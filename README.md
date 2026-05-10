@@ -1,0 +1,9 @@
+This repo aims to develop a PACMAN autonomous hive network, wherein the ghosts in the game have been altered to communincate together and plan how to eradicate the pacman - which is controlled by a human player. This will act as a proof of concept for developing a quadruped hive network for multiagentic reconnisance missions, which will be the next part of our mission.
+
+There have been multiple modifications to the game, as a means to evaluate our system based on multiagentic collaborative metrics:
+1. Each new game has a randomised maze like structure, ensuring agents learn to explore and do not memorise a single route.
+2. The game ends either when all pellets are consumed by the Pacman, constituting a win for the human player, or if the pacman is caught by one of the ghosts - resulting in a loss.
+3. Whenever a powered pellet is consumed by the Pacman, it turns blue and can then consume any of the ghosts, whose objective in that stage will be to avoid getting consumed as that results in their death for the remainder of the game.
+4. There will be no notification of the Powered stage, ghosts in direct line of sight can observe the change in colour and can update the state to other ghosts via their internal communincation network ~ ensuring that agents relay crucial information to one another.
+5. Ghosts can in turn consume the powered pellets, while going across them, which in turn changes it to a normal pellet - sets up side tasks that ensure agent survival, beside the main task of killing the pacman.
+6. All other aspects are similar to the actual game, with 7 agentic ghost bots, and 28 powered pellets. Another thing that can be setup perhaps is limiting direct communincation within a stipulated radius of the agents, calling for indirect auctions of tasks via mediary agents.
