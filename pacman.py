@@ -101,7 +101,6 @@ def generate_map(): #using prims algorithm to generate a maze, then adding pelle
 
 
 def bfs_path(grid, start, goal):
-    """Return first step direction from start toward goal, or None."""
     rows = len(grid)
     cols = len(grid[0])
     visited = {start}
@@ -122,7 +121,7 @@ def bfs_path(grid, start, goal):
 
 class Ghost:
     def __init__(self, gid, grid, pos, color):
-        self.gid = gid          #permanent ID for hive implementation
+        self.gid = gid  #permanent ID for hive implementation
         self.grid = grid
         self.row, self.col = pos
         self.color = color
