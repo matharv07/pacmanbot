@@ -2,8 +2,7 @@ import pygame
 import random
 import math
 import sys
-from collections import deque
-from ghost import Ghost
+from ghost import Ghost, UNKNOWN
 
 CELL = 20
 COLS = 41
@@ -79,11 +78,9 @@ def generate_map(): #using prims algorithm to generate a maze, then adding pelle
         grid[r][cols - 1] = WALL
 
     open_cells = [(r, c) for r in range(rows) for c in range(cols) if grid[r][c] == EMPTY]
-
     centre = (rows // 2, cols // 2)
     open_cells.sort(key=lambda p: abs(p[0] - centre[0]) + abs(p[1] - centre[1]))
     player_start = open_cells[0]
-
     for r, c in open_cells:
         if abs(r - player_start[0]) + abs(c - player_start[1]) > 2:
             grid[r][c] = PELLET
@@ -99,93 +96,6 @@ def generate_map(): #using prims algorithm to generate a maze, then adding pelle
             placed += 1
 
     return grid, player_start
-
-
-def bfs_path(grid, start, goal):
-    rows = len(grid)
-    cols = len(grid[0])
-    visited = {start}
-    queue = deque([(start, [])])
-    while queue:
-        (r, c), path = queue.popleft()
-        if (r, c) == goal:
-            return path[0] if path else None
-        for dr, dc in DIRS:
-            nr, nc = r + dr, c + dc
-            if (0 <= nr < rows and 0 <= nc < cols
-                    and (nr, nc) not in visited
-                    and grid[nr][nc] != WALL):
-                visited.add((nr, nc))
-                queue.append(((nr, nc), path + [(dr, dc)]))
-    return None
-
-
-# class Ghost:
-#     def __init__(self, gid, grid, pos, color):
-#         self.gid = gid  #permanent ID for hive implementation
-#         self.grid = grid
-#         self.row, self.col = pos
-#         self.color = color
-#         self.scared = False
-#         self.dead = False
-#         self.respawn = pos
-#         self.dead_timer = 0
-#         self.move_counter = 0
-#         self.move_every = 2   #ticks between moves
-#         self.last_dir = random.choice(DIRS)
-
-#     def update(self, player_pos, scared):
-#         self.move_counter += 1
-#         if self.move_counter < self.move_every:
-#             return
-#         self.move_counter = 0
-
-#         rows = len(self.grid)
-#         cols = len(self.grid[0])
-
-#         #available moves
-#         options = []
-#         for dr, dc in DIRS:
-#             nr, nc = self.row + dr, self.col + dc
-#             if (0 <= nr < rows and 0 <= nc < cols
-#                     and self.grid[nr][nc] != WALL):
-#                 options.append((dr, dc))
-#         if not options:
-#             return
-
-#         #70% continue last dir, 30% random for now - RL later
-#         if self.last_dir in options and random.random() < 0.70:
-#             options = [self.last_dir]
-#         else:
-#             random.shuffle(options)
-
-#         dr, dc = options[0]
-#         self.row += dr
-#         self.col += dc
-#         self.last_dir = (dr, dc)
-
-#         #modifies game such that if a ghost captures a power pellet, it changes to a normal pellet
-#         if self.grid[self.row][self.col] == POWER:
-#             self.grid[self.row][self.col] = PELLET
-
-#     def kill(self):
-#         self.dead = True
-#         self.dead_timer = 30
-#         self.scared = False
-
-#     def draw(self, surf):
-#         if self.dead:
-#             return
-#         x = self.col * CELL + CELL // 2
-#         y = self.row * CELL + CELL // 2
-#         r = CELL // 2 - 2
-#         color = self.color
-#         pygame.draw.circle(surf, color, (x, y - 2), r)
-#         pygame.draw.rect(surf, color, (x - r, y - 2, r * 2, r + 2))
-#         pygame.draw.circle(surf, WHITE, (x - 4, y - 4), 3)
-#         pygame.draw.circle(surf, WHITE, (x + 4, y - 4), 3)
-#         pygame.draw.circle(surf, BLACK, (x - 3, y - 4), 2)
-#         pygame.draw.circle(surf, BLACK, (x + 5, y - 4), 2)
 
 class Player:
     def __init__(self, grid, pos):
@@ -263,7 +173,6 @@ class Player:
         r = CELL // 2 - 2
         angles = {(0, 1): 0, (0, -1): 180, (-1, 0): 90, (1, 0): 270}
         angle = angles.get(self.dir, 0)
-
         pac_color = POWERED_COLOR if self.powered else YELLOW
         if self.mouth_open and not self.dead:
             #draw pie shape
@@ -283,20 +192,69 @@ class Player:
 class Game:
     def __init__(self):
         pygame.init()
-        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        self.screen = pygame.display.set_mode((WIDTH*2, HEIGHT))
         pygame.display.set_caption("PACMAN")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("monospace", 18, bold=True)
         self.small = pygame.font.SysFont("monospace", 14)
         self.new_game()
 
+    def draw_personal_map(self):
+        ghost = self.ghosts.get(self.debug_ghost_id)
+        if not ghost:
+            if self.ghosts:
+                self.debug_ghost_id = next(iter(self.ghosts))
+                ghost = self.ghosts[self.debug_ghost_id]
+            else:
+                return
+        for r in range(ROWS):
+            for c in range(COLS):
+                x = WIDTH + c * CELL
+                y = r * CELL
+                val = ghost.personal_map[r][c]
+                if val == UNKNOWN:
+                    color = (30, 30, 30)
+                elif val == WALL:
+                    color = BLUE
+                elif val == PELLET:
+                    color = (180, 180, 180)
+                elif val == POWER:
+                    color = (255, 200, 0)
+                elif val == EMPTY:
+                    color = BLACK
+                else:
+                    color = (30, 30, 30)
+                pygame.draw.rect(self.screen, color, (x, y, CELL, CELL))
+        #drawing nearest neighbour agents
+        for gid, (gr, gc) in ghost.known_agents.items():
+            x = WIDTH + gc * CELL + CELL // 2
+            y = gr * CELL + CELL // 2
+            pygame.draw.circle(self.screen, GHOST_COLORS[gid], (x, y), CELL // 2 - 2)
+            label = self.small.render(str(gid), True, WHITE)
+            self.screen.blit(label, (WIDTH + gc * CELL + 2, gr * CELL + 2))
+        #denote local agent
+        x = WIDTH + ghost.col * CELL + CELL // 2
+        y = ghost.row * CELL + CELL // 2
+        pygame.draw.circle(self.screen, GHOST_COLORS[self.debug_ghost_id], (x, y), CELL // 2 - 2)
+        label = self.small.render(str(self.debug_ghost_id), True, WHITE)
+        self.screen.blit(label, (WIDTH + ghost.col * CELL + 2, ghost.row * CELL + 2))
+        #check if pacman pos is known
+        if ghost.known_pacman:
+            pr, pc = ghost.known_pacman
+            x = WIDTH + pc * CELL + CELL // 2
+            y = pr * CELL + CELL // 2
+            pygame.draw.circle(self.screen, YELLOW, (x, y), CELL // 2 - 2)
+            label = self.small.render("P", True, BLACK)
+            self.screen.blit(label, (WIDTH + pc * CELL + 2, pr * CELL + 2))
+
+        txt = self.small.render(f"Ghost {self.debug_ghost_id} local map  [0-6 to switch]", True, WHITE)
+        self.screen.blit(txt, (WIDTH + 4, ROWS * CELL + 6))
+
     def new_game(self):
         self.grid, self.player_start = generate_map()
         self.player = Player(self.grid, self.player_start)
-
         #pellet counter
         self.total_pellets = sum(1 for r in self.grid for c in r if c in (PELLET, POWER))
-
         #randomise ghost starting positions
         open_cells = [(r, c) for r in range(ROWS) for c in range(COLS) if self.grid[r][c] != WALL]
         pr, pc = self.player_start
@@ -305,6 +263,7 @@ class Game:
         self.ghosts = { i: Ghost(i, self.grid, pos, GHOST_COLORS[i]) for i, pos in enumerate(ghost_starts) }
         self.state = "playing"   #states = {playing, dead, win, gameover}
         self.message_timer = 0
+        self.debug_ghost_id = 0
 
     def pellets_left(self):
         return sum(1 for r in self.grid for c in r if c in (PELLET, POWER))
@@ -323,9 +282,13 @@ class Game:
                     self.player.set_dir(LEFT)
                 elif event.key in (pygame.K_d, pygame.K_RIGHT):
                     self.player.set_dir(RIGHT)
+                elif event.key in (pygame.K_0, pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5, pygame.K_6):
+                    num = event.key - pygame.K_0
+                    if num in self.ghosts:
+                        self.debug_ghost_id = num
                 elif event.key == pygame.K_r:
                     score = self.player.score
-                    self.new_game()
+                    self.new_game() 
                     self.player.score = score  #keeps score on reset
 
     def update(self):
@@ -344,11 +307,9 @@ class Game:
             return
 
         self.player.update()
-
         scared = self.player.powered
         for ghost in self.ghosts.values():
-            ghost.update((self.player.row, self.player.col), scared)
-
+            ghost.update((self.player.row, self.player.col), scared, self.ghosts)
         #collision condition
         if not self.player.dead:
             for gid, ghost in list(self.ghosts.items()):
@@ -363,7 +324,6 @@ class Game:
                         self.state = "gameover"
                         self.message_timer = 90
                         break
-
         # win condition
         if self.pellets_left() == 0:
             self.state = "win"
@@ -416,6 +376,7 @@ class Game:
                 ghost.draw(self.screen)
             self.player.draw(self.screen)
             self.draw_hud()
+            self.draw_personal_map()
             if self.state == "win":
                 self.draw_overlay("CLEARED!  Next map loading...", YELLOW)
             elif self.state == "dead":
