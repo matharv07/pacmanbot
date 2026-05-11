@@ -60,7 +60,7 @@ class Ghost:
         self.last_seen = [[-1] * cols for _ in range(rows)]
         self.frame = 0
         self.message_queue = []
-        self.seen_message_ids = set()
+        self.seen_message_ids = {}
         self.seq = 0
         self.known_agents = {} #gid - (row, col) | UNKNOWN if ghost is lost or dead, None if not seen yet
         self.known_pacman = None #(row, col) | None for not seen yet
@@ -182,7 +182,7 @@ class Ghost:
         if msg_id is None:
             msg_id = (self.gid, self.frame, self.seq)
             self.seq += 1
-        self.seen_message_ids.add(msg_id)
+        self.seen_message_ids[msg_id] = True
         msg = {"id": msg_id, "diffs": diffs, "hop": hop}
         for ghost in all_ghosts.values():
             if ghost.gid == self.gid:
@@ -230,7 +230,7 @@ class Ghost:
         for msg in self.message_queue:
             if msg["id"] in self.seen_message_ids:
                 continue
-            self.seen_message_ids.add(msg["id"])
+            self.seen_message_ids[msg["id"]] = True
             hop = msg.get("hop", 0)
             relay_diffs = []
             for diff in msg["diffs"]:
@@ -293,11 +293,11 @@ class Ghost:
             self._broadcast(relay_diffs, all_ghosts, msg_id=msg["id"], hop=hop + 1)
         self.message_queue.clear()
         
-        #prune deque keeping only N=500 latest message ids
+        #prune list keeping only N=250 latest message ids post reaching 500 ids
         if len(self.seen_message_ids) > 500:
             to_remove = list(self.seen_message_ids)[:250]
             for item in to_remove:
-                self.seen_message_ids.discard(item)
+                self.seen_message_ids.pop(item, None)
 
     def kill(self):
         self.dead = True
