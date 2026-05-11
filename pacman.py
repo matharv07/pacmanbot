@@ -249,9 +249,9 @@ class Game:
             return
 
         self.player.update()
-        scared = self.player.powered
+        powered = self.player.powered
         for ghost in self.ghosts.values():
-            ghost.update((self.player.row, self.player.col), scared, self.ghosts)
+            ghost.update((self.player.row, self.player.col), powered, self.ghosts)
 
         #capture detection
         if not self.player.dead:
@@ -353,7 +353,7 @@ class Game:
             pr, pc = ghost.known_pacman
             x = WIDTH + pc * CELL + CELL // 2
             y = pr * CELL + CELL // 2
-            pygame.draw.circle(self.screen, YELLOW, (x, y), CELL // 2 - 2)
+            pygame.draw.circle(self.screen, POWERED_COLOR if ghost.powered else YELLOW, (x, y), CELL // 2 - 2)
             label = self.small.render("P", True, BLACK)
             self.screen.blit(label, (WIDTH + pc * CELL + 2, pr * CELL + 2))
         txt = self.small.render(f"Ghost {self.debug_ghost_id} local map  [0-6 to switch]", True, WHITE)

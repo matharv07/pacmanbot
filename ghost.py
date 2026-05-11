@@ -47,7 +47,7 @@ class Ghost:
         self.grid = grid
         self.row, self.col = pos
         self.color = color
-        self.scared = False
+        self.powered = False
         self.dead = False
         self.respawn = pos
         self.dead_timer = 0
@@ -64,17 +64,15 @@ class Ghost:
         self.seq = 0
         self.known_agents = {} #gid - (row, col) | UNKNOWN if ghost is lost or dead, None if not seen yet
         self.known_pacman = None #(row, col) | None for not seen yet
-        self.pacman_color = YELLOW #YELLOW for normal | POWERED_COLOR for scared | None for unknown case
         self.pacman_mode = "normal" #normal | powered | unknown
         self.pacman_last_seen = -1 #frame of when pacman was last seen for tiebreaks
         self.last_heartbeat = {} #frame of last received heartbeat from every ghost
         self.last_sync_frame = {} #frame of last full sync sent to every ghost
 
-    def update(self, player_pos, scared, all_ghosts):
+    def update(self, player_pos, powered, all_ghosts):
         self.frame += 1
-        self.scared = scared
         self._check_liveness(all_ghosts)
-        diffs = self._update_personal_map(all_ghosts, player_pos)
+        diffs = self._update_personal_map(all_ghosts, player_pos, powered)
         #piggyback heartbeat onto broadcast every N=5 frames
         if self.frame % HEARTBEAT_EVERY == 0:
             diffs.append(("heartbeat", self.gid, self.row, self.col))
@@ -112,7 +110,7 @@ class Ghost:
                     self.known_agents[gid] = "UNKNOWN"
                     self._broadcast([("agent_lost", gid)], all_ghosts)
 
-    def _get_visible_cells(self, all_ghosts, player_pos):
+    def _get_visible_cells(self, all_ghosts, player_pos, powered=False):
         visible = {}
         rows = len(self.grid)
         cols = len(self.grid[0])
@@ -159,12 +157,13 @@ class Ghost:
         if (pr, pc) in visible:
             if self.known_pacman != (pr, pc):
                 self.known_pacman = (pr, pc)
-                pacman_diff = ("pacman", pr, pc, self.frame)
+                self.powered = powered #update powered state on seeing pacman to relay mode info
+                pacman_diff = ("pacman", pr, pc, powered, self.frame)
 
         return visible, agent_diffs, pacman_diff
 
-    def _update_personal_map(self, all_ghosts, player_pos):
-        visible, agent_diffs, pacman_diff = self._get_visible_cells(all_ghosts, player_pos)
+    def _update_personal_map(self, all_ghosts, player_pos, powered=False):
+        visible, agent_diffs, pacman_diff = self._get_visible_cells(all_ghosts, player_pos, powered)
         diffs = []
         for (r, c), val in visible.items():
             old = self.personal_map[r][c]
@@ -221,7 +220,7 @@ class Ghost:
             sync_diffs.append(("hb_sync", gid, frames_ago))
         #transfer pacman last known position
         if self.known_pacman:
-            sync_diffs.append(("pacman", self.known_pacman[0], self.known_pacman[1], self.pacman_last_seen))
+            sync_diffs.append(("pacman", self.known_pacman[0], self.known_pacman[1], self.powered, self.pacman_last_seen))
 
         if sync_diffs:
             sync_id = ("sync", self.gid, target_ghost.gid, self.frame)
@@ -284,9 +283,10 @@ class Ghost:
                         self.last_heartbeat[gid] = reconstructed
                         relay_diffs.append(diff)
                 elif dtype == "pacman":
-                    _, r, c, obs_frame = diff
+                    _, r, c, powered, obs_frame = diff
                     if obs_frame > self.pacman_last_seen:
                         self.known_pacman = (r, c)
+                        self.powered = powered
                         self.pacman_last_seen = obs_frame
                         relay_diffs.append(diff)
 
