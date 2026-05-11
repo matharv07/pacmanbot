@@ -1,7 +1,6 @@
 import pygame
 import random
 import math
-from collections import deque
 
 CELL = 20
 COLS = 41
@@ -22,8 +21,8 @@ GREY   = (80, 80, 80)
 POWERED_COLOR = (0, 120, 255)
 GHOST_COLORS = [RED, PINK, CYAN, ORANGE, (180, 0, 180), (0, 180, 80), (220, 220, 0)]
 
-WALL  = 1
-EMPTY = 0
+WALL   = 1
+EMPTY  = 0
 PELLET = 2
 POWER  = 3
 
@@ -39,9 +38,8 @@ MAX_RAY_DIST      = 10
 UNKNOWN           = -1
 MEMORY_FRAMES     = 10
 HEARTBEAT_EVERY   = 5
-HEARTBEAT_TIMEOUT = 60  #if no heartbeat received for 60 frames (6s ), consider agent lost
+HEARTBEAT_TIMEOUT = 60  #if no heartbeat received for 60 frames (6s), consider agent lost
 RESYNC_EVERY      = 50
-
 
 class Ghost:
     def __init__(self, gid, grid, pos, color):
@@ -59,15 +57,18 @@ class Ghost:
         rows = len(grid)
         cols = len(grid[0])
         self.personal_map = [[UNKNOWN] * cols for _ in range(rows)]
-        self.last_seen = [[-999] * cols for _ in range(rows)]
+        self.last_seen = [[-1] * cols for _ in range(rows)]
         self.frame = 0
         self.message_queue = []
         self.seen_message_ids = set()
         self.seq = 0
         self.known_agents = {} #gid - (row, col) | UNKNOWN if ghost is lost or dead, None if not seen yet
-        self.known_pacman = None #(row, col) | None
+        self.known_pacman = None #(row, col) | None for not seen yet
+        self.pacman_color = YELLOW #YELLOW for normal | POWERED_COLOR for scared | None for unknown case
+        self.pacman_mode = "normal" #normal | powered | unknown
+        self.pacman_last_seen = -1 #frame of when pacman was last seen for tiebreaks
         self.last_heartbeat = {} #frame of last received heartbeat from every ghost
-        self.last_sync_frame  = {} #frame of last full sync sent to every ghost
+        self.last_sync_frame = {} #frame of last full sync sent to every ghost
 
     def update(self, player_pos, scared, all_ghosts):
         self.frame += 1
@@ -158,7 +159,7 @@ class Ghost:
         if (pr, pc) in visible:
             if self.known_pacman != (pr, pc):
                 self.known_pacman = (pr, pc)
-                pacman_diff = ("pacman", pr, pc)
+                pacman_diff = ("pacman", pr, pc, self.frame)
 
         return visible, agent_diffs, pacman_diff
 
@@ -191,7 +192,7 @@ class Ghost:
             if dist <= RADIUS:
                 ghost.message_queue.append(msg)
                 #full sync for when ghost interact for the first time/for complete resync every N=50 frames
-                last = self.last_sync_frame.get(ghost.gid, -999)
+                last = self.last_sync_frame.get(ghost.gid, -1)
                 if self.frame - last >= RESYNC_EVERY:
                     self.last_sync_frame[ghost.gid] = self.frame
                     ghost.last_sync_frame[self.gid] = self.frame
@@ -220,7 +221,7 @@ class Ghost:
             sync_diffs.append(("hb_sync", gid, frames_ago))
         #transfer pacman last known position
         if self.known_pacman:
-            sync_diffs.append(("pacman", self.known_pacman[0], self.known_pacman[1]))
+            sync_diffs.append(("pacman", self.known_pacman[0], self.known_pacman[1], self.pacman_last_seen))
 
         if sync_diffs:
             sync_id = ("sync", self.gid, target_ghost.gid, self.frame)
@@ -263,7 +264,7 @@ class Ghost:
                     _, gid, r, c = diff
                     if gid == self.gid:
                         continue
-                    existing = self.last_heartbeat.get(gid, -999)
+                    existing = self.last_heartbeat.get(gid, -1)
                     if self.frame > existing:
                         self.last_heartbeat[gid] = self.frame
                     if r != 0 or c != 0:
@@ -278,14 +279,15 @@ class Ghost:
                     if gid == self.gid:
                         continue
                     reconstructed = self.frame - frames_ago
-                    existing = self.last_heartbeat.get(gid, -999)
+                    existing = self.last_heartbeat.get(gid, -1)
                     if reconstructed > existing:
                         self.last_heartbeat[gid] = reconstructed
                         relay_diffs.append(diff)
                 elif dtype == "pacman":
-                    _, r, c = diff
-                    if self.known_pacman != (r, c):
+                    _, r, c, obs_frame = diff
+                    if obs_frame > self.pacman_last_seen:
                         self.known_pacman = (r, c)
+                        self.pacman_last_seen = obs_frame
                         relay_diffs.append(diff)
 
             self._broadcast(relay_diffs, all_ghosts, msg_id=msg["id"], hop=hop + 1)

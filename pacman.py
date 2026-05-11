@@ -24,8 +24,8 @@ GREY   = (80, 80, 80)
 POWERED_COLOR = (0, 120, 255)
 GHOST_COLORS = [RED, PINK, CYAN, ORANGE, (180, 0, 180), (0, 180, 80), (220, 220, 0)]
 
-WALL  = 1
-EMPTY = 0
+WALL   = 1
+EMPTY  = 0
 PELLET = 2
 POWER  = 3
 
@@ -260,12 +260,7 @@ class Game:
                         and ghost.row == self.player.row
                         and ghost.col == self.player.col):
                     if self.player.powered:
-                        # notify all surviving ghosts of this death before removing
-                        death_msg = {
-                            "id": ("death", gid, ghost.frame),
-                            "diffs": [("agent_lost", gid)],
-                            "hop": 0
-                        }
+                        death_msg = {"id": ("death", gid, ghost.frame), "diffs": [("agent_lost", gid)], "hop": 0}
                         for g in self.ghosts.values():
                             if g.gid != gid:
                                 g.message_queue.append(death_msg)
