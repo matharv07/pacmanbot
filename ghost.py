@@ -47,6 +47,7 @@ class Ghost:
         self.gid = gid
         self.grid = grid
         self.row, self.col = pos
+        self.prev_row, self.prev_col = pos
         self.color = color
         self.dead = False
         self.respawn = pos
@@ -95,8 +96,7 @@ class Ghost:
         options = []
         for dr, dc in DIRS:
             nr, nc = self.row + dr, self.col + dc
-            if (0 <= nr < rows and 0 <= nc < cols
-                    and self.grid[nr][nc] != WALL):
+            if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL):
                 options.append((dr, dc))
         if not options:
             return
@@ -105,6 +105,7 @@ class Ghost:
         else:
             random.shuffle(options)
         dr, dc = options[0]
+        self.prev_row, self.prev_col = self.row, self.col
         self.row += dr
         self.col += dc
         self.last_dir = (dr, dc)
@@ -265,7 +266,7 @@ class Ghost:
                     old = self.personal_map[r][c]
                     if old != val:
                         if old != UNKNOWN and self.last_seen[r][c] >= self.frame - MEMORY_FRAMES:
-                            continue #reject stale cell update if we have seen it recently
+                            continue    #reject stale cell update if we have seen it recently
                         self.personal_map[r][c] = val
                         relay_diffs.append(diff)
                 elif dtype == "agent":
@@ -295,7 +296,7 @@ class Ghost:
                         if old != (r, c):
                             self.known_agents[gid] = (r, c)
                             relay_diffs.append(("agent", gid, r, c))
-                    relay_diffs.append(diff)  # always relay heartbeats so all agents know where others are
+                    relay_diffs.append(diff)  #always relay heartbeats so all agents know where others are
                 elif dtype == "hb_sync":
                     _, gid, frames_ago = diff
                     if gid == self.gid:
@@ -311,7 +312,7 @@ class Ghost:
                         self.known_pacman     = (r, c)
                         self.pacman_powered   = powered
                         self.pacman_last_seen = obs_frame
-                        self.last_lost_pacman = None  # fresh sighting clears lost marker
+                        self.last_lost_pacman = None  #new sighting clears lost marker
                         relay_diffs.append(diff)
                 elif dtype == "pacman_lost":
                     _, lr, lc, obs_frame = diff

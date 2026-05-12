@@ -98,6 +98,7 @@ class Player:
     def __init__(self, grid, pos):
         self.grid = grid
         self.row, self.col = pos
+        self.prev_row, self.prev_col = pos
         self.start = pos
         self.dir = RIGHT
         self.next_dir = RIGHT
@@ -135,7 +136,8 @@ class Player:
         def can_move(r, c, d):
             nr, nc = r + d[0], c + d[1]
             return (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL)
-
+        
+        self.prev_row, self.prev_col = self.row, self.col
         if can_move(self.row, self.col, self.next_dir):
             self.dir = self.next_dir
         if can_move(self.row, self.col, self.dir):
@@ -223,8 +225,7 @@ class Game:
                     self.player.set_dir(LEFT)
                 elif event.key in (pygame.K_d, pygame.K_RIGHT):
                     self.player.set_dir(RIGHT)
-                elif event.key in (pygame.K_0, pygame.K_1, pygame.K_2,
-                                   pygame.K_3, pygame.K_4, pygame.K_5, pygame.K_6):
+                elif event.key in (pygame.K_0, pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5, pygame.K_6):
                     num = event.key - pygame.K_0
                     if num in self.ghosts:
                         self.debug_ghost_id = num
@@ -256,9 +257,11 @@ class Game:
         #capture detection
         if not self.player.dead:
             for gid, ghost in list(self.ghosts.items()):
-                if (not ghost.dead
-                        and ghost.row == self.player.row
-                        and ghost.col == self.player.col):
+                if ghost.dead:
+                    continue
+                same_cell = (ghost.row == self.player.row and ghost.col == self.player.col)
+                swapped = (ghost.row == self.player.prev_row and ghost.col == self.player.prev_col and self.player.row == ghost.prev_row and self.player.col == ghost.prev_col)
+                if (same_cell or swapped):
                     if self.player.powered:
                         death_msg = {"id": ("death", gid, ghost.frame), "diffs": [("agent_lost", gid)], "hop": 0}
                         for g in self.ghosts.values():
