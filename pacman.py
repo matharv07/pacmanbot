@@ -353,7 +353,7 @@ class Game:
             pr, pc = ghost.known_pacman
             x = WIDTH + pc * CELL + CELL // 2
             y = pr * CELL + CELL // 2
-            pygame.draw.circle(self.screen, POWERED_COLOR if ghost.powered else YELLOW, (x, y), CELL // 2 - 2)
+            pygame.draw.circle(self.screen, POWERED_COLOR if ghost.pacman_powered else YELLOW, (x, y), CELL // 2 - 2)
             label = self.small.render("P", True, BLACK)
             self.screen.blit(label, (WIDTH + pc * CELL + 2, pr * CELL + 2))
         txt = self.small.render(f"Ghost {self.debug_ghost_id} local map  [0-6 to switch]", True, WHITE)

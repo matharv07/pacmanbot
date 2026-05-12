@@ -38,8 +38,9 @@ MAX_RAY_DIST      = 10
 UNKNOWN           = -1
 MEMORY_FRAMES     = 10
 HEARTBEAT_EVERY   = 5
-HEARTBEAT_TIMEOUT = 60  #if no heartbeat received for 60 frames (6s), consider agent lost
+HEARTBEAT_TIMEOUT = 60
 RESYNC_EVERY      = 50
+
 
 class Ghost:
     def __init__(self, gid, grid, pos, color):
@@ -47,7 +48,6 @@ class Ghost:
         self.grid = grid
         self.row, self.col = pos
         self.color = color
-        self.powered = False
         self.dead = False
         self.respawn = pos
         self.dead_timer = 0
@@ -62,19 +62,27 @@ class Ghost:
         self.message_queue = []
         self.seen_message_ids = {}
         self.seq = 0
-        self.known_agents = {} #gid - (row, col) | UNKNOWN if ghost is lost or dead, None if not seen yet
-        self.known_pacman = None #(row, col) | None for not seen yet
-        self.pacman_mode = "normal" #normal | powered | unknown
-        self.pacman_last_seen = -1 #frame of when pacman was last seen for tiebreaks
-        self.last_lost_pacman = None #(row, col) of last invalidated pacman pos
-        self.last_heartbeat = {} #frame of last received heartbeat from every ghost
-        self.last_sync_frame = {} #frame of last full sync sent to every ghost
+        self.known_agents = {}    # gid -> (row, col) | "UNKNOWN"
+        self.last_heartbeat = {}    # gid -> frame of last received heartbeat
+        self.last_sync_frame = {}    # gid -> frame of last full sync sent to them
+        # pacman tracking — all fields updated together always
+        self.known_pacman = None  # (row, col) | None
+        self.pacman_powered = False # last known powered state
+        self.pacman_last_seen = -1    # frame of last confirmed sighting (direct or relayed)
+        self.last_lost_pacman = None  # (row, col) of last spot where pacman was confirmed gone
+
 
     def update(self, player_pos, powered, all_ghosts):
         self.frame += 1
+        if self.dead:
+            self.dead_timer -= 1
+            if self.dead_timer <= 0:
+                self.dead = False
+                self.row, self.col = self.respawn
+            return
         self._check_liveness(all_ghosts)
         diffs = self._update_personal_map(all_ghosts, player_pos, powered)
-        #piggyback heartbeat onto broadcast every N=5 frames
+        #piggyback heartbeat every N=5 frames
         if self.frame % HEARTBEAT_EVERY == 0:
             diffs.append(("heartbeat", self.gid, self.row, self.col, self.frame))
         self._broadcast(diffs, all_ghosts)
@@ -134,6 +142,7 @@ class Ghost:
                 visible[(r, c)] = cell_val
                 if cell_val == WALL:
                     break
+
         #check co-ghost visibility
         agent_diffs = []
         for gid, ghost in all_ghosts.items():
@@ -155,22 +164,28 @@ class Ghost:
         pacman_diff = None
         pr, pc = player_pos
         if (pr, pc) in visible:
-            if self.known_pacman != (pr, pc):
-                self.known_pacman = (pr, pc)
-                self.powered = powered #update powered state on seeing pacman to relay mode info
+            if self.known_pacman != (pr, pc) or self.pacman_powered != powered:
+                self.known_pacman    = (pr, pc)
+                self.pacman_powered  = powered
+                self.pacman_last_seen = self.frame
                 pacman_diff = ("pacman", pr, pc, powered, self.frame)
             else:
-                if self.known_pacman is not None: #checking if pacman disappeared from 'known' location
-                    kr, kc = self.known_pacman
-                    if (kr, kc) in visible: #impliies pacman was expected to be seen there but has moved
-                        self.known_pacman = None
-                        self.last_lost_pacman = (kr, kc)
-                        pacman_diff = ("pacman_lost", kr, kc, self.frame)
+                self.pacman_last_seen = self.frame
+        else:
+            #if pacman not visible, check if we can see where it was last seen
+            if self.known_pacman is not None:
+                kr, kc = self.known_pacman
+                if (kr, kc) in visible:
+                    self.last_lost_pacman = (kr, kc)
+                    self.pacman_last_seen = self.frame  #timestamp of loss
+                    self.known_pacman     = None
+                    pacman_diff = ("pacman_lost", kr, kc, self.frame)
 
         return visible, agent_diffs, pacman_diff
 
     def _update_personal_map(self, all_ghosts, player_pos, powered=False):
-        visible, agent_diffs, pacman_diff = self._get_visible_cells(all_ghosts, player_pos, powered)
+        visible, agent_diffs, pacman_diff = self._get_visible_cells(
+            all_ghosts, player_pos, powered)
         diffs = []
         for (r, c), val in visible.items():
             old = self.personal_map[r][c]
@@ -197,38 +212,39 @@ class Ghost:
             dist = abs(ghost.row - self.row) + abs(ghost.col - self.col)
             if dist <= RADIUS:
                 ghost.message_queue.append(msg)
-                #full sync for when ghost interact for the first time/for complete resync every N=50 frames
                 last = self.last_sync_frame.get(ghost.gid, -1)
                 if self.frame - last >= RESYNC_EVERY:
                     self.last_sync_frame[ghost.gid] = self.frame
                     ghost.last_sync_frame[self.gid] = self.frame
-                    self._send_full_sync(ghost)  #self to ghost
-                    ghost._send_full_sync(self)  #ghost to self
+                    self._send_full_sync(ghost)
+                    ghost._send_full_sync(self)
 
     def _send_full_sync(self, target_ghost):
         sync_diffs = []
         rows = len(self.personal_map)
         cols = len(self.personal_map[0])
-        #full map sync
+
         for r in range(rows):
             for c in range(cols):
                 val = self.personal_map[r][c]
                 if val != UNKNOWN:
                     sync_diffs.append(("cell", r, c, val))
-        #add all known agent positions
+
+        #iterate through agent positions and liveness
         for gid, pos in self.known_agents.items():
             if pos == "UNKNOWN":
                 sync_diffs.append(("agent_lost", gid))
             elif pos is not None:
                 sync_diffs.append(("agent", gid, pos[0], pos[1]))
-        #transfer prev heartbeat timing data
+
         for gid, hb_frame in self.last_heartbeat.items():
             frames_ago = self.frame - hb_frame
             sync_diffs.append(("hb_sync", gid, frames_ago))
-        #transfer pacman last known position
-        if self.known_pacman:
-            sync_diffs.append(("pacman", self.known_pacman[0], self.known_pacman[1], self.powered, self.pacman_last_seen))
-        elif self.last_lost_pacman and self.pacman_last_seen > -1:
+
+        #check & relay pacman state
+        if self.known_pacman is not None:
+            sync_diffs.append(("pacman", self.known_pacman[0], self.known_pacman[1], self.pacman_powered, self.pacman_last_seen))
+        elif self.last_lost_pacman is not None and self.pacman_last_seen > -1:
             sync_diffs.append(("pacman_lost", self.last_lost_pacman[0], self.last_lost_pacman[1], self.pacman_last_seen))
 
         if sync_diffs:
@@ -240,8 +256,9 @@ class Ghost:
             if msg["id"] in self.seen_message_ids:
                 continue
             self.seen_message_ids[msg["id"]] = True
-            hop = msg.get("hop", 0)
+            hop  = msg.get("hop", 0)
             relay_diffs = []
+
             for diff in msg["diffs"]:
                 dtype = diff[0]
                 if dtype == "cell":
@@ -249,7 +266,7 @@ class Ghost:
                     old = self.personal_map[r][c]
                     if old != val:
                         if old != UNKNOWN and self.last_seen[r][c] >= self.frame - MEMORY_FRAMES:
-                            continue
+                            continue #reject stale cell update if we have seen it recently
                         self.personal_map[r][c] = val
                         relay_diffs.append(diff)
                 elif dtype == "agent":
@@ -264,8 +281,7 @@ class Ghost:
                     _, gid = diff
                     if gid == self.gid:
                         continue
-                    current = self.known_agents.get(gid)
-                    if current != "UNKNOWN":
+                    if self.known_agents.get(gid) != "UNKNOWN":
                         self.known_agents[gid] = "UNKNOWN"
                         relay_diffs.append(diff)
                 elif dtype == "heartbeat":
@@ -280,8 +296,7 @@ class Ghost:
                         if old != (r, c):
                             self.known_agents[gid] = (r, c)
                             relay_diffs.append(("agent", gid, r, c))
-                    #relay heartbeat further so other ghosts know positions as well
-                    relay_diffs.append(diff)
+                    relay_diffs.append(diff)  # always relay heartbeats so all agents know where others are
                 elif dtype == "hb_sync":
                     _, gid, frames_ago = diff
                     if gid == self.gid:
@@ -293,49 +308,31 @@ class Ghost:
                         relay_diffs.append(diff)
                 elif dtype == "pacman":
                     _, r, c, powered, obs_frame = diff
-                    accept = False
-                    if self.known_pacman is None:
-                        if self.last_lost_pacman == (r, c):
-                            if obs_frame > self.pacman_last_seen:
-                                accept = True
-                        else:
-                            accept = True
-                    else:
-                        if obs_frame > self.pacman_last_seen:
-                            accept = True
-                    if accept:
-                        self.known_pacman = (r, c)
-                        self.powered = powered
+                    if obs_frame > self.pacman_last_seen:
+                        self.known_pacman     = (r, c)
+                        self.pacman_powered   = powered
                         self.pacman_last_seen = obs_frame
+                        self.last_lost_pacman = None  # fresh sighting clears lost marker
                         relay_diffs.append(diff)
                 elif dtype == "pacman_lost":
                     _, lr, lc, obs_frame = diff
-                    if self.known_pacman == (lr, lc):
-                        if obs_frame > self.pacman_last_seen:
+                    if obs_frame > self.pacman_last_seen:
+                        if self.known_pacman == (lr, lc):
                             self.known_pacman = None
-                            self.last_lost_pacman = (lr, lc)
-                            self.pacman_last_seen = obs_frame
-                            relay_diffs.append(diff)
-                    elif self.known_pacman is None:
-                        if obs_frame > self.pacman_last_seen:
-                            self.last_lost_pacman = (lr, lc)
-                            self.pacman_last_seen = obs_frame
-                        relay_diffs.append(diff)
-                    else:
+                        self.last_lost_pacman = (lr, lc)
+                        self.pacman_last_seen = obs_frame
                         relay_diffs.append(diff)
             self._broadcast(relay_diffs, all_ghosts, msg_id=msg["id"], hop=hop + 1)
         self.message_queue.clear()
-        
-        #prune list keeping only N=250 latest message ids post reaching 500 ids
+        #rolling prune - keep newest 250, discarding rest post 500 messages
         if len(self.seen_message_ids) > 500:
             to_remove = list(self.seen_message_ids)[:250]
             for item in to_remove:
                 self.seen_message_ids.pop(item, None)
 
     def kill(self):
-        self.dead = True
+        self.dead      = True
         self.dead_timer = 30
-        self.scared = False
 
     def draw(self, surf):
         if self.dead:
