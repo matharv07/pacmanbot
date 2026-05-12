@@ -66,6 +66,7 @@ class Ghost:
         self.known_pacman = None #(row, col) | None for not seen yet
         self.pacman_mode = "normal" #normal | powered | unknown
         self.pacman_last_seen = -1 #frame of when pacman was last seen for tiebreaks
+        self.last_lost_pacman = None #(row, col) of last invalidated pacman pos
         self.last_heartbeat = {} #frame of last received heartbeat from every ghost
         self.last_sync_frame = {} #frame of last full sync sent to every ghost
 
@@ -75,7 +76,7 @@ class Ghost:
         diffs = self._update_personal_map(all_ghosts, player_pos, powered)
         #piggyback heartbeat onto broadcast every N=5 frames
         if self.frame % HEARTBEAT_EVERY == 0:
-            diffs.append(("heartbeat", self.gid, self.row, self.col))
+            diffs.append(("heartbeat", self.gid, self.row, self.col, self.frame))
         self._broadcast(diffs, all_ghosts)
         self._process_messages(all_ghosts)
         self.move_counter += 1
@@ -133,7 +134,6 @@ class Ghost:
                 visible[(r, c)] = cell_val
                 if cell_val == WALL:
                     break
-
         #check co-ghost visibility
         agent_diffs = []
         for gid, ghost in all_ghosts.items():
@@ -159,6 +159,13 @@ class Ghost:
                 self.known_pacman = (pr, pc)
                 self.powered = powered #update powered state on seeing pacman to relay mode info
                 pacman_diff = ("pacman", pr, pc, powered, self.frame)
+            else:
+                if self.known_pacman is not None: #checking if pacman disappeared from 'known' location
+                    kr, kc = self.known_pacman
+                    if (kr, kc) in visible: #impliies pacman was expected to be seen there but has moved
+                        self.known_pacman = None
+                        self.last_lost_pacman = (kr, kc)
+                        pacman_diff = ("pacman_lost", kr, kc, self.frame)
 
         return visible, agent_diffs, pacman_diff
 
@@ -221,6 +228,8 @@ class Ghost:
         #transfer pacman last known position
         if self.known_pacman:
             sync_diffs.append(("pacman", self.known_pacman[0], self.known_pacman[1], self.powered, self.pacman_last_seen))
+        elif self.last_lost_pacman and self.pacman_last_seen > -1:
+            sync_diffs.append(("pacman_lost", self.last_lost_pacman[0], self.last_lost_pacman[1], self.pacman_last_seen))
 
         if sync_diffs:
             sync_id = ("sync", self.gid, target_ghost.gid, self.frame)
@@ -260,12 +269,12 @@ class Ghost:
                         self.known_agents[gid] = "UNKNOWN"
                         relay_diffs.append(diff)
                 elif dtype == "heartbeat":
-                    _, gid, r, c = diff
+                    _, gid, r, c, origin_frame = diff
                     if gid == self.gid:
                         continue
                     existing = self.last_heartbeat.get(gid, -1)
-                    if self.frame > existing:
-                        self.last_heartbeat[gid] = self.frame
+                    if origin_frame > existing:
+                        self.last_heartbeat[gid] = origin_frame
                     if r != 0 or c != 0:
                         old = self.known_agents.get(gid)
                         if old != (r, c):
@@ -284,12 +293,36 @@ class Ghost:
                         relay_diffs.append(diff)
                 elif dtype == "pacman":
                     _, r, c, powered, obs_frame = diff
-                    if obs_frame > self.pacman_last_seen:
+                    accept = False
+                    if self.known_pacman is None:
+                        if self.last_lost_pacman == (r, c):
+                            if obs_frame > self.pacman_last_seen:
+                                accept = True
+                        else:
+                            accept = True
+                    else:
+                        if obs_frame > self.pacman_last_seen:
+                            accept = True
+                    if accept:
                         self.known_pacman = (r, c)
                         self.powered = powered
                         self.pacman_last_seen = obs_frame
                         relay_diffs.append(diff)
-
+                elif dtype == "pacman_lost":
+                    _, lr, lc, obs_frame = diff
+                    if self.known_pacman == (lr, lc):
+                        if obs_frame > self.pacman_last_seen:
+                            self.known_pacman = None
+                            self.last_lost_pacman = (lr, lc)
+                            self.pacman_last_seen = obs_frame
+                            relay_diffs.append(diff)
+                    elif self.known_pacman is None:
+                        if obs_frame > self.pacman_last_seen:
+                            self.last_lost_pacman = (lr, lc)
+                            self.pacman_last_seen = obs_frame
+                        relay_diffs.append(diff)
+                    else:
+                        relay_diffs.append(diff)
             self._broadcast(relay_diffs, all_ghosts, msg_id=msg["id"], hop=hop + 1)
         self.message_queue.clear()
         
