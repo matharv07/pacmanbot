@@ -62,14 +62,13 @@ class Ghost:
         self.message_queue = []
         self.seen_message_ids = {}
         self.seq = 0
-        self.known_agents = {}    # gid -> (row, col) | "UNKNOWN"
-        self.last_heartbeat = {}    # gid -> frame of last received heartbeat
-        self.last_sync_frame = {}    # gid -> frame of last full sync sent to them
-        # pacman tracking — all fields updated together always
-        self.known_pacman = None  # (row, col) | None
-        self.pacman_powered = False # last known powered state
-        self.pacman_last_seen = -1    # frame of last confirmed sighting (direct or relayed)
-        self.last_lost_pacman = None  # (row, col) of last spot where pacman was confirmed gone
+        self.known_agents = {}          #(row, col) | UNKNOWN for dead/out of reach agents
+        self.last_heartbeat = {}        #frame of last received heartbeat from every ghost
+        self.last_sync_frame = {}       #frame of last full sync sent to every ghost
+        self.known_pacman = None        #(row, col) | None for not seen yet
+        self.pacman_powered = False     #normal | powered | unknown
+        self.pacman_last_seen = -1      #frame of when pacman was last seen for tiebreaks
+        self.last_lost_pacman = None    #(row, col) of last invalidated pacman pos
 
 
     def update(self, player_pos, powered, all_ghosts):
