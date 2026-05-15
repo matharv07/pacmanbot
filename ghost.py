@@ -1,6 +1,8 @@
 import pygame
 import random
 import math
+from cbba import CBBA_Agent
+from pathfinder import next_step
 
 CELL = 20
 COLS = 41
@@ -70,7 +72,8 @@ class Ghost:
         self.pacman_powered = False     #normal | powered | unknown
         self.pacman_last_seen = -1      #frame of when pacman was last seen for tiebreaks
         self.last_lost_pacman = None    #(row, col) of last invalidated pacman pos
-
+        self.cbba_agent = CBBA_Agent(gid) #CBBA auction agent for this ghost
+        self._cbba_z_global: dict = {}    #merged z vector from all received consensus payloads
 
     def update(self, player_pos, powered, all_ghosts):
         self.frame += 1
@@ -91,26 +94,41 @@ class Ghost:
         if self.move_counter < self.move_every:
             return
         self.move_counter = 0
-        rows = len(self.grid)
-        cols = len(self.grid[0])
-        options = []
-        for dr, dc in DIRS:
-            nr, nc = self.row + dr, self.col + dc
-            if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL):
-                options.append((dr, dc))
-        if not options:
-            return
-        if self.last_dir in options and random.random() < 0.70:
-            options = [self.last_dir]
-        else:
-            random.shuffle(options)
-        dr, dc = options[0]
-        self.prev_row, self.prev_col = self.row, self.col
-        self.row += dr
-        self.col += dc
-        self.last_dir = (dr, dc)
-        if self.grid[self.row][self.col] == POWER:
-            self.grid[self.row][self.col] = PELLET
+
+        #CBBA: get active task and move toward target
+        active_task = self.cbba_agent.step(self, self.frame)
+        self.cbba_agent.check_evade_cap(self._cbba_z_global)
+        moved = False
+        if active_task is not None:
+            nxt = next_step(self.personal_map, (self.row, self.col), active_task.target_pos)
+            if nxt is not None and nxt != (self.row, self.col):
+                self.prev_row, self.prev_col = self.row, self.col
+                self.row, self.col = nxt
+                self.last_dir = (self.row - self.prev_row, self.col - self.prev_col)
+                if self.grid[self.row][self.col] == POWER:
+                    self.grid[self.row][self.col] = PELLET
+                moved = True
+
+        if not moved:
+            rows = len(self.grid)
+            cols = len(self.grid[0])
+            options = []
+            for dr, dc in DIRS:
+                nr, nc = self.row + dr, self.col + dc
+                if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL):
+                    options.append((dr, dc))
+            if options:
+                if self.last_dir in options and random.random() < 0.70:
+                    options = [self.last_dir]
+                else:
+                    random.shuffle(options)
+                dr, dc = options[0]
+                self.prev_row, self.prev_col = self.row, self.col
+                self.row += dr
+                self.col += dc
+                self.last_dir = (dr, dc)
+                if self.grid[self.row][self.col] == POWER:
+                    self.grid[self.row][self.col] = PELLET
 
     def _check_liveness(self, all_ghosts):
         for gid in list(self.last_heartbeat.keys()):
@@ -177,10 +195,9 @@ class Ghost:
                 kr, kc = self.known_pacman
                 if (kr, kc) in visible:
                     self.last_lost_pacman = (kr, kc)
-                    self.pacman_last_seen = self.frame  #timestamp of loss
+                    self.pacman_last_seen = self.frame 
                     self.known_pacman     = None
                     pacman_diff = ("pacman_lost", kr, kc, self.frame)
-
         return visible, agent_diffs, pacman_diff
 
     def _update_personal_map(self, all_ghosts, player_pos, powered=False):
@@ -204,6 +221,9 @@ class Ghost:
         if msg_id is None:
             msg_id = (self.gid, self.frame, self.seq)
             self.seq += 1
+            #piggyback CBBA consensus payload on every new broadcast
+            cbba_payload = self.cbba_agent.get_consensus_payload()
+            diffs = list(diffs) + [("cbba", self.gid, cbba_payload)]
         self.seen_message_ids[msg_id] = True
         msg = {"id": msg_id, "diffs": diffs, "hop": hop}
         for ghost in all_ghosts.values():
@@ -321,6 +341,17 @@ class Ghost:
                             self.known_pacman = None
                         self.last_lost_pacman = (lr, lc)
                         self.pacman_last_seen = obs_frame
+                        relay_diffs.append(diff)
+                elif dtype == "cbba":
+                    _, sender_gid, payload = diff
+                    if sender_gid == self.gid:
+                        continue
+                    changed = self.cbba_agent.receive_consensus(sender_gid, payload["y"], payload["z"], payload["s"], self.frame)
+                    for k, v in payload["z"].items():
+                        key = eval(k)
+                        if v is not None:
+                            self._cbba_z_global[key] = v
+                    if changed:
                         relay_diffs.append(diff)
             self._broadcast(relay_diffs, all_ghosts, msg_id=msg["id"], hop=hop + 1)
         self.message_queue.clear()

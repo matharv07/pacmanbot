@@ -53,12 +53,16 @@ def _dist_score(d: float, scale: float) -> float:   #normalize the distances rec
     return math.exp(-d / scale) if d != math.inf and d >= 0 else 0.0
 
 def _score_hunt(ghost, dists: dict) -> Optional[Task]:
-    target = ghost.known_pacman
-    info = dists.get(target)
-    dist, path = info
+    if ghost.pacman_powered:
+        return None
+    target = ghost.known_pacman or ghost.last_lost_pacman  #fallback to last known location
     if target is None:
-        target = ghost.last_lost_pacman  #fallback to last known location - we set this up in the verifier method
-    if target is None or ghost.pacman_powered or info is None or dist == math.inf:
+        return None
+    info = dists.get(target)
+    if info is None:
+        return None
+    dist, _ = info
+    if dist == math.inf:
         return None
     score = _dist_score(dist, HUNT_SCALE)
     return Task(task_type=TaskType.HUNT, target_pos=target, score=score)
@@ -73,27 +77,41 @@ def _score_convert(ghost, dists: dict) -> List[Task]:
             if ghost.personal_map[r][c] == POWER:
                 pos = (r, c)
                 info = dists.get(pos)
-                dist, path = info
-                if info is None or dist == math.inf:
+                if info is None:
+                    continue
+                dist, _ = info
+                if dist == math.inf:
                     continue
                 score = _dist_score(dist, CONVERT_SCALE)
                 tasks.append(Task(task_type=TaskType.CONVERT, target_pos=pos, score=score))
     return tasks
 
 def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
+    if not ghost.pacman_powered:
+        return None
     target = ghost.known_pacman
+    if target is None:
+        return None
     info = dists.get(target)
-    dist, path = info
-    if not ghost.pacman_powered or target is None or info is None or dist == math.inf or dist < SAFE_RADIUS:
+    if info is None:
+        return None
+    dist, _ = info
+    if dist == math.inf or dist < SAFE_RADIUS:
         return None
     score = _dist_score(dist, SAFE_SCALE)
     return Task(task_type=TaskType.EVADE_TRACK, target_pos=target, score=score, created_frame=frame)
 
 def _score_evade_flee(ghost, dists: dict) -> Optional[Task]:
+    if not ghost.pacman_powered:
+        return None
     target = ghost.known_pacman
+    if target is None:
+        return None
     info = dists.get(target)
+    if info is None:
+        return None
     dist_to_pac, _ = info
-    if not ghost.pacman_powered or target is None or info is None or dist_to_pac == math.inf or dist_to_pac >= SAFE_RADIUS:
+    if dist_to_pac == math.inf or dist_to_pac >= SAFE_RADIUS:
         return None
     urgency_to_move = _dist_score(dist_to_pac, RISK_SCALE)
     #heuristic: we pick the map corner farthest from Pacman as flee destination - until next auction update
