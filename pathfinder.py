@@ -1,5 +1,5 @@
 """
-This module implements A* and Dijkstra as seperate means to compute optimal paths using each ghost's personal map.
+This program implements A* and Dijkstra as seperate means to compute optimal paths using each ghost's personal map.
 A* is used for single-target pathfinding for the RL model, wheras Dijkstra's multi-target nature is used by CBBA to score multi-candidate tasks.
 """
 
