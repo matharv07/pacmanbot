@@ -101,14 +101,13 @@ class Ghost:
         moved = False
         if active_task is not None:
             nxt = next_step(self.personal_map, (self.row, self.col), active_task.target_pos)
-            if nxt is not None and nxt != (self.row, self.col):
+            if (nxt is not None and nxt != (self.row, self.col) and self.grid[nxt[0]][nxt[1]] != WALL):
                 self.prev_row, self.prev_col = self.row, self.col
                 self.row, self.col = nxt
                 self.last_dir = (self.row - self.prev_row, self.col - self.prev_col)
                 if self.grid[self.row][self.col] == POWER:
                     self.grid[self.row][self.col] = PELLET
                 moved = True
-
         if not moved:
             rows = len(self.grid)
             cols = len(self.grid[0])
