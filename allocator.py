@@ -11,6 +11,7 @@ EXPLORE - map out unexplored regions
 
 from __future__ import annotations
 
+import heapq
 import math
 from dataclasses import dataclass
 from enum import IntEnum
@@ -27,19 +28,18 @@ UNKNOWN = -1
 #Setup decay constants for CBBA
 HUNT_SCALE    = 10.0
 CONVERT_SCALE = 8.0
-RISK_SCALE    = 6.0     #ghost capture risk from pacman
 SAFE_RADIUS   = 8       #min safe power pacman distance
 SAFE_SCALE    = 8.0
 RECENCY_SCALE = 20.0    #sets up quantity to prioritize revisiting older mapped locations
 EXPLORE_SCALE = 6.0
 UNKNOWN_BONUS = 100     #5x reward(?) of looking for new locations over updating old ones
+EXPLORE_TOP_K = 3       #number of top explore candidates passed to CBBA
 
 class TaskType(IntEnum):
     HUNT        = 0
     CONVERT     = 1
     EVADE_TRACK = 2
-    EVADE_FLEE  = 3
-    EXPLORE     = 4
+    EXPLORE     = 3
 
 @dataclass
 class Task:
@@ -101,32 +101,11 @@ def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
     score = _dist_score(dist, SAFE_SCALE)
     return Task(task_type=TaskType.EVADE_TRACK, target_pos=target, score=score, created_frame=frame)
 
-def _score_evade_flee(ghost, dists: dict) -> Optional[Task]:
-    if not ghost.pacman_powered:
-        return None
-    target = ghost.known_pacman
-    if target is None:
-        return None
-    info = dists.get(target)
-    if info is None:
-        return None
-    dist_to_pac, _ = info
-    if dist_to_pac == math.inf or dist_to_pac >= SAFE_RADIUS:
-        return None
-    urgency_to_move = _dist_score(dist_to_pac, RISK_SCALE)
-    #heuristic: we pick the map corner farthest from Pacman as flee destination - until next auction update
-    rows = len(ghost.personal_map)
-    cols = len(ghost.personal_map[0])
-    corners = [(1, 1), (1, cols - 2), (rows - 2, 1), (rows - 2, cols - 2)]
-    pr, pc = target
-    best_corner = max(corners, key=lambda c: abs(c[0] - pr) + abs(c[1] - pc))
-    return Task(task_type=TaskType.EVADE_FLEE, target_pos=best_corner, score=urgency_to_move)
 
-def _score_explore(ghost, frame: int) -> Optional[Task]:    #pick locations with unknown or older info
+def _score_explore(ghost, frame: int) -> List[Task]:    #pick top-K locations with unknown or older info
     rows = len(ghost.personal_map)
     cols = len(ghost.personal_map[0])
-    best_pos = None
-    best_age = -1
+    scored: list = []
     for r in range(1, rows - 1):
         for c in range(1, cols - 1):
             if ghost.personal_map[r][c] == WALL:
@@ -136,15 +115,16 @@ def _score_explore(ghost, frame: int) -> Optional[Task]:    #pick locations with
             else:
                 last = ghost.last_seen[r][c]
                 age = frame - last if last >= 0 else frame + 1
-            if age > best_age:
-                best_age = age
-                best_pos = (r, c)
-    if best_pos is None:
-        return None
-    score = 1.0 - math.exp(-best_age / RECENCY_SCALE)
-    #normalizing scoring using manhattan distance to make it similar terms to the other tasks
-    score *= _dist_score(abs(best_pos[0] - ghost.row) + abs(best_pos[1] - ghost.col), EXPLORE_SCALE)
-    return Task(task_type=TaskType.EXPLORE, target_pos=best_pos, score=score)
+            scored.append((age, (r, c)))
+    if not scored:
+        return []
+    top = heapq.nlargest(EXPLORE_TOP_K, scored, key=lambda x: x[0])
+    tasks: list = []
+    for age, pos in top:
+        score = 1.0 - math.exp(-age / RECENCY_SCALE)
+        score *= _dist_score(abs(pos[0] - ghost.row) + abs(pos[1] - ghost.col), EXPLORE_SCALE)
+        tasks.append(Task(task_type=TaskType.EXPLORE, target_pos=pos, score=score))
+    return tasks
 
 def generate_tasks(ghost, frame: int) -> List[Task]:
     start = (ghost.row, ghost.col)
@@ -162,9 +142,9 @@ def generate_tasks(ghost, frame: int) -> List[Task]:
     for cn in corners:
         targets.add(cn)
 
-    explore_task = _score_explore(ghost, frame)
-    if explore_task is not None:
-        targets.add(explore_task.target_pos)
+    explore_tasks = _score_explore(ghost, frame)
+    for et in explore_tasks:
+        targets.add(et.target_pos)
     dists = dijkstra_multi(ghost.personal_map, start, list(targets))
     tasks: list[Task] = []
     hunt = _score_hunt(ghost, dists)
@@ -174,11 +154,7 @@ def generate_tasks(ghost, frame: int) -> List[Task]:
     evade_track = _score_evade_track(ghost, dists, frame)
     if evade_track is not None:
         tasks.append(evade_track)
-    evade_flee = _score_evade_flee(ghost, dists)
-    if evade_flee is not None:
-        tasks.append(evade_flee)
-    if explore_task is not None:
-        tasks.append(explore_task)
+    tasks.extend(explore_tasks)
 
     for t in tasks:
         if t.created_frame == 0:

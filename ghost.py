@@ -1,6 +1,7 @@
 import pygame
 import random
 import math
+from collections import deque
 from cbba import CBBA_Agent
 from pathfinder import next_step
 
@@ -42,6 +43,7 @@ MEMORY_FRAMES     = 10
 HEARTBEAT_EVERY   = 5
 HEARTBEAT_TIMEOUT = 60
 RESYNC_EVERY      = 50
+OSCILLATION_WINDOW = 8   #position history length to prevent oscillations
 
 
 class Ghost:
@@ -73,7 +75,7 @@ class Ghost:
         self.pacman_last_seen = -1      #frame of when pacman was last seen for tiebreaks
         self.last_lost_pacman = None    #(row, col) of last invalidated pacman pos
         self.cbba_agent = CBBA_Agent(gid) #CBBA auction agent for this ghost
-        self._cbba_z_global: dict = {}    #merged z vector from all received consensus payloads
+        self.pos_history: deque = deque(maxlen=OSCILLATION_WINDOW)  #rolling position window for oscillation detection
 
     def update(self, player_pos, powered, all_ghosts):
         self.frame += 1
@@ -97,7 +99,6 @@ class Ghost:
 
         #CBBA: get active task and move toward target
         active_task = self.cbba_agent.step(self, self.frame)
-        self.cbba_agent.check_evade_cap(self._cbba_z_global)
         moved = False
         if active_task is not None:
             nxt = next_step(self.personal_map, (self.row, self.col), active_task.target_pos)
@@ -128,6 +129,19 @@ class Ghost:
                 self.last_dir = (dr, dc)
                 if self.grid[self.row][self.col] == POWER:
                     self.grid[self.row][self.col] = PELLET
+
+        self.pos_history.append((self.row, self.col))
+        self._check_oscillation()
+
+    def _check_oscillation(self):
+        if len(self.pos_history) < OSCILLATION_WINDOW:
+            return
+        cur = (self.row, self.col)
+        if self.pos_history.count(cur) < 2:
+            return
+        if self.known_pacman is None and self.last_lost_pacman is not None:
+            self.last_lost_pacman = None
+            self.pos_history.clear()  
 
     def _check_liveness(self, all_ghosts):
         for gid in list(self.last_heartbeat.keys()):
@@ -346,10 +360,6 @@ class Ghost:
                     if sender_gid == self.gid:
                         continue
                     changed = self.cbba_agent.receive_consensus(sender_gid, payload["y"], payload["z"], payload["s"], self.frame)
-                    for k, v in payload["z"].items():
-                        key = eval(k)
-                        if v is not None:
-                            self._cbba_z_global[key] = v
                     if changed:
                         relay_diffs.append(diff)
             self._broadcast(relay_diffs, all_ghosts, msg_id=msg["id"], hop=hop + 1)

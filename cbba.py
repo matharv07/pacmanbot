@@ -6,7 +6,6 @@ from allocator import TaskType, Task, generate_tasks
 AUCTION_EVERY   = 5      #full auction every 0.5s
 LT              = 3
 LAMBDA          = 0.95   #time decay factor
-EVADE_TRACK_CAP = 2      #max ghosts allowed to hold EVADE_TRACK simultaneously
 
 def _manhattan(a: tuple, b: tuple) -> float:
     return float(abs(a[0] - b[0]) + abs(a[1] - b[1]))
@@ -183,22 +182,3 @@ class CBBA_Agent:
             if key in self.path:
                 self.path.remove(key)
         self.bundle = self.bundle[:n_bar]
-
-    def check_evade_cap(self, z_global: dict) -> bool:
-        if not self.bundle:
-            return False
-        primary = self.bundle[0]
-        task = self._task_map.get(primary)
-        if task is None or task.task_type != TaskType.EVADE_TRACK:
-            return False
-        evade_count = sum(1 for key, winner in z_global.items() if isinstance(key, tuple) and key[0] == int(TaskType.EVADE_TRACK) and winner is not None)
-        if evade_count <= EVADE_TRACK_CAP:
-            return False
-        my_bid = self.y.get(primary, 0.0)
-        lower_bids = sum(1 for key, winner in z_global.items() if isinstance(key, tuple) and key[0] == int(TaskType.EVADE_TRACK) and winner is not None and self.y.get(key, 0.0) < my_bid)
-        if lower_bids < evade_count - EVADE_TRACK_CAP:
-            return False
-        self.y[primary] = 0.0
-        self.z[primary] = None
-        self._cascade_release()
-        return True
