@@ -127,8 +127,8 @@ def _score_explore(ghost, frame: int) -> Optional[Task]:    #pick locations with
     cols = len(ghost.personal_map[0])
     best_pos = None
     best_age = -1
-    for r in range(1, rows - 1):        #skip border rows (always walls)
-        for c in range(1, cols - 1):    #skip border cols (always walls)
+    for r in range(1, rows - 1):
+        for c in range(1, cols - 1):
             if ghost.personal_map[r][c] == WALL:
                 continue
             if ghost.personal_map[r][c] == UNKNOWN:
