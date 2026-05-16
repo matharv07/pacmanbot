@@ -4,6 +4,7 @@ import math
 from collections import deque
 from cbba import CBBA_Agent
 from pathfinder import next_step
+from beliefmap import BeliefMap
 
 CELL = 20
 COLS = 41
@@ -45,9 +46,8 @@ HEARTBEAT_TIMEOUT = 60
 RESYNC_EVERY      = 50
 OSCILLATION_WINDOW = 8   #position history length to prevent oscillations
 
-
 class Ghost:
-    def __init__(self, gid, grid, pos, color):
+    def __init__(self, gid, grid, pos, color, player_start):
         self.gid = gid
         self.grid = grid
         self.row, self.col = pos
@@ -74,8 +74,11 @@ class Ghost:
         self.pacman_powered = False     #normal | powered | unknown
         self.pacman_last_seen = -1      #frame of when pacman was last seen for tiebreaks
         self.last_lost_pacman = None    #(row, col) of last invalidated pacman pos
+        self.prev_pac_row: int = -1     #pacman's row on previous frame - belief map
+        self.prev_pac_col: int = -1     #pacman's col on previous frame - belief map
         self.cbba_agent = CBBA_Agent(gid) #CBBA auction agent for this ghost
         self.pos_history: deque = deque(maxlen=OSCILLATION_WINDOW)  #rolling position window for oscillation detection
+        self.belief_map = BeliefMap(gid, self.personal_map, player_start)
 
     def update(self, player_pos, powered, all_ghosts):
         self.frame += 1
@@ -103,19 +106,23 @@ class Ghost:
         if active_task is not None:
             nxt = next_step(self.personal_map, (self.row, self.col), active_task.target_pos)
             if (nxt is not None and nxt != (self.row, self.col) and self.grid[nxt[0]][nxt[1]] != WALL):
-                self.prev_row, self.prev_col = self.row, self.col
-                self.row, self.col = nxt
-                self.last_dir = (self.row - self.prev_row, self.col - self.prev_col)
-                if self.grid[self.row][self.col] == POWER:
-                    self.grid[self.row][self.col] = PELLET
-                moved = True
+                if self.pacman_powered and self.known_pacman is not None and nxt == self.known_pacman:
+                    pass
+                else:
+                    self.prev_row, self.prev_col = self.row, self.col
+                    self.row, self.col = nxt
+                    self.last_dir = (self.row - self.prev_row, self.col - self.prev_col)
+                    if self.grid[self.row][self.col] == POWER:
+                        self.grid[self.row][self.col] = PELLET
+                    moved = True
         if not moved:
             rows = len(self.grid)
             cols = len(self.grid[0])
+            pac_cell = self.known_pacman if (self.pacman_powered and self.known_pacman) else None
             options = []
             for dr, dc in DIRS:
                 nr, nc = self.row + dr, self.col + dc
-                if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL):
+                if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL and (nr, nc) != pac_cell):   #exclude Pacman's cell when powered
                     options.append((dr, dc))
             if options:
                 if self.last_dir in options and random.random() < 0.70:
@@ -214,18 +221,34 @@ class Ghost:
         return visible, agent_diffs, pacman_diff
 
     def _update_personal_map(self, all_ghosts, player_pos, powered=False):
-        visible, agent_diffs, pacman_diff = self._get_visible_cells(
-            all_ghosts, player_pos, powered)
+        visible, agent_diffs, pacman_diff = self._get_visible_cells(all_ghosts, player_pos, powered)
         diffs = []
         for (r, c), val in visible.items():
             old = self.personal_map[r][c]
             self.last_seen[r][c] = self.frame
             if old != val:
                 self.personal_map[r][c] = val
+                if val == WALL:
+                    self.belief_map.update_local_map_cell((r, c), WALL)
                 diffs.append(("cell", r, c, val))
         diffs.extend(agent_diffs)
         if pacman_diff:
             diffs.append(pacman_diff)
+        pr, pc = player_pos
+        pacman_in_los  = (pr, pc) in visible      #true every frame Pacman is actually visible
+        pacman_just_lost = pacman_diff is not None and pacman_diff[0] == "pacman_lost"
+        if pacman_in_los:
+            pac_dir = (0, 0)
+            if self.prev_pac_row >= 0:
+                pac_dir = (pr - self.prev_pac_row, pc - self.prev_pac_col)
+            self.belief_map.observe((pr, pc), pac_dir)
+            self.prev_pac_row, self.prev_pac_col = pr, pc  #update every LOS frame for accurate direction
+        elif pacman_just_lost:
+            _, kr, kc, _ = pacman_diff
+            self.belief_map.observe_lost((kr, kc))
+        self.belief_map.diffuse((self.row, self.col))
+        pac_pos = (pr, pc) if pacman_in_los else None  #preserve Pacman's cell during clear
+        self.belief_map.observe_clear(set(visible.keys()), pac_pos)
         return diffs
 
     def _broadcast(self, diffs, all_ghosts, msg_id=None, hop=0):
@@ -234,9 +257,9 @@ class Ghost:
         if msg_id is None:
             msg_id = (self.gid, self.frame, self.seq)
             self.seq += 1
-            #piggyback CBBA consensus payload on every new broadcast
-            cbba_payload = self.cbba_agent.get_consensus_payload()
-            diffs = list(diffs) + [("cbba", self.gid, cbba_payload)]
+            cbba_payload   = self.cbba_agent.get_consensus_payload()
+            belief_payload = self.belief_map.get_payload()
+            diffs = list(diffs) + [("cbba", self.gid, cbba_payload), ("belief", self.gid, belief_payload)]
         self.seen_message_ids[msg_id] = True
         msg = {"id": msg_id, "diffs": diffs, "hop": hop}
         for ghost in all_ghosts.values():
@@ -301,6 +324,8 @@ class Ghost:
                         if old != UNKNOWN and self.last_seen[r][c] >= self.frame - MEMORY_FRAMES:
                             continue    #reject stale cell update if we have seen it recently
                         self.personal_map[r][c] = val
+                        if val == WALL:
+                            self.belief_map.update_local_map_cell((r, c), WALL)
                         relay_diffs.append(diff)
                 elif dtype == "agent":
                     _, gid, r, c = diff
@@ -362,6 +387,12 @@ class Ghost:
                     changed = self.cbba_agent.receive_consensus(sender_gid, payload["y"], payload["z"], payload["s"], self.frame)
                     if changed:
                         relay_diffs.append(diff)
+                elif dtype == "belief":
+                    _, sender_gid, payload = diff
+                    if sender_gid == self.gid:
+                        continue
+                    self.belief_map.merge(sender_gid, payload, self.frame)
+                    relay_diffs.append(diff)  #always relay — belief spreads like heartbeats
             self._broadcast(relay_diffs, all_ghosts, msg_id=msg["id"], hop=hop + 1)
         self.message_queue.clear()
         #rolling prune - keep newest 250, discarding rest post 500 messages

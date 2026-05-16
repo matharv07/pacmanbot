@@ -96,11 +96,19 @@ def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
     if info is None:
         return None
     dist, _ = info
-    if dist == math.inf or dist < SAFE_RADIUS:
+    if dist == math.inf:
         return None
+    if dist < SAFE_RADIUS:
+        #already too close - will pick the map corner farthest from Pacman as emergency flee target
+        rows = len(ghost.personal_map)
+        cols = len(ghost.personal_map[0])
+        pr, pc = target
+        corners = [(1, 1), (1, cols - 2), (rows - 2, 1), (rows - 2, cols - 2)]
+        flee_target = max(corners, key=lambda c: abs(c[0] - pr) + abs(c[1] - pc))
+        urgency = _dist_score(dist, SAFE_SCALE) * 2.0  #doubled so flee beats any HUNT bid
+        return Task(task_type=TaskType.EVADE_TRACK, target_pos=flee_target, score=urgency, created_frame=frame)
     score = _dist_score(dist, SAFE_SCALE)
     return Task(task_type=TaskType.EVADE_TRACK, target_pos=target, score=score, created_frame=frame)
-
 
 def _score_explore(ghost, frame: int) -> List[Task]:    #pick top-K locations with unknown or older info
     rows = len(ghost.personal_map)

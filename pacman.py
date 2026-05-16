@@ -208,7 +208,7 @@ class Game:
         pr, pc = self.player_start
         open_cells.sort(key=lambda p: -abs(p[0] - pr) - abs(p[1] - pc))
         ghost_starts = open_cells[:7]
-        self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i]) for i, pos in enumerate(ghost_starts)}
+        self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i], self.player_start) for i, pos in enumerate(ghost_starts)}
         self.state = "playing"
         self.message_timer = 0
         self.debug_ghost_id = 0
@@ -339,6 +339,23 @@ class Game:
                 else:
                     color = (30, 30, 30)
                 pygame.draw.rect(self.screen, color, (x, y, CELL, CELL))
+        #belief heatmap overlay
+        bm = ghost.belief_map
+        if bm._initialised and bm._open_cells:
+            probs = [bm._b[r][c] for r, c in bm._open_cells]
+            max_p = max(probs) if probs else 0.0
+            if max_p > 1e-9:
+                cell_surf = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
+                for (r, c), p in zip(bm._open_cells, probs):
+                    if p < 0.001:
+                        continue
+                    t = min(1.0, p / max_p)
+                    red = int(t * 255)
+                    green = int((1.0 - t) * 40)
+                    blue = int((1.0 - t) * 210)
+                    alpha = int(60 + t * 180)
+                    cell_surf.fill((red, green, blue, alpha))
+                    self.screen.blit(cell_surf, (WIDTH + c * CELL, r * CELL))
 
         #iterate through known agent positions
         for gid, pos in ghost.known_agents.items():
@@ -364,7 +381,7 @@ class Game:
             pygame.draw.circle(self.screen, POWERED_COLOR if ghost.pacman_powered else YELLOW, (x, y), CELL // 2 - 2)
             label = self.small.render("P", True, BLACK)
             self.screen.blit(label, (WIDTH + pc * CELL + 2, pr * CELL + 2))
-        txt = self.small.render(f"Ghost {self.debug_ghost_id} local map  [0-6 to switch]", True, WHITE)
+        txt = self.small.render(f"Ghost {self.debug_ghost_id} local map + belief heatmap  [0-6 to switch]", True, WHITE)
         self.screen.blit(txt, (WIDTH + 4, ROWS * CELL + 6))
 
     def draw_overlay(self, msg, color=WHITE):
