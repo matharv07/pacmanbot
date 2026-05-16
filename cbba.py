@@ -1,11 +1,12 @@
 from __future__ import annotations
 import math
 from typing import Optional
+import ast
 from allocator import TaskType, Task, generate_tasks
 
 AUCTION_EVERY   = 5      #full auction every 0.5s
 LT              = 3
-LAMBDA          = 0.95   #time decay factor
+LAMBDA          = 0.99   #time decay factor
 
 def _manhattan(a: tuple, b: tuple) -> float:
     return float(abs(a[0] - b[0]) + abs(a[1] - b[1]))
@@ -45,8 +46,8 @@ class CBBA_Agent:
         return {"y": {str(k): v for k, v in self.y.items()}, "z": {str(k): v for k, v in self.z.items()}, "s": dict(self.s)}
 
     def receive_consensus(self, sender_gid: int, y_k: dict, z_k: dict, s_k: dict, frame: int) -> bool:
-        y_k = {eval(k): v for k, v in y_k.items()}
-        z_k = {eval(k): v for k, v in z_k.items()}
+        y_k = {ast.literal_eval(k): v for k, v in y_k.items()}
+        z_k = {ast.literal_eval(k): v for k, v in z_k.items()}
         self.s[sender_gid] = max(self.s.get(sender_gid, -1), frame)
         for agent_id, ts in s_k.items():
             if isinstance(agent_id, str):
@@ -78,8 +79,15 @@ class CBBA_Agent:
         valid_keys = {_task_key(t) for t in tasks}
         self._task_map.update({_task_key(t): t for t in tasks})
         #pruning bundle & path: keeping only tasks we still own in the new task set
-        self.bundle = [k for k in self.bundle if k in valid_keys and self.z.get(k) == self.gid]
-        self.path = [k for k in self.path if k in self.bundle]
+        new_bundle = []
+        for k in self.bundle:
+            if k in valid_keys and self.z.get(k) == self.gid:
+                new_bundle.append(k)
+            else:
+                break 
+        kept = set(new_bundle)
+        self.bundle = new_bundle
+        self.path   = [k for k in self.path if k in kept]
         #greedily adding tasks until bundle full or no valid candidate remains
         while len(self.bundle) < self.lt:
             best_key = None
@@ -138,35 +146,35 @@ class CBBA_Agent:
         return total
 
     def _table1(self, k: int, z_kj, z_ij, y_kj: float, y_ij: float, s_k: dict, s_i: dict) -> str:
-        #returns update / reset / leave
         i = self.gid
-        def s_kj(agent): return s_k.get(agent, s_k.get(str(agent), -1))
-        def s_ij(agent): return s_i.get(agent, -1)
-        if z_kj == k:
-            if z_ij == k:
-                return "update" if s_kj(k) > s_ij(k) else "leave"
-            elif z_ij == i:
-                return "update"
-            else:
-                return "update" if y_kj > y_ij else "leave"
-        elif z_kj == i:
-            if z_ij == k:
-                return "reset"
-            elif z_ij == i:
-                return "leave"
-            else:
-                return "leave"
-        elif z_kj is None:
-            return "update" if y_kj > y_ij else "leave"
-        else:
-            if z_ij == k:
-                return "update" if y_kj > y_ij else "leave"
-            elif z_ij == i:
-                return "reset" if s_kj(i) > s_ij(i) else "leave"
-            elif z_ij == z_kj:
-                return "update" if y_kj > y_ij else "leave"
-            else:
-                return "update" if y_kj > y_ij else "leave"
+        def sk(a): return s_k.get(a, s_k.get(str(a), -1))  #k's timestamp for agent a
+        def si(a): return s_i.get(a, s_i.get(str(a), -1))  #i's timestamp for agent a
+
+        if z_kj == k:           #sender claims self as winner
+            if z_ij == i: return "update" if y_kj > y_ij else "leave"
+            elif z_ij == k: return "update" if sk(k) > si(k) else "leave"
+            elif z_ij is None: return "update"
+            else: return "update" if y_kj > y_ij else "leave"  #z_ij == m
+
+        elif z_kj == i:         #sender claims receiver as winner
+            if z_ij == i: return "leave"
+            elif z_ij == k: return "reset"
+            elif z_ij is None: return "update"
+            else: return "update" if sk(i) > si(i) else "leave"  #z_ij == m
+
+        elif z_kj is None:      #sender says unassigned
+            if z_ij == i: return "leave"
+            elif z_ij == k: return "update" if sk(k) > si(k) else "leave"
+            elif z_ij is None: return "leave"
+            else: return "update" if sk(z_ij) > si(z_ij) else "leave"  #z_ij == m
+
+        else:                   #sender claims third agent m as winner
+            m = z_kj
+            if z_ij == i: return "update" if sk(m) > si(m) else "leave"
+            elif z_ij == k: return "update" if sk(m) > si(m) else "leave"
+            elif z_ij is None: return "update"
+            elif z_ij == m: return "update" if sk(m) > si(m) else "leave"  #same m
+            else: return "update" if y_kj > y_ij else "leave"   #different m'
 
     def _cascade_release(self):
         n_bar = None
@@ -176,9 +184,9 @@ class CBBA_Agent:
                 break
         if n_bar is None:
             return
+        kept = set(self.bundle[:n_bar])
         for key in self.bundle[n_bar:]:
             self.y[key] = 0.0
             self.z[key] = None
-            if key in self.path:
-                self.path.remove(key)
+        self.path   = [k for k in self.path if k in kept]  #filter in one pass, preserves order
         self.bundle = self.bundle[:n_bar]
