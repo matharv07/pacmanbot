@@ -127,7 +127,7 @@ def dijkstra_multi(grid: list, start: tuple, targets: list) -> dict:
                 came_from[neighbour] = node
                 heapq.heappush(open_heap, (tentative, neighbour))
 
-    return results      #return inf filled results - if all goals are unreachable from start
+    return results      #return infinite if all goals are unreachable from start
 
 def next_step(grid: list, start: tuple, goal: tuple) -> tuple | None:       #return immediate next step towards goal
     path = astar(grid, start, goal)

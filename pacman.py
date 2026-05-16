@@ -191,8 +191,13 @@ class Game:
         self.screen = pygame.display.set_mode((WIDTH * 2, HEIGHT))
         pygame.display.set_caption("PACMAN")
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("monospace", 18, bold=True)
-        self.small = pygame.font.SysFont("monospace", 14)
+        try:
+            pygame.font.init()
+            self.font  = pygame.font.SysFont("monospace", 18, bold=True)
+            self.small = pygame.font.SysFont("monospace", 14)
+        except Exception:
+            self.font  = pygame.font.Font(None, 22)
+            self.small = pygame.font.Font(None, 16)
         self.new_game()
 
     def new_game(self):
