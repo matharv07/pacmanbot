@@ -86,6 +86,23 @@ def _score_convert(ghost, dists: dict) -> List[Task]:
                 tasks.append(Task(task_type=TaskType.CONVERT, target_pos=pos, score=score))
     return tasks
 
+def _find_flee_pos(ghost, pacman_pos: tuple) -> Optional[tuple]:
+    pr, pc = pacman_pos
+    best_pos  = None
+    best_dist = -1
+    rows = len(ghost.personal_map)
+    cols = len(ghost.personal_map[0])
+    for r in range(rows):
+        for c in range(cols):
+            if ghost.personal_map[r][c] in (WALL, UNKNOWN):
+                continue
+            d = abs(r - pr) + abs(c - pc)
+            if d > best_dist:
+                best_dist = d
+                best_pos  = (r, c)
+    return best_pos
+
+
 def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
     if not ghost.pacman_powered:
         return None
@@ -99,16 +116,14 @@ def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
     if dist == math.inf:
         return None
     if dist < SAFE_RADIUS:
-        #already too close - will pick the map corner farthest from Pacman as emergency flee target
-        rows = len(ghost.personal_map)
-        cols = len(ghost.personal_map[0])
-        pr, pc = target
-        corners = [(1, 1), (1, cols - 2), (rows - 2, 1), (rows - 2, cols - 2)]
-        flee_target = max(corners, key=lambda c: abs(c[0] - pr) + abs(c[1] - pc))
-        urgency = _dist_score(dist, SAFE_SCALE) * 2.0  #doubled so flee beats any HUNT bid
-        return Task(task_type=TaskType.EVADE_TRACK, target_pos=flee_target, score=urgency, created_frame=frame)
-    score = _dist_score(dist, SAFE_SCALE)
-    return Task(task_type=TaskType.EVADE_TRACK, target_pos=target, score=score, created_frame=frame)
+        #inside danger zone - fleeing to farthest known cell
+        flee_pos = _find_flee_pos(ghost, target)
+        if flee_pos is None:
+            return None
+        return Task(task_type=TaskType.EVADE_TRACK,target_pos=flee_pos, score=2.0, created_frame=frame)
+    #outside danger zone - score by how far we are (farther => higher score)
+    score = 1.0 - _dist_score(dist, SAFE_SCALE)
+    return Task(task_type=TaskType.EVADE_TRACK, target_pos=_find_flee_pos(ghost, target) or target, score=score, created_frame=frame)
 
 def _score_explore(ghost, frame: int) -> List[Task]:    #pick top-K locations with unknown or older info
     rows = len(ghost.personal_map)
