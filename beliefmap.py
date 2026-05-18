@@ -11,9 +11,7 @@ TAU_RECENCY    = 60       #lower value adds trust to older messages
 MIN_CONFIDENCE = 0.02     #minimum trust in any message
 LOS_CERTAINTY  = 0.99     #trust in a direct sighting
 LOST_SPREAD    = 0.40     #how to spread out probability if we lose sight of pacman
-
 COMPRESS_THRESHOLD = 0.001   #cells below this are omitted from payload
-
 
 class BeliefMap:
     def __init__(self, gid: int, grid: list, pacman_start: Optional[tuple] = None):
@@ -75,7 +73,7 @@ class BeliefMap:
         for (r, c) in visible_cells:
             if (r, c) == pacman_pos:
                 continue
-            if self._b[r][c] > 0.0:
+            if self._b[r][c] > 1e-9:
                 self._b[r][c] = 0.0
                 changed = True
         if changed:
@@ -109,7 +107,7 @@ class BeliefMap:
         for r, c in self._open_cells:
             s[r][c] /= s_total
 
-        #log(posterior) proportional to (1-confidence)*log(prior) + confidence*log(sender)
+        #log of posterior poportional to (1-confidence)*log(prior) + confidence*log(sender)
         EPS = 1e-12   #adding miniscule value to prevent log(0)
         new_b = [row[:] for row in self._b]
         for r, c in self._open_cells:
