@@ -99,7 +99,6 @@ class Ghost:
         if self.move_counter < self.move_every:
             return
         self.move_counter = 0
-
         #CBBA: get active task and move toward target
         active_task = self.cbba_agent.step(self, self.frame)
         moved = False
@@ -402,7 +401,7 @@ class Ghost:
                 self.seen_message_ids.pop(item, None)
 
     def kill(self):
-        self.dead      = True
+        self.dead = True
         self.dead_timer = 30
 
     def draw(self, surf):
