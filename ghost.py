@@ -78,7 +78,7 @@ class Ghost:
         self.prev_pac_col: int = -1     #pacman's col on previous frame - belief map
         self.cbba_agent = CBBA_Agent(gid) #CBBA auction agent for this ghost
         self.pos_history: deque = deque(maxlen=OSCILLATION_WINDOW)  #rolling position window for oscillation detection
-        self.belief_map = BeliefMap(gid, self.personal_map, player_start)
+        self.belief_map = BeliefMap(gid, self.personal_map, pacman_start=player_start)
 
     def update(self, player_pos, powered, all_ghosts):
         self.frame += 1
@@ -95,6 +95,7 @@ class Ghost:
             diffs.append(("heartbeat", self.gid, self.row, self.col, self.frame))
         self._broadcast(diffs, all_ghosts)
         self._process_messages(all_ghosts)
+        self.belief_map.update_safety_map(self.known_agents, self.frame, powered=self.pacman_powered)
         self.move_counter += 1
         if self.move_counter < self.move_every:
             return
