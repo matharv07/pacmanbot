@@ -4,115 +4,70 @@ from typing import Optional
 
 WALL = 1
 
-# ── Pacman-tracking belief constants (unchanged) ────────────────────────────
-ALPHA_UNIFORM      = 0.12   # fraction of mass diffused to each neighbour every frame
-ALPHA_MOMENTUM     = 0.25   # direction-based mass sharing
-MOMENTUM_DECAY     = 80     # lower → trust older sightings less
-TAU_RECENCY        = 60     # lower → older messages trusted less
-MIN_CONFIDENCE     = 0.02   # minimum trust in any received message
-LOS_CERTAINTY      = 0.99   # trust in a direct sighting
-LOST_SPREAD        = 0.40   # probability spread when Pacman is lost
-COMPRESS_THRESHOLD = 0.001  # cells below this omitted from payload
+ALPHA_UNIFORM      = 0.12   #fraction of mass diffused to each neighbour every frame-ish
+ALPHA_MOMENTUM     = 0.25   #direction-based mass sharing
+MOMENTUM_DECAY     = 80     #lower value removes trust from older sightings
+TAU_RECENCY        = 60     #lower value adds trust to older messages
+MIN_CONFIDENCE     = 0.02   #minimum trust in any received message
+LOS_CERTAINTY      = 0.99   #trust in a direct sighting
+LOST_SPREAD        = 0.40   #how to spread out probability if we lose sight of pacman
+COMPRESS_THRESHOLD = 0.001  #cells below this are omitted from payload
 
-# ── Bayesian safety-map constants ───────────────────────────────────────────
-DANGER_SIGMA       = 6.0    # Gaussian σ (cells) for ghost danger falloff
-STALENESS_DECAY    = 40.0   # frames half-life for un-refreshed ghost positions
-UNSEEN_GHOST_PRIOR = 0.30   # prior danger weight for a ghost whose position is unknown
-PRIOR_UNIFORM_WT   = 1.0    # weight of the uniform prior (equivalent to one ghost
-                             # uniformly spread over the whole map)
-MIN_SAFETY         = 1e-6   # floor so log-space stays valid
-SAFETY_RECOMPUTE_EVERY = 3  # recompute safety map at most every N frames;
-                             # ghost positions don't change fast enough to
-                             # justify every-frame recomputation
+DANGER_SIGMA       = 6.0    #Gaussian variance cells for ghost danger falloff
+STALENESS_DECAY    = 40.0   #frames half-life for un-refreshed ghost positions
+UNSEEN_GHOST_PRIOR = 0.30   #PRIOR danger weight for a ghost whose position is unknown
+PRIOR_UNIFORM_WT   = 1.0    #weight of the uniform PRIOR
+MIN_SAFETY         = 1e-6   #minimum safety per cell to avoid divide-by-zero in normalisation and -infinity in logloss calc
+SAFETY_RECOMPUTE_EVERY = 3  #recompute safety map at most every N frames;
 
-# ── Powered-mode (hunt) constants ───────────────────────────────────────────
-HUNT_SIGMA         = 5.0    # Gaussian σ for attraction falloff toward ghosts
-                             # tighter than DANGER_SIGMA → sharper pull toward nearest ghost
-HUNT_CROWD_WEIGHT  = 0.4    # blend factor for crowd scoring vs proximal scoring:
-                             #   0.0 = pure proximal (go for single nearest ghost)
-                             #   1.0 = pure crowd    (go where most ghosts cluster)
-                             #   0.4 = default: mostly proximal, crowd as tiebreaker
-
+HUNT_SIGMA         = 5.0    #Gaussian variance for attraction falloff toward ghosts
+HUNT_CROWD_WEIGHT = 0.4     #blend factor for crowd scoring vs proximal scoring: 0.0 = pure proximal, 1.0 = pure crowd, 0.4 = blend
 
 class BeliefMap:
     """
-    Per-ghost probabilistic tracker of Pacman's position, now extended with a
-    Bayesian *safety map* that Pacman (or any observer) can query to find the
-    cells least likely to be occupied by a ghost.
-
     Safety ranking algorithm
-    ─────────────────────────
-    We treat each cell c as a hypothesis and maintain a danger score D(c) that
-    represents the posterior probability that at least one ghost is reachable
-    from c within a short time.
 
-    For every known ghost position g_i with staleness age_i (frames since last
-    confirmed sighting):
-
-        likelihood_i(c) = exp( -dist(c, g_i)² / (2 σ²) )   [Gaussian falloff]
-        weight_i        = exp( -age_i / STALENESS_DECAY )    [recency discount]
-
-        danger_i(c)     = weight_i · likelihood_i(c)         [weighted evidence]
+    For every known ghost position g_i with staleness age_i (frames since last confirmed sighting):
+        likelihood_i(c) = exp(-dist(c, g_i)**2 / (2 sigma**2))   [Gaussian falloff]
+        weight_i        = exp(-age_i / STALENESS_DECAY)          [recency discount]
+        danger_i(c)     = weight_i * likelihood_i(c)             [weighted evidence]
 
     Bayes update (log-space, multiplicative across independent ghosts):
+        log P(c unsafe) = Σ_i  danger_i(c)
 
-        log P(c unsafe) ∝ Σ_i  danger_i(c)
-
-    We include a uniform prior (PRIOR_UNIFORM_WT) so that cells with *no* ghost
-    evidence are not treated as perfectly safe.  After summing, we normalise the
+    We include a uniform prior (PRIOR_UNIFORM_WT) so that cells with no ghost evidence are not treated as perfectly safe.  After summing, we normalise the
     danger map to [0,1] and define:
-
         safety(c) = 1 − danger_norm(c)
 
-    Cells are then ranked descending by safety(c) — highest safety first.
-
-    Ghost positions are collected from every ghost this instance knows about via
-    `known_agents` (shared over the comms network in ghost.py).  Unknown ("UNKNOWN")
-    entries contribute a flat UNSEEN_GHOST_PRIOR to the danger of every cell,
-    reflecting our uncertainty.
+    Cells are then ranked descending by safety(c) - highest safety first.
+     
+    Pacman in non-powered mode should generally move towards the safest cell in its visible neighbourhood, which we can check each frame.
+    In powered mode, we can use the same safety map but invert it to get an "attraction" map and move towards the most attractive cell to hunt ghosts.
     """
 
     def __init__(self, gid: int, grid: list, pacman_start: Optional[tuple] = None):
-        self.gid   = gid
-        self.grid  = grid
-        self.rows  = len(grid)
-        self.cols  = len(grid[0])
-
-        # Pacman-position belief grid
-        self._b: list[list[float]] = [[0.0] * self.cols for _ in range(self.rows)]
+        self.gid = gid
+        self.grid = grid
+        self.rows = len(grid)
+        self.cols = len(grid[0])
+        self._b: list[list[float]] = [[0.0] * self.cols for _ in range(self.rows)]   #stores gridwise beliefmap
         self._initialised = False
-
-        self.last_known_pos:      Optional[tuple] = None
-        self.last_known_dir:      tuple           = (0, 0)
-        self.frames_since_sighting: int           = 9999
-
+        self.last_known_pos: Optional[tuple] = None
+        self.last_known_dir: tuple = (0, 0)
+        self.frames_since_sighting: int = 9999
         self._pacman_start: Optional[tuple] = pacman_start
-        self._neighbours:   dict[tuple, list[tuple]] = {}
-        self._open_cells:   list[tuple]              = []
+        self._neighbours: dict[tuple, list[tuple]] = {}
+        self._open_cells: list[tuple] = []
         self._compute_topology()
-
-        # Safety map — computed lazily each time update_safety_map() is called.
-        # _safety[r][c] ∈ [0, 1]: 1 = perfectly safe, 0 = ghost is here.
+        #SafetyMap: _safety[r][c] contains [0, 1], where 1 = perfectly safe, 0 = ghost present
         self._safety: list[list[float]] = [[1.0] * self.cols for _ in range(self.rows)]
-
-        # Snapshot of ghost positions used in last safety computation:
-        # { gid: (row, col) | "UNKNOWN" }
-        self._last_ghost_snapshot: dict = {}
-
-        # Per-ghost last-seen frame so we can compute staleness ourselves
-        # without needing a reference to the ghost object after the first call.
+        self._last_ghost_snapshot: dict = {}     #store last known ghost positions for bayesian modelling
         self._ghost_last_seen: dict[int, int] = {}
-
-        # Throttle tracking — skip recompute if nothing changed
-        self._last_safety_frame: int   = -999
-        self._last_powered:      bool  = False
-
-    # ════════════════════════════════════════════════════════════════════════
-    # Public: Pacman position tracking (unchanged behaviour)
-    # ════════════════════════════════════════════════════════════════════════
+        #Throttle tracking - skips recompute if nothing changed
+        self._last_safety_frame: int = -999
+        self._last_powered: bool = False
 
     def observe(self, pacman_pos: tuple, pacman_dir: tuple = (0, 0)):
-        """Direct line-of-sight sighting of Pacman."""
         self._ensure_initialised()
         r, c = pacman_pos
         total = sum(self._b[rr][cc] for rr, cc in self._open_cells) or 1.0
@@ -127,7 +82,6 @@ class BeliefMap:
         self._normalise()
 
     def observe_lost(self, last_pos: tuple):
-        """Pacman was just lost — spread probability in its last direction."""
         self._ensure_initialised()
         r, c       = last_pos
         outgoing   = self._b[r][c] * LOST_SPREAD
@@ -150,7 +104,6 @@ class BeliefMap:
         self._normalise()
 
     def observe_clear(self, visible_cells: set, pacman_pos=None):
-        """Zero out belief for visible cells that don't contain Pacman."""
         self._ensure_initialised()
         changed = False
         for (r, c) in visible_cells:
@@ -163,7 +116,6 @@ class BeliefMap:
             self._normalise()
 
     def diffuse(self, ghost_pos: tuple):
-        """Advance the belief one frame (call once per frame)."""
         self._ensure_initialised()
         self.frames_since_sighting = min(self.frames_since_sighting + 1, 9999)
         self._uniform_diffuse()
@@ -171,70 +123,49 @@ class BeliefMap:
             self._momentum_diffuse()
         self._normalise()
 
-    def merge(self, sender_gid: int, payload: dict, frame: int):
-        """
-        Bayesian merge of a remote ghost's belief payload into our own.
-
-        P(c | self, sender) ∝ P(c | self)^(1−conf) · P(c | sender)^conf
-        implemented in log-space for numerical stability.
-        """
+    def merge(self, sender_gid: int, payload: dict, frame: int):     #P(c | self, sender) = P(c | self)^(1−conf) x P(c | sender)^conf
         self._ensure_initialised()
         sender_fss = payload.get("fss", 9999)
         cells: dict = payload.get("cells", {})
         if not cells:
             return
-
         confidence = max(MIN_CONFIDENCE, math.exp(-sender_fss / TAU_RECENCY))
-
-        # Map received sparse dict onto a full grid
-        s       = [[0.0] * self.cols for _ in range(self.rows)]
+        #projecting recieved changes onto full map
+        s = [[0.0] * self.cols for _ in range(self.rows)]
         s_total = 0.0
         for key, val in cells.items():
             r, c = key if isinstance(key, tuple) else (key[0], key[1])
-            s[r][c]  = float(val)
+            s[r][c] = float(val)
             s_total += float(val)
         if s_total < 1e-9:
             return
         for r, c in self._open_cells:
             s[r][c] /= s_total
-
-        EPS   = 1e-12
         new_b = [row[:] for row in self._b]
         for r, c in self._open_cells:
-            log_prior  = math.log(max(self._b[r][c], EPS))
-            log_sender = math.log(max(s[r][c],        EPS))
-            new_b[r][c] = math.exp((1.0 - confidence) * log_prior
-                                   +        confidence  * log_sender)
+            log_prior = math.log(max(self._b[r][c], 1e-12))
+            log_sender = math.log(max(s[r][c], 1e-12))
+            new_b[r][c] = math.exp((1.0 - confidence) * log_prior + confidence * log_sender)    #log-loss compute
         self._b = new_b
-
         lkp = payload.get("lkp")
         if lkp is not None and sender_fss < self.frames_since_sighting:
-            self.last_known_pos        = tuple(lkp)
-            self.last_known_dir        = tuple(payload.get("lkd", (0, 0)))
+            self.last_known_pos = tuple(lkp)
+            self.last_known_dir = tuple(payload.get("lkd", (0, 0)))
             self.frames_since_sighting = sender_fss
-
         self._normalise()
 
     def get_payload(self) -> dict:
-        """Sparse payload for broadcast to peer ghosts."""
         self._ensure_initialised()
         cells = {}
         for r, c in self._open_cells:
             v = self._b[r][c]
             if v >= COMPRESS_THRESHOLD:
                 cells[(r, c)] = round(v, 5)
-        return {
-            "cells": cells,
-            "fss":   self.frames_since_sighting,
-            "lkp":   self.last_known_pos,
-            "lkd":   self.last_known_dir,
-        }
+        return {"cells": cells, "fss":   self.frames_since_sighting, "lkp":   self.last_known_pos, "lkd":   self.last_known_dir}
 
     def top_cells(self, n: int = 5) -> list[tuple]:
-        """Top-N cells by Pacman probability (descending)."""
         self._ensure_initialised()
-        ranked = sorted(self._open_cells,
-                        key=lambda rc: self._b[rc[0]][rc[1]], reverse=True)
+        ranked = sorted(self._open_cells, key=lambda rc: self._b[rc[0]][rc[1]], reverse=True)
         return ranked[:n]
 
     def probability_at(self, pos: tuple) -> float:
@@ -242,126 +173,77 @@ class BeliefMap:
         return self._b[pos[0]][pos[1]]
 
     def as_flat_list(self) -> list[float]:
-        """Flat list for RL agent consumption."""
         self._ensure_initialised()
         return [self._b[r][c] for r in range(self.rows) for c in range(self.cols)]
 
-    # ════════════════════════════════════════════════════════════════════════
-    # Public: Bayesian safety map — Pacman's perspective
-    # ════════════════════════════════════════════════════════════════════════
-
-    def update_safety_map(self, known_agents: dict, current_frame: int,
-                          powered: bool = False,
-                          hunt_mode: str = "blend"):
+    def update_safety_map(self, known_agents: dict, current_frame: int, powered: bool = False, hunt_mode: str = "blend"):
         """
-        Rebuild the safety/hunt map using the ghost positions already known
-        from broadcast messages — no full-map scan needed.
+        Updated strategy to distribute probability mass across nearest cells from sighting:
 
-        We already have every ghost's (row, col) in known_agents (maintained
-        by the comms layer).  Instead of iterating over all open cells for
-        every ghost, we BFS-flood outward from each known ghost position and
-        only touch cells within a meaningful radius (3σ cutoff).  Cells beyond
-        that get negligible Gaussian weight and are left at their prior value.
+            flight mode (unpowered):
+            score(c) = (1 - max_i) * danger_i(c)
+            We believe probability will be spread out to nearest neighbours and so on, and we do continuous calcuations cell wise to calculate the spread,
+            just like the previous version.
+            This time however, we rank cells by their maximum distance from all known ghosts, and favour their spread vs others - this allows for us to be 
+            prepared for human player strategies that involve hiding in corners and such in our probability calculations.
 
-        Mode is determined by self.pacman_powered (the ghost's *local* belief
-        about whether Pacman is powered, set only on direct sighting or via
-        comms — never from the global game state):
-            False → NORMAL:  safety map,  highest score = farthest from ghosts
-            True  → POWERED: hunt map,    highest score = closest to ghosts
-
-        hunt_mode (powered only)
-        ────────────────────────
-        "proximal" : score(c) = max_i  attraction_i(c)
-                     Go for the single nearest ghost.  Best when ghosts spread out.
-        "crowd"    : score(c) = Σ_i   attraction_i(c)
-                     Go where ghosts cluster.  Best for chaining kills.
-        "blend"    : (1−w)·proximal + w·crowd,  w = HUNT_CROWD_WEIGHT (default 0.4)
-                     Mostly proximal, crowd as tiebreaker.  Recommended default.
-
-        Complexity
-        ──────────
-        Old approach : O(open_cells × n_ghosts) every frame  (~4800+ ops/ghost/frame)
-        New approach : O(n_ghosts × radius²) every N frames  (~1000 ops total, skipped
-                       most frames unless ghost positions actually changed)
+            hunt mode (powered):
+                can select between three strategies for ranking cells by their attraction to known ghost positions -
+                "proximal": score(c) = max_i  attraction_i(c)
+                            Go for the nearest ghost. Best for when ghosts are spread out.
+                "crowd":    score(c) = Σ_i   attraction_i(c)
+                            Go behind ghost clusters. Best for chaining kills.
+                "blend":    (1−w)*proximal + w*crowd, w = HUNT_CROWD_WEIGHT (default 0.4)
+                            Mostly proximal, crowd as tiebreaker. Recommended default.
         """
-        # ── Guard: skip if nothing changed and not due for recompute ─────
-        new_snapshot = {
-            gid: pos for gid, pos in known_agents.items()
-            if pos != "UNKNOWN"
-        }
-        # powered is passed in from ghost.pacman_powered — the ghost's LOCAL
-        # belief set only on direct sighting or comms, never from global state
-
+        new_snapshot = {gid: pos for gid, pos in known_agents.items() if pos != "UNKNOWN"}
         positions_changed = (new_snapshot != self._last_ghost_snapshot)
-        mode_changed      = (powered != getattr(self, "_last_powered", None))
-        due               = (current_frame - getattr(self, "_last_safety_frame", -999)
-                             >= SAFETY_RECOMPUTE_EVERY)
-
+        mode_changed = (powered != getattr(self, "_last_powered", None))
+        due = (current_frame - getattr(self, "_last_safety_frame", -999) >= SAFETY_RECOMPUTE_EVERY)
         if not (positions_changed or mode_changed or due):
             return
-
         self._last_ghost_snapshot = new_snapshot
-        self._last_powered        = powered
-        self._last_safety_frame   = current_frame
-
-        # ── Update staleness tracking for known positions ─────────────────
+        self._last_powered = powered
+        self._last_safety_frame = current_frame
         for gid, pos in known_agents.items():
             if pos != "UNKNOWN":
                 self._ghost_last_seen[gid] = current_frame
-
         n_open = len(self._open_cells)
         if n_open == 0:
             return
-
-        # ── Build list of (gr, gc, weight) only from broadcast positions ──
-        # known_agents already contains every ghost position the network
-        # has reported — no map scan needed, just iterate the dict.
-        known_positions: list[tuple] = []   # (gr, gc, recency_weight)
+        known_positions: list[tuple] = []   #(gr, gc, recency_weight) - this decides spread for belief map
         n_unknown = 0
         for gid, pos in known_agents.items():
             if pos == "UNKNOWN":
                 n_unknown += 1
                 continue
             gr, gc = pos
-            age    = current_frame - self._ghost_last_seen.get(gid, current_frame)
+            age = current_frame - self._ghost_last_seen.get(gid, current_frame)
             weight = math.exp(-age / STALENESS_DECAY)
             known_positions.append((gr, gc, weight))
 
         sigma      = HUNT_SIGMA if powered else DANGER_SIGMA
-        cutoff_d2  = (3.0 * sigma) ** 2   # beyond 3σ contribution < 1% — skip
-
-        # ── Initialise score grid ─────────────────────────────────────────
-        # Normal:  start at uniform prior danger, BFS adds ghost-specific danger
-        # Powered: start at zero, BFS adds ghost-specific attraction
+        cutoff_d2  = (3.0 * sigma) ** 2   #beyond 3sigma contribution < 1% — skip
+        #Normal: start at uniform prior danger, BFS adds ghost-specific danger
+        #Powered: start at zero, BFS adds ghost-specific attraction
         if not powered:
             prior = PRIOR_UNIFORM_WT / n_open
-            # flat unknown-ghost penalty spread uniformly
-            flat_unknown = n_unknown * (UNSEEN_GHOST_PRIOR / n_open)
-            scores: dict[tuple, float] = {
-                (r, c): prior + flat_unknown for r, c in self._open_cells
-            }
+            flat_unknown = n_unknown * (UNSEEN_GHOST_PRIOR / n_open)    #spread unknown ghost prior evenly across all cells
+            scores: dict[tuple, float] = {(r, c): prior + flat_unknown for r, c in self._open_cells}
         else:
             scores = {(r, c): 0.0 for r, c in self._open_cells}
             if not known_positions:
-                # No ghost locations known at all — uniform score
+                #no ghost locations known at all — uniform score
                 for r, c in self._open_cells:
                     self._safety[r][c] = 1.0 / n_open
                 return
-
-        # ── BFS flood from each known ghost position ──────────────────────
-        # We flood outward in BFS order (Manhattan distance shells) and stop
-        # when the Gaussian contribution drops below the cutoff.  This means
-        # we never touch cells that wouldn't meaningfully change the score.
         DIRS4 = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-
-        # For powered hunt we also need proximal tracking per cell
-        proximal: dict[tuple, float] = {(r, c): 0.0 for r, c in self._open_cells} if powered else {}
+        proximal: dict[tuple, float] = {(r, c): 0.0 for r, c in self._open_cells} if powered else {}    #stores max_i attraction_i(c) for hunt mode - proximality
 
         for gr, gc, weight in known_positions:
             visited: set   = set()
-            queue:   list  = [(gr, gc, 0)]   # (row, col, dist²_so_far)
+            queue:   list  = [(gr, gc, 0)]   #(row, col, dist²_so_far)
             visited.add((gr, gc))
-
             while queue:
                 next_queue = []
                 for r, c, d2 in queue:
@@ -373,7 +255,6 @@ class BeliefMap:
                         scores[key] += contrib
                         if powered and contrib > proximal[key]:
                             proximal[key] = contrib
-
                     for dr, dc in DIRS4:
                         nr, nc = r + dr, c + dc
                         if (nr, nc) in visited:
@@ -381,96 +262,51 @@ class BeliefMap:
                         if not (0 <= nr < self.rows and 0 <= nc < self.cols):
                             continue
                         if self.grid[nr][nc] == WALL:
-                            visited.add((nr, nc))   # mark walls visited to skip
+                            visited.add((nr, nc))   #mark walls visited to skip
                             continue
                         nd2 = (nr - gr) ** 2 + (nc - gc) ** 2
                         if nd2 <= cutoff_d2:
                             visited.add((nr, nc))
                             next_queue.append((nr, nc, nd2))
                 queue = next_queue
-
-        # ── Normalise and write to _safety ────────────────────────────────
         if not powered:
             max_score = max(scores.values()) if scores else 1.0
             if max_score < MIN_SAFETY:
                 max_score = MIN_SAFETY
             for r, c in self._open_cells:
                 self._safety[r][c] = 1.0 - (scores[(r, c)] / max_score)
-
         else:
-            # crowd score is already in scores[]; proximal is in proximal[]
-            max_crowd = max(scores.values())    or MIN_SAFETY
-            max_prox  = max(proximal.values())  or MIN_SAFETY
-
+            max_crowd = max(scores.values()) or MIN_SAFETY
+            max_prox = max(proximal.values())  or MIN_SAFETY
             for r, c in self._open_cells:
                 c_norm = scores[(r, c)]   / max_crowd
                 p_norm = proximal[(r, c)] / max_prox
-
                 if hunt_mode == "proximal":
                     self._safety[r][c] = p_norm
                 elif hunt_mode == "crowd":
                     self._safety[r][c] = c_norm
-                else:   # "blend"
-                    self._safety[r][c] = ((1.0 - HUNT_CROWD_WEIGHT) * p_norm
-                                          +       HUNT_CROWD_WEIGHT  * c_norm)
-
-        # Walls stay at their initialised value (irrelevant to movement)
+                else:
+                    self._safety[r][c] = ((1.0 - HUNT_CROWD_WEIGHT) * p_norm + HUNT_CROWD_WEIGHT  * c_norm)   #blend szn
 
     def safety_at(self, pos: tuple) -> float:
-        """Return the safety score ∈ [0, 1] for a single cell (1 = safest)."""
         return self._safety[pos[0]][pos[1]]
 
-    def safest_cells(self, n: int = 5) -> list[tuple]:
-        """
-        Return the top-N open cells ranked by safety descending.
-
-        These are the most optimal positions for Pacman to move toward —
-        cells maximally distant (in Gaussian-weighted, recency-discounted
-        terms) from every known ghost location.
-
-        Usage example (from ghost.py or an AI Pacman controller):
-            best_moves = ghost.belief_map.safest_cells(n=3)
-            target     = best_moves[0]   # single best cell
-        """
-        ranked = sorted(
-            self._open_cells,
-            key=lambda rc: self._safety[rc[0]][rc[1]],
-            reverse=True,
-        )
+    def safest_cells(self, n: int = 5) -> list[tuple]:      #return n most optimal cells for pacman to move towards based on safety map
+        ranked = sorted(self._open_cells, key=lambda rc: self._safety[rc[0]][rc[1]], reverse=True)
         return ranked[:n]
 
-    def safest_neighbour(self, pacman_pos: tuple) -> Optional[tuple]:
-        """
-        Return the immediate neighbour of `pacman_pos` with the highest safety
-        score — useful for one-step greedy Pacman movement decisions.
-
-        Returns None if Pacman is completely surrounded by walls.
-        """
+    def safest_neighbour(self, pacman_pos: tuple) -> Optional[tuple]:   #same as safest_cells[1]
         candidates = self._neighbours.get(pacman_pos, [])
         if not candidates:
             return None
         return max(candidates, key=lambda rc: self._safety[rc[0]][rc[1]])
 
-    def safety_as_flat_list(self) -> list[float]:
-        """Flat list of safety scores for RL agent consumption."""
+    def safety_as_flat_list(self) -> list[float]:       #setup for RL strategizing
         return [self._safety[r][c]
                 for r in range(self.rows) for c in range(self.cols)]
 
     def safety_payload(self) -> dict:
-        """
-        Sparse dict of non-trivial safety scores for optional broadcast.
-        Ghosts could share this to give a collaborative danger picture to
-        any coordinating controller.
-        """
-        return {
-            (r, c): round(self._safety[r][c], 4)
-            for r, c in self._open_cells
-            if self._safety[r][c] < 0.95   # only send cells that matter
-        }
-
-    # ════════════════════════════════════════════════════════════════════════
-    # Grid topology helpers
-    # ════════════════════════════════════════════════════════════════════════
+        return {(r, c): round(self._safety[r][c], 4) for r, c in self._open_cells if self._safety[r][c] < 0.95}   #only send cells that are below safety threshold for ghosts
 
     def update_local_map_cell(self, pos: tuple, value: int):
         r, c = pos
@@ -480,8 +316,8 @@ class BeliefMap:
         self.grid[r][c] = value
         if value == WALL:
             self._remove_open_cell(pos)
-            self._b[r][c]      = 0.0
-            self._safety[r][c] = 1.0   # walls can't be stepped on
+            self._b[r][c] = 0.0
+            self._safety[r][c] = 1.0
         elif old == WALL:
             self._add_open_cell(pos)
         self._normalise()
@@ -505,18 +341,13 @@ class BeliefMap:
         neighbours = []
         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             nr, nc = r + dr, c + dc
-            if (0 <= nr < self.rows and 0 <= nc < self.cols
-                    and self.grid[nr][nc] != WALL):
+            if (0 <= nr < self.rows and 0 <= nc < self.cols and self.grid[nr][nc] != WALL):
                 neighbours.append((nr, nc))
         self._open_cells.append(pos)
         self._neighbours[pos] = neighbours
         for nbr in neighbours:
             if nbr in self._neighbours and pos not in self._neighbours[nbr]:
                 self._neighbours[nbr].append(pos)
-
-    # ════════════════════════════════════════════════════════════════════════
-    # Internal belief helpers (unchanged)
-    # ════════════════════════════════════════════════════════════════════════
 
     def _compute_topology(self):
         DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
@@ -528,16 +359,14 @@ class BeliefMap:
                 nbrs = []
                 for dr, dc in DIRS:
                     nr, nc = r + dr, c + dc
-                    if (0 <= nr < self.rows and 0 <= nc < self.cols
-                            and self.grid[nr][nc] != WALL):
+                    if (0 <= nr < self.rows and 0 <= nc < self.cols and self.grid[nr][nc] != WALL):
                         nbrs.append((nr, nc))
                 self._neighbours[(r, c)] = nbrs
 
     def _ensure_initialised(self):
         if self._initialised:
             return
-        if (self._pacman_start is not None
-                and self._pacman_start in self._open_cells):
+        if (self._pacman_start is not None and self._pacman_start in self._open_cells):
             r, c = self._pacman_start
             self._b[r][c] = 1.0
         else:
@@ -564,8 +393,8 @@ class BeliefMap:
             nbrs = self._neighbours[(r, c)]
             if not nbrs:
                 continue
-            outflow      = self._b[r][c] * ALPHA_UNIFORM
-            share        = outflow / len(nbrs)
+            outflow = self._b[r][c] * ALPHA_UNIFORM
+            share = outflow / len(nbrs)
             delta[r][c] -= outflow
             for nr, nc in nbrs:
                 delta[nr][nc] += share
@@ -580,17 +409,14 @@ class BeliefMap:
         if strength < 1e-4:
             return
         lr, lc = self.last_known_pos
-        dr, dc  = self.last_known_dir
-        candidates = [
-            (r, c) for r, c in self._neighbours.get((lr, lc), [])
-            if (r - lr) * dr + (c - lc) * dc > 0
-        ]
+        dr, dc = self.last_known_dir
+        candidates = [(r, c) for r, c in self._neighbours.get((lr, lc), []) if (r - lr) * dr + (c - lc) * dc > 0]
         if not candidates:
             return
         source_mass = self._b[lr][lc] * strength
         if source_mass < 1e-9:
             return
-        share           = source_mass / len(candidates)
+        share = source_mass / len(candidates)
         self._b[lr][lc] -= source_mass
         for r, c in candidates:
             self._b[r][c] += share
