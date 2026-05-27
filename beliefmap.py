@@ -242,7 +242,7 @@ class BeliefMap:
 
         for gr, gc, weight in known_positions:
             visited: set   = set()
-            queue:   list  = [(gr, gc, 0)]   #(row, col, dist²_so_far)
+            queue:   list  = [(gr, gc, 0)]   #(row, col, dist_so_far**2)
             visited.add((gr, gc))
             while queue:
                 next_queue = []
