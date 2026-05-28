@@ -177,25 +177,6 @@ class BeliefMap:
         return [self._b[r][c] for r in range(self.rows) for c in range(self.cols)]
 
     def update_safety_map(self, known_agents: dict, current_frame: int, powered: bool = False, hunt_mode: str = "blend"):
-        """
-        Updated strategy to distribute probability mass across nearest cells from sighting:
-
-            flight mode (unpowered):
-            score(c) = (1 - max_i) * danger_i(c)
-            We believe probability will be spread out to nearest neighbours and so on, and we do continuous calcuations cell wise to calculate the spread,
-            just like the previous version.
-            This time however, we rank cells by their maximum distance from all known ghosts, and favour their spread vs others - this allows for us to be 
-            prepared for human player strategies that involve hiding in corners and such in our probability calculations.
-
-            hunt mode (powered):
-                can select between three strategies for ranking cells by their attraction to known ghost positions -
-                "proximal": score(c) = max_i  attraction_i(c)
-                            Go for the nearest ghost. Best for when ghosts are spread out.
-                "crowd":    score(c) = Σ_i   attraction_i(c)
-                            Go behind ghost clusters. Best for chaining kills.
-                "blend":    (1−w)*proximal + w*crowd, w = HUNT_CROWD_WEIGHT (default 0.4)
-                            Mostly proximal, crowd as tiebreaker. Recommended default.
-        """
         new_snapshot = {gid: pos for gid, pos in known_agents.items() if pos != "UNKNOWN"}
         positions_changed = (new_snapshot != self._last_ghost_snapshot)
         mode_changed = (powered != getattr(self, "_last_powered", None))
@@ -224,8 +205,6 @@ class BeliefMap:
 
         sigma      = HUNT_SIGMA if powered else DANGER_SIGMA
         cutoff_d2  = (3.0 * sigma) ** 2   #beyond 3sigma contribution < 1% — skip
-        #Normal: start at uniform prior danger, BFS adds ghost-specific danger
-        #Powered: start at zero, BFS adds ghost-specific attraction
         if not powered:
             prior = PRIOR_UNIFORM_WT / n_open
             flat_unknown = n_unknown * (UNSEEN_GHOST_PRIOR / n_open)    #spread unknown ghost prior evenly across all cells
@@ -233,16 +212,15 @@ class BeliefMap:
         else:
             scores = {(r, c): 0.0 for r, c in self._open_cells}
             if not known_positions:
-                #no ghost locations known at all — uniform score
                 for r, c in self._open_cells:
                     self._safety[r][c] = 1.0 / n_open
                 return
         DIRS4 = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-        proximal: dict[tuple, float] = {(r, c): 0.0 for r, c in self._open_cells} if powered else {}    #stores max_i attraction_i(c) for hunt mode - proximality
+        proximal: dict[tuple, float] = {(r, c): 0.0 for r, c in self._open_cells} if powered else {}
 
         for gr, gc, weight in known_positions:
             visited: set   = set()
-            queue:   list  = [(gr, gc, 0)]   #(row, col, dist_so_far**2)
+            queue:   list  = [(gr, gc, 0)]
             visited.add((gr, gc))
             while queue:
                 next_queue = []
@@ -262,7 +240,7 @@ class BeliefMap:
                         if not (0 <= nr < self.rows and 0 <= nc < self.cols):
                             continue
                         if self.grid[nr][nc] == WALL:
-                            visited.add((nr, nc))   #mark walls visited to skip
+                            visited.add((nr, nc))
                             continue
                         nd2 = (nr - gr) ** 2 + (nc - gc) ** 2
                         if nd2 <= cutoff_d2:
@@ -286,27 +264,26 @@ class BeliefMap:
                 elif hunt_mode == "crowd":
                     self._safety[r][c] = c_norm
                 else:
-                    self._safety[r][c] = ((1.0 - HUNT_CROWD_WEIGHT) * p_norm + HUNT_CROWD_WEIGHT  * c_norm)   #blend szn
+                    self._safety[r][c] = ((1.0 - HUNT_CROWD_WEIGHT) * p_norm + HUNT_CROWD_WEIGHT  * c_norm)
 
     def safety_at(self, pos: tuple) -> float:
         return self._safety[pos[0]][pos[1]]
 
-    def safest_cells(self, n: int = 5) -> list[tuple]:      #return n most optimal cells for pacman to move towards based on safety map
+    def safest_cells(self, n: int = 5) -> list[tuple]:
         ranked = sorted(self._open_cells, key=lambda rc: self._safety[rc[0]][rc[1]], reverse=True)
         return ranked[:n]
 
-    def safest_neighbour(self, pacman_pos: tuple) -> Optional[tuple]:   #same as safest_cells[1]
+    def safest_neighbour(self, pacman_pos: tuple) -> Optional[tuple]:
         candidates = self._neighbours.get(pacman_pos, [])
         if not candidates:
             return None
         return max(candidates, key=lambda rc: self._safety[rc[0]][rc[1]])
 
-    def safety_as_flat_list(self) -> list[float]:       #setup for RL strategizing
-        return [self._safety[r][c]
-                for r in range(self.rows) for c in range(self.cols)]
+    def safety_as_flat_list(self) -> list[float]:
+        return [self._safety[r][c] for r in range(self.rows) for c in range(self.cols)]
 
     def safety_payload(self) -> dict:
-        return {(r, c): round(self._safety[r][c], 4) for r, c in self._open_cells if self._safety[r][c] < 0.95}   #only send cells that are below safety threshold for ghosts
+        return {(r, c): round(self._safety[r][c], 4) for r, c in self._open_cells if self._safety[r][c] < 0.95}
 
     def update_local_map_cell(self, pos: tuple, value: int):
         r, c = pos
@@ -315,6 +292,30 @@ class BeliefMap:
             return
         self.grid[r][c] = value
         if value == WALL:
+            mass = self._b[r][c]
+            neighbours = self._neighbours.get(pos, [])
+            if mass > 0 and neighbours:
+                weights = {}
+                total_w = 0.0
+                if self.last_known_pos is not None:
+                    lr, lc = self.last_known_pos
+                    dr, dc = lr - r, lc - c
+                    dist = math.hypot(dr, dc)
+                    if dist > 0:
+                        dr /= dist
+                        dc /= dist
+                    for nr, nc in neighbours:
+                        alignment = (nr - r) * dr + (nc - c) * dc
+                        w = max(0.01, alignment + 1.0)
+                        weights[(nr, nc)] = w
+                        total_w += w
+                else:
+                    for nr, nc in neighbours:
+                        weights[(nr, nc)] = 1.0
+                        total_w += 1.0    
+                if total_w > 0:
+                    for (nr, nc), w in weights.items():
+                        self._b[nr][nc] += mass * (w / total_w)
             self._remove_open_cell(pos)
             self._b[r][c] = 0.0
             self._safety[r][c] = 1.0
@@ -404,8 +405,7 @@ class BeliefMap:
     def _momentum_diffuse(self):
         if self.last_known_pos is None or self.last_known_dir == (0, 0):
             return
-        strength = ALPHA_MOMENTUM * math.exp(
-            -self.frames_since_sighting / MOMENTUM_DECAY)
+        strength = ALPHA_MOMENTUM * math.exp(-self.frames_since_sighting / MOMENTUM_DECAY)
         if strength < 1e-4:
             return
         lr, lc = self.last_known_pos
