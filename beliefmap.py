@@ -4,9 +4,9 @@ from typing import Optional
 
 WALL = 1
 
-ALPHA_UNIFORM      = 0.12   #fraction of mass diffused to each neighbour every frame-ish
+ALPHA_UNIFORM      = 0.18   #fraction of mass diffused to each neighbour every frame
 ALPHA_MOMENTUM     = 0.25   #direction-based mass sharing
-MOMENTUM_DECAY     = 80     #lower value removes trust from older sightings
+MOMENTUM_DECAY     = 50     #lower value removes trust from older sightings
 TAU_RECENCY        = 60     #lower value adds trust to older messages
 MIN_CONFIDENCE     = 0.02   #minimum trust in any received message
 LOS_CERTAINTY      = 0.99   #trust in a direct sighting
@@ -192,7 +192,7 @@ class BeliefMap:
         n_open = len(self._open_cells)
         if n_open == 0:
             return
-        known_positions: list[tuple] = []   #(gr, gc, recency_weight) - this decides spread for belief map
+        known_positions: list[tuple] = []
         n_unknown = 0
         for gid, pos in known_agents.items():
             if pos == "UNKNOWN":
@@ -202,12 +202,11 @@ class BeliefMap:
             age = current_frame - self._ghost_last_seen.get(gid, current_frame)
             weight = math.exp(-age / STALENESS_DECAY)
             known_positions.append((gr, gc, weight))
-
-        sigma      = HUNT_SIGMA if powered else DANGER_SIGMA
-        cutoff_d2  = (3.0 * sigma) ** 2   #beyond 3sigma contribution < 1% — skip
+        sigma = HUNT_SIGMA if powered else DANGER_SIGMA
+        cutoff_steps = int(3.0 * sigma)
         if not powered:
             prior = PRIOR_UNIFORM_WT / n_open
-            flat_unknown = n_unknown * (UNSEEN_GHOST_PRIOR / n_open)    #spread unknown ghost prior evenly across all cells
+            flat_unknown = n_unknown * (UNSEEN_GHOST_PRIOR / n_open)
             scores: dict[tuple, float] = {(r, c): prior + flat_unknown for r, c in self._open_cells}
         else:
             scores = {(r, c): 0.0 for r, c in self._open_cells}
@@ -219,20 +218,20 @@ class BeliefMap:
         proximal: dict[tuple, float] = {(r, c): 0.0 for r, c in self._open_cells} if powered else {}
 
         for gr, gc, weight in known_positions:
-            visited: set   = set()
-            queue:   list  = [(gr, gc, 0)]
+            visited: set = set()
+            queue: list = [(gr, gc, 0)] #track actual path steps instead of coordinate distance
             visited.add((gr, gc))
             while queue:
                 next_queue = []
-                for r, c, d2 in queue:
-                    if d2 > cutoff_d2:
+                for r, c, steps in queue:
+                    if steps > cutoff_steps:
                         continue
-                    contrib = weight * math.exp(-d2 / (2.0 * sigma ** 2))
+                    contrib = weight * math.exp(-(steps ** 2) / (2.0 * sigma ** 2))
                     key = (r, c)
                     if key in scores:
                         scores[key] += contrib
                         if powered and contrib > proximal[key]:
-                            proximal[key] = contrib
+                            proximal[key] = contrib        
                     for dr, dc in DIRS4:
                         nr, nc = r + dr, c + dc
                         if (nr, nc) in visited:
@@ -242,11 +241,10 @@ class BeliefMap:
                         if self.grid[nr][nc] == WALL:
                             visited.add((nr, nc))
                             continue
-                        nd2 = (nr - gr) ** 2 + (nc - gc) ** 2
-                        if nd2 <= cutoff_d2:
-                            visited.add((nr, nc))
-                            next_queue.append((nr, nc, nd2))
+                        visited.add((nr, nc))
+                        next_queue.append((nr, nc, steps + 1))
                 queue = next_queue
+                
         if not powered:
             max_score = max(scores.values()) if scores else 1.0
             if max_score < MIN_SAFETY:
@@ -255,16 +253,16 @@ class BeliefMap:
                 self._safety[r][c] = 1.0 - (scores[(r, c)] / max_score)
         else:
             max_crowd = max(scores.values()) or MIN_SAFETY
-            max_prox = max(proximal.values())  or MIN_SAFETY
+            max_prox = max(proximal.values()) or MIN_SAFETY
             for r, c in self._open_cells:
-                c_norm = scores[(r, c)]   / max_crowd
+                c_norm = scores[(r, c)] / max_crowd
                 p_norm = proximal[(r, c)] / max_prox
                 if hunt_mode == "proximal":
                     self._safety[r][c] = p_norm
                 elif hunt_mode == "crowd":
                     self._safety[r][c] = c_norm
                 else:
-                    self._safety[r][c] = ((1.0 - HUNT_CROWD_WEIGHT) * p_norm + HUNT_CROWD_WEIGHT  * c_norm)
+                    self._safety[r][c] = ((1.0 - HUNT_CROWD_WEIGHT) * p_norm + HUNT_CROWD_WEIGHT * c_norm)
 
     def safety_at(self, pos: tuple) -> float:
         return self._safety[pos[0]][pos[1]]
@@ -395,10 +393,22 @@ class BeliefMap:
             if not nbrs:
                 continue
             outflow = self._b[r][c] * ALPHA_UNIFORM
-            share = outflow / len(nbrs)
-            delta[r][c] -= outflow
+            #compute weights based on the path's safety map
+            nbr_weights = []
+            total_w = 0.0
             for nr, nc in nbrs:
-                delta[nr][nc] += share
+                safety_val = self._safety[nr][nc]
+                w = math.exp(safety_val * 3.0) 
+                nbr_weights.append(((nr, nc), w))
+                total_w += w
+            delta[r][c] -= outflow
+            if total_w > 0:
+                for (nr, nc), w in nbr_weights:
+                    delta[nr][nc] += outflow * (w / total_w)
+            else:
+                share = outflow / len(nbrs)
+                for nr, nc in nbrs:
+                    delta[nr][nc] += share
         for r, c in self._open_cells:
             self._b[r][c] = max(0.0, self._b[r][c] + delta[r][c])
 
