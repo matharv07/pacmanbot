@@ -423,7 +423,7 @@ class Game:
         self.player.update(self.ghosts)
         powered = self.player.powered
         for ghost in self.ghosts.values():
-            ghost.update((self.player.row, self.player.col), powered, self.ghosts)
+            ghost.update((self.player.row, self.player.col), powered, self.ghosts, training_mode=TRAINING_MODE)
         if not self.player.dead:
             for gid, ghost in list(self.ghosts.items()):
                 if ghost.dead:
@@ -432,6 +432,8 @@ class Game:
                 swapped = (ghost.row == self.player.prev_row and ghost.col == self.player.prev_col and self.player.row == ghost.prev_row and self.player.col == ghost.prev_col)
                 if (same_cell or swapped):
                     if self.player.powered:
+                        if TRAINING_MODE and ghost.last_state is not None and ghost.last_action_idx != -1:
+                            ghost.rl_agent.buffer.push(ghost.last_state, ghost.last_action_idx, -100.0, ghost.last_state, True)
                         death_msg = {"id": ("death", gid, ghost.frame), "diffs": [("agent_lost", gid)], "hop": 0}
                         for g in self.ghosts.values():
                             if g.gid != gid:
@@ -439,13 +441,19 @@ class Game:
                         del self.ghosts[gid]
                         self.player.score += 200
                     else:
+                        if TRAINING_MODE and ghost.last_state is not None and ghost.last_action_idx != -1:
+                            ghost.rl_agent.buffer.push(ghost.last_state, ghost.last_action_idx, 100.0, ghost.last_state, True)
                         self.player.die()
                         self.state = "gameover"
-                        self.message_timer = 90
+                        self.message_timer = 90 if not TRAINING_MODE else 0
                         break
         if self.pellets_left() == 0:
             self.state = "win"
-            self.message_timer = 60
+            self.message_timer = 60 if not TRAINING_MODE else 0
+            
+        if TRAINING_MODE:
+            for ghost in self.ghosts.values():
+                ghost.rl_agent.train()
 
     def draw_grid(self):
         surf = self.screen

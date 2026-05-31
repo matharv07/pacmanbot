@@ -5,6 +5,8 @@ from collections import deque
 from cbba import CBBA_Agent
 from pathfinder import next_step
 from beliefmap import BeliefMap
+from allocator import TaskType
+from rl_agent import RLAgent
 
 CELL = 20
 COLS = 41
@@ -79,8 +81,11 @@ class Ghost:
         self.cbba_agent = CBBA_Agent(gid) #CBBA auction agent for this ghost
         self.pos_history: deque = deque(maxlen=OSCILLATION_WINDOW)  #rolling position window for oscillation detection
         self.belief_map = BeliefMap(gid, self.personal_map, pacman_start=player_start)
+        self.rl_agent = RLAgent(gid)
+        self.last_state = None
+        self.last_action_idx = -1
 
-    def update(self, player_pos, powered, all_ghosts):
+    def update(self, player_pos, powered, all_ghosts, training_mode=False):
         self.frame += 1
         if self.dead:
             self.dead_timer -= 1
@@ -104,7 +109,26 @@ class Ghost:
         active_task = self.cbba_agent.step(self, self.frame)
         moved = False
         if active_task is not None:
-            nxt = next_step(self.personal_map, (self.row, self.col), active_task.target_pos)
+            #using RL agent for pathfinding instead of a-star
+            nxt, current_state, action_idx = self.rl_agent.get_next_step(self.personal_map, self.belief_map, (self.row, self.col), active_task.target_pos, training_mode=training_mode)
+            if training_mode and self.last_state is not None and self.last_action_idx != -1:
+                reward = -0.01
+                reached = ((self.row, self.col) == active_task.target_pos)
+                if reached:
+                    reward = 1.0                
+                #heuristic reward based on belief map       
+                if self.belief_map._initialised:
+                    prob = self.belief_map._b[self.row][self.col]
+                    if active_task.task_type == TaskType.EVADE_TRACK:
+                        reward -= prob * 10.0  #penalize stepping into likely pacman locations
+                    elif active_task.task_type == TaskType.HUNT:
+                        reward += prob * 2.0   #reward following the probability scent
+                        
+                self.rl_agent.buffer.push(self.last_state, self.last_action_idx, reward, current_state, reached)
+                
+            self.last_state = current_state
+            self.last_action_idx = action_idx
+            
             if (nxt is not None and nxt != (self.row, self.col) and self.grid[nxt[0]][nxt[1]] != WALL):
                 if self.pacman_powered and self.known_pacman is not None and nxt == self.known_pacman:
                     pass
