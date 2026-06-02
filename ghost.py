@@ -49,7 +49,7 @@ RESYNC_EVERY      = 50
 OSCILLATION_WINDOW = 8   #position history length to prevent oscillations
 
 class Ghost:
-    def __init__(self, gid, grid, pos, color, player_start):
+    def __init__(self, gid, grid, pos, color, player_start, rl_agent=None):
         self.gid = gid
         self.grid = grid
         self.row, self.col = pos
@@ -81,20 +81,21 @@ class Ghost:
         self.cbba_agent = CBBA_Agent(gid) #CBBA auction agent for this ghost
         self.pos_history: deque = deque(maxlen=OSCILLATION_WINDOW)  #rolling position window for oscillation detection
         self.belief_map = BeliefMap(gid, self.personal_map, pacman_start=player_start)
-        self.rl_agent = RLAgent(gid)
+        self.rl_agent = rl_agent
         self.last_state = None
         self.last_action_idx = -1
 
-    def update(self, player_pos, powered, all_ghosts, training_mode=False):
+    def update(self, player_pos, powered, all_ghosts):
         self.frame += 1
+        newly_discovered = 0
         if self.dead:
             self.dead_timer -= 1
             if self.dead_timer <= 0:
                 self.dead = False
                 self.row, self.col = self.respawn
-            return
+            return newly_discovered
         self._check_liveness(all_ghosts)
-        diffs = self._update_personal_map(all_ghosts, player_pos, powered)
+        diffs, newly_discovered = self._update_personal_map(all_ghosts, player_pos, powered)
         #piggyback heartbeat every N=5 frames
         if self.frame % HEARTBEAT_EVERY == 0:
             diffs.append(("heartbeat", self.gid, self.row, self.col, self.frame))
@@ -103,29 +104,15 @@ class Ghost:
         self.belief_map.update_safety_map(self.known_agents, self.frame, powered=self.pacman_powered)
         self.move_counter += 1
         if self.move_counter < self.move_every:
-            return
+            return newly_discovered
         self.move_counter = 0
         #CBBA: get active task and move toward target
         active_task = self.cbba_agent.step(self, self.frame)
         moved = False
         if active_task is not None:
             #using RL agent for pathfinding instead of a-star
-            nxt, current_state, action_idx = self.rl_agent.get_next_step(self.personal_map, self.belief_map, (self.row, self.col), active_task.target_pos, training_mode=training_mode)
-            if training_mode and self.last_state is not None and self.last_action_idx != -1:
-                reward = -0.01
-                reached = ((self.row, self.col) == active_task.target_pos)
-                if reached:
-                    reward = 1.0                
-                #heuristic reward based on belief map       
-                if self.belief_map._initialised:
-                    prob = self.belief_map._b[self.row][self.col]
-                    if active_task.task_type == TaskType.EVADE_TRACK:
-                        reward -= prob * 10.0  #penalize stepping into likely pacman locations
-                    elif active_task.task_type == TaskType.HUNT:
-                        reward += prob * 2.0   #reward following the probability scent
-                        
-                self.rl_agent.buffer.push(self.last_state, self.last_action_idx, reward, current_state, reached)
-                
+            nxt, current_state, action_idx = self.rl_agent.get_next_step(self.personal_map, self.belief_map, (self.row, self.col))
+            
             self.last_state = current_state
             self.last_action_idx = action_idx
             
@@ -163,6 +150,7 @@ class Ghost:
 
         self.pos_history.append((self.row, self.col))
         self._check_oscillation()
+        return newly_discovered
 
     def _check_oscillation(self):
         if len(self.pos_history) < OSCILLATION_WINDOW:
@@ -247,10 +235,13 @@ class Ghost:
     def _update_personal_map(self, all_ghosts, player_pos, powered=False):
         visible, agent_diffs, pacman_diff = self._get_visible_cells(all_ghosts, player_pos, powered)
         diffs = []
+        newly_discovered = 0
         for (r, c), val in visible.items():
             old = self.personal_map[r][c]
             self.last_seen[r][c] = self.frame
             if old != val:
+                if old == UNKNOWN:
+                    newly_discovered += 1
                 self.personal_map[r][c] = val
                 if val == WALL:
                     self.belief_map.update_local_map_cell((r, c), WALL)
@@ -273,7 +264,7 @@ class Ghost:
         self.belief_map.diffuse((self.row, self.col))
         pac_pos = (pr, pc) if pacman_in_los else None  #preserve Pacman's cell during clear
         self.belief_map.observe_clear(set(visible.keys()), pac_pos)
-        return diffs
+        return diffs, newly_discovered
 
     def _broadcast(self, diffs, all_ghosts, msg_id=None, hop=0):
         if not diffs:

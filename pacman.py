@@ -2,8 +2,12 @@ import pygame
 import random
 import math
 import sys
+import os
 from collections import deque
 from ghost import Ghost, UNKNOWN
+from rl_agent import RLAgent, GhostRLNetwork, TORCH_AVAILABLE, device
+if TORCH_AVAILABLE:
+    import torch
 
 CELL = 20
 COLS = 41
@@ -25,7 +29,7 @@ GREY   = (80, 80, 80)
 POWERED_COLOR = (0, 120, 255)
 GHOST_COLORS  = [RED, PINK, CYAN, ORANGE, (180, 0, 180), (0, 180, 80), (220, 220, 0)]
 
-TRAINING_MODE = False
+AUTO_MODE = False
 TOGGLE_WIDTH, TOGGLE_HEIGHT = 160, 32
 TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH - 10, ROWS * CELL + 8, TOGGLE_WIDTH, TOGGLE_HEIGHT)
 
@@ -206,7 +210,7 @@ class Player:
             return (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL)
         
         self.prev_row, self.prev_col = self.row, self.col
-        if TRAINING_MODE:
+        if AUTO_MODE:
             self.t += 1
             ghost_maps = []
             min_ghost_dist = float('inf')
@@ -356,6 +360,18 @@ class Game:
         except Exception:
             self.font  = pygame.font.Font(None, 22)
             self.small = pygame.font.Font(None, 16)
+        self.shared_model = None
+        if TORCH_AVAILABLE:
+            self.shared_model = GhostRLNetwork(input_channels=2, output_dim=4).to(device)
+            model_path = "ghostweights.pth"
+            if os.path.exists(model_path):
+                try:
+                    self.shared_model.load_state_dict(torch.load(model_path, map_location=device))
+                    print(f"Loaded weights from {model_path}")
+                except Exception as e:
+                    pass
+            self.shared_model.eval()
+        self.agents = {i: RLAgent(i, shared_model=self.shared_model, shared_target=self.shared_model) for i in range(7)}
         self.new_game()
 
     def new_game(self):
@@ -366,7 +382,7 @@ class Game:
         pr, pc = self.player_start
         open_cells.sort(key=lambda p: -abs(p[0] - pr) - abs(p[1] - pc))
         ghost_starts = open_cells[:7]
-        self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i], self.player_start) for i, pos in enumerate(ghost_starts)}
+        self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i], self.player_start, rl_agent=self.agents[i]) for i, pos in enumerate(ghost_starts)}
         self.state = "playing"
         self.message_timer = 0
         self.debug_ghost_id = 0
@@ -399,8 +415,8 @@ class Game:
             if event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1: 
                     if self.state == "playing" and TOGGLE_RECT.collidepoint(event.pos):
-                        global TRAINING_MODE
-                        TRAINING_MODE = not TRAINING_MODE
+                        global AUTO_MODE
+                        AUTO_MODE = not AUTO_MODE
                         self.player.m_row, self.player.m_col = 0.0, 0.0
                         self.player.v_row, self.player.v_col = 0.0, 0.0
                         self.player.t = 0
@@ -423,7 +439,7 @@ class Game:
         self.player.update(self.ghosts)
         powered = self.player.powered
         for ghost in self.ghosts.values():
-            ghost.update((self.player.row, self.player.col), powered, self.ghosts, training_mode=TRAINING_MODE)
+            ghost.update((self.player.row, self.player.col), powered, self.ghosts)
         if not self.player.dead:
             for gid, ghost in list(self.ghosts.items()):
                 if ghost.dead:
@@ -432,8 +448,7 @@ class Game:
                 swapped = (ghost.row == self.player.prev_row and ghost.col == self.player.prev_col and self.player.row == ghost.prev_row and self.player.col == ghost.prev_col)
                 if (same_cell or swapped):
                     if self.player.powered:
-                        if TRAINING_MODE and ghost.last_state is not None and ghost.last_action_idx != -1:
-                            ghost.rl_agent.buffer.push(ghost.last_state, ghost.last_action_idx, -100.0, ghost.last_state, True)
+
                         death_msg = {"id": ("death", gid, ghost.frame), "diffs": [("agent_lost", gid)], "hop": 0}
                         for g in self.ghosts.values():
                             if g.gid != gid:
@@ -441,19 +456,16 @@ class Game:
                         del self.ghosts[gid]
                         self.player.score += 200
                     else:
-                        if TRAINING_MODE and ghost.last_state is not None and ghost.last_action_idx != -1:
-                            ghost.rl_agent.buffer.push(ghost.last_state, ghost.last_action_idx, 100.0, ghost.last_state, True)
+
                         self.player.die()
                         self.state = "gameover"
-                        self.message_timer = 90 if not TRAINING_MODE else 0
+                        self.message_timer = 90 if not AUTO_MODE else 0
                         break
         if self.pellets_left() == 0:
             self.state = "win"
-            self.message_timer = 60 if not TRAINING_MODE else 0
+            self.message_timer = 60 if not AUTO_MODE else 0
             
-        if TRAINING_MODE:
-            for ghost in self.ghosts.values():
-                ghost.rl_agent.train()
+
 
     def draw_grid(self):
         surf = self.screen
@@ -483,9 +495,9 @@ class Game:
             pygame.draw.rect(self.screen, POWERED_COLOR, (WIDTH // 2 - 50, y + 28, bar_w, 8))
             txt = self.small.render("POWERED", True, POWERED_COLOR)
             self.screen.blit(txt, (WIDTH // 2 - 28, y + 10))
-        bg_btn = (0, 200, 100) if TRAINING_MODE else GREY
+        bg_btn = (0, 200, 100) if AUTO_MODE else GREY
         pygame.draw.rect(self.screen, bg_btn, TOGGLE_RECT, border_radius=4)
-        lbl_msg = "TRAINING MODE" if TRAINING_MODE else "MANUAL PLAY"
+        lbl_msg = "AUTO MODE" if AUTO_MODE else "MANUAL PLAY"
         text_btn = self.small.render(lbl_msg, True, WHITE)
         text_rect = text_btn.get_rect(center=TOGGLE_RECT.center)
         self.screen.blit(text_btn, text_rect)
