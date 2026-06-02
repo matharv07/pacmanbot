@@ -27,7 +27,7 @@ class PacmanMultiAgentEnv:
         self.step_count += 1
         self.player.update(self.ghosts)
         powered = self.player.powered
-        rewards = {i: -0.1 for i in self.ghosts.keys()}
+        rewards = {i: -0.15 for i in self.ghosts.keys()}
         for gid, ghost in self.ghosts.items():
             if ghost.dead:
                 ghost.update((self.player.row, self.player.col), powered, self.ghosts)
@@ -61,10 +61,10 @@ class PacmanMultiAgentEnv:
                         ghost.kill()
                         self.player.score += 200
                     else:
-                        rewards[gid] += 50.0  #capturer reward
+                        rewards[gid] += 300.0  #capturer reward
                         for g, pos in ghost.known_agents.items():
                             if pos != "UNKNOWN":
-                                rewards[g] += 35.0  #hive strategy reward
+                                rewards[g] += 100.0  #hive strategy reward
                         self.player.die()
                         terminated = True
                         break
