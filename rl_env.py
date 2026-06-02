@@ -57,7 +57,7 @@ class PacmanMultiAgentEnv:
                 swapped = (ghost.row == self.player.prev_row and ghost.col == self.player.prev_col and self.player.row == ghost.prev_row and self.player.col == ghost.prev_col)
                 if same_cell or swapped:
                     if self.player.powered:
-                        rewards[gid] -= 100.0  #large penalty for being eaten
+                        rewards[gid] = 100.0  #large penalty for being eaten
                         ghost.kill()
                         self.player.score += 200
                     else:
