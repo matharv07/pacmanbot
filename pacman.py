@@ -362,7 +362,7 @@ class Game:
             self.small = pygame.font.Font(None, 16)
         self.shared_model = None
         if TORCH_AVAILABLE:
-            self.shared_model = GhostRLNetwork(input_channels=2, output_dim=4).to(device)
+            self.shared_model = GhostRLNetwork(input_channels=6, output_dim=4).to(device)
             model_path = "ghostweights.pth"
             if os.path.exists(model_path):
                 try:

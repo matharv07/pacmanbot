@@ -15,7 +15,7 @@ except ImportError:
     device = "cpu"
 
 class GhostRLNetwork(None if not TORCH_AVAILABLE else nn.Module):
-    def __init__(self, input_channels=2, output_dim=4):
+    def __init__(self, input_channels=6, output_dim=4):
         if TORCH_AVAILABLE:
             super(GhostRLNetwork, self).__init__()
             self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=3, padding=1)
@@ -96,13 +96,13 @@ class RLAgent:
         self.sync_target_frames = 1000
         self.frame_count = 0
         if TORCH_AVAILABLE:
-            if shared_model is not None and shared_target is not None and shared_trainer is not None:
+            if shared_model is not None and shared_target is not None:
                 self.model = shared_model
                 self.target_model = shared_target
                 self.trainer = shared_trainer
             else:
-                self.model = GhostRLNetwork(input_channels=2, output_dim=4).to(device)
-                self.target_model = GhostRLNetwork(input_channels=2, output_dim=4).to(device)
+                self.model = GhostRLNetwork(input_channels=6, output_dim=4).to(device)
+                self.target_model = GhostRLNetwork(input_channels=6, output_dim=4).to(device)
                 if os.path.exists(self.model_path):
                     try:
                         self.model.load_state_dict(torch.load(self.model_path, map_location=device))
@@ -117,15 +117,21 @@ class RLAgent:
             self.target_model = None
             self.trainer = None
 
-    def _prepare_state(self, personal_map, belief_map):     #store state as (personal map + belief map)
+    def _prepare_state(self, personal_map, belief_map, target_pos=None):     #store state as (personal map + belief map)
         rows, cols = len(personal_map), len(personal_map[0])
-        p_map = np.array(personal_map, dtype=np.float32)
-        b_map = np.zeros_like(p_map)
+        p_map = np.array(personal_map, dtype=np.int32)
+        one_hot = np.zeros((4, rows, cols), dtype=np.float32)
+        for i in range(4):
+            one_hot[i] = (p_map == i).astype(np.float32)
+        b_map = np.zeros((rows, cols), dtype=np.float32)
         if hasattr(belief_map, '_b'):
             for r in range(rows):
                 for c in range(cols):
                     b_map[r][c] = belief_map._b[r][c]
-        state = np.stack([p_map, b_map], axis=0)
+        target_map = np.zeros((rows, cols), dtype=np.float32)
+        if target_pos is not None:
+            target_map[target_pos[0]][target_pos[1]] = 1.0
+        state = np.concatenate([one_hot, np.expand_dims(b_map, axis=0), np.expand_dims(target_map, axis=0)], axis=0)
         return state
         
     def save_model(self):
@@ -139,8 +145,8 @@ class RLAgent:
             t.score = random.uniform(0.1, 10.0)
         return tasks
 
-    def get_next_step(self, personal_map, belief_map, current_pos, training_mode=False):    #predicts optimal immediate next step (dr, dc)
-        state = self._prepare_state(personal_map, belief_map)
+    def get_next_step(self, personal_map, belief_map, current_pos, target_pos=None, training_mode=False):    #predicts optimal immediate next step (dr, dc)
+        state = self._prepare_state(personal_map, belief_map, target_pos)
         rows, cols = len(personal_map), len(personal_map[0])
         valid_actions = []
         for i, (dr, dc) in enumerate(self.DIRS):

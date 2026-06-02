@@ -10,8 +10,8 @@ def train(episodes=1000):
     print("Starting headless MARL training!!!")
     env = PacmanMultiAgentEnv(max_steps=500)
     if TORCH_AVAILABLE:
-        shared_model = GhostRLNetwork(input_channels=2, output_dim=4).to(device)
-        shared_target = GhostRLNetwork(input_channels=2, output_dim=4).to(device)
+        shared_model = GhostRLNetwork(input_channels=6, output_dim=4).to(device)
+        shared_target = GhostRLNetwork(input_channels=6, output_dim=4).to(device)
         model_path = "ghostweights.pth"
         if os.path.exists(model_path):
             try:

@@ -111,7 +111,8 @@ class Ghost:
         moved = False
         if active_task is not None:
             #using RL agent for pathfinding instead of a-star
-            nxt, current_state, action_idx = self.rl_agent.get_next_step(self.personal_map, self.belief_map, (self.row, self.col))
+            target_pos = active_task.target_pos if hasattr(active_task, 'target_pos') else None
+            nxt, current_state, action_idx = self.rl_agent.get_next_step(self.personal_map, self.belief_map, (self.row, self.col), target_pos)
             
             self.last_state = current_state
             self.last_action_idx = action_idx

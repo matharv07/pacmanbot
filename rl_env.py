@@ -79,13 +79,21 @@ class PacmanMultiAgentEnv:
             if ghost.dead:
                 continue
             #convert (personal+belief) map to numeric array for NN
-            p_map = np.array(ghost.personal_map, dtype=np.float32)
-            b_map = np.zeros_like(p_map)
+            p_map = np.array(ghost.personal_map, dtype=np.int32)
+            one_hot = np.zeros((4, ROWS, COLS), dtype=np.float32)
+            for i in range(4):
+                one_hot[i] = (p_map == i).astype(np.float32)
+            b_map = np.zeros((ROWS, COLS), dtype=np.float32)
             if ghost.belief_map._initialised:
                 for r in range(ROWS):
                     for c in range(COLS):
                         b_map[r][c] = ghost.belief_map._b[r][c]
-            state = np.stack([p_map, b_map], axis=0)
+            target_map = np.zeros((ROWS, COLS), dtype=np.float32)
+            active_task = ghost.cbba_agent.get_active_task()
+            if active_task and active_task.target_pos:
+                tr, tc = active_task.target_pos
+                target_map[tr][tc] = 1.0
+            state = np.concatenate([one_hot, np.expand_dims(b_map, axis=0), np.expand_dims(target_map, axis=0)], axis=0)
             obs[gid] = state
         return obs
 
