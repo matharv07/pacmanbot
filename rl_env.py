@@ -61,8 +61,10 @@ class PacmanMultiAgentEnv:
                         ghost.kill()
                         self.player.score += 200
                     else:
-                        for g in self.ghosts.keys():
-                            rewards[g] += 50.0  #team reward for capturing pacman
+                        rewards[gid] += 50.0  #capturer reward
+                        for g, pos in ghost.known_agents.items():
+                            if pos != "UNKNOWN":
+                                rewards[g] += 35.0  #hive strategy reward
                         self.player.die()
                         terminated = True
                         break
