@@ -7,7 +7,7 @@ import pacman
 from rl_env import PacmanMultiAgentEnv
 from rl_agent import RLAgent, GhostRLNetwork, DQN_Trainer, ReplayBuffer, TORCH_AVAILABLE, device
 
-def train(episodes=1000, start_episode=1):
+def train(episodes=1000, start_episode=0):
     pacman.AUTO_MODE = True
     print("Starting headless MARL training!!!")
     env = PacmanMultiAgentEnv(max_steps=500)
@@ -29,7 +29,7 @@ def train(episodes=1000, start_episode=1):
         shared_model = shared_target = shared_trainer = shared_buffer = None
     agents = {i: RLAgent(i, shared_model=shared_model, shared_target=shared_target, shared_trainer=shared_trainer, shared_buffer=shared_buffer) for i in range(7)}
     for gid in agents:
-        agents[gid].epsilon = max(agents[gid].epsilon_min, (agents[gid].epsilon_decay ** (start_episode-1)))
+        agents[gid].epsilon = max(agents[gid].epsilon_min, (agents[gid].epsilon_decay ** start_episode))
     for ep in range(start_episode, episodes):
         obs, info = env.reset()
         for gid, ghost in env.ghosts.items():
