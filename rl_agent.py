@@ -188,5 +188,3 @@ class RLAgent:
         if self.frame_count % self.sync_target_frames == 0:
             self.trainer.sync_target()
             self.save_model()
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay

@@ -27,7 +27,7 @@ class PacmanMultiAgentEnv:
         self.step_count += 1
         self.player.update(self.ghosts)
         powered = self.player.powered
-        rewards = {i: -0.15 for i in self.ghosts.keys()}
+        rewards = {i: -0.25 for i in self.ghosts.keys()}
         for gid, ghost in self.ghosts.items():
             if ghost.dead:
                 ghost.update((self.player.row, self.player.col), powered, self.ghosts)
@@ -43,10 +43,10 @@ class PacmanMultiAgentEnv:
                         ghost.last_dir = (dr, dc)
                         if self.grid[ghost.row][ghost.col] == POWER:
                             self.grid[ghost.row][ghost.col] = PELLET
-                            rewards[gid] += 10.0
+                            rewards[gid] += 7.0
             newly_discovered = ghost.update((self.player.row, self.player.col), powered, self.ghosts)
             if newly_discovered:
-                rewards[gid] += newly_discovered * 0.5
+                rewards[gid] += newly_discovered * 0.25
         terminated = False
         truncated = self.step_count >= self.max_steps
         if not self.player.dead:
@@ -57,7 +57,7 @@ class PacmanMultiAgentEnv:
                 swapped = (ghost.row == self.player.prev_row and ghost.col == self.player.prev_col and self.player.row == ghost.prev_row and self.player.col == ghost.prev_col)
                 if same_cell or swapped:
                     if self.player.powered:
-                        rewards[gid] = 100.0  #large penalty for being eaten
+                        rewards[gid] -= 100.0  #large penalty for being eaten
                         ghost.kill()
                         self.player.score += 200
                     else:
@@ -71,8 +71,7 @@ class PacmanMultiAgentEnv:
         if sum(1 for r in self.grid for c in r if c in (PELLET, POWER)) == 0:
             terminated = True
             for g in self.ghosts.keys():
-                rewards[g] -= 50.0  #penalty for letting pacman win
-
+                rewards[g] -= 200.0  #penalty for letting pacman win
         return self._get_observations(), rewards, terminated, truncated, self._get_info()
 
     def _get_observations(self):
