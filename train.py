@@ -75,11 +75,13 @@ def train(episodes=1000, start_episode=0):
                     action_idx = int(np.argmax(q_vals))        
                 actions[gid] = RLAgent.DIRS[action_idx]
                 action_indices[gid] = action_idx
+            prev_dead = {gid: env.ghosts[gid].dead for gid in active_gids}
             next_obs, rewards, terminated, truncated, info = env.step(actions)
             for gid, state in current_states.items():
                 reward = rewards.get(gid, 0)
                 next_state = next_obs.get(gid, state)
-                done = terminated or truncated
+                just_died = env.ghosts[gid].dead and not prev_dead.get(gid, False)
+                done = terminated or truncated or just_died
                 agents[gid].buffer.push(state, action_indices[gid], reward, next_state, done)
             if current_states:
                 agents[0].train()

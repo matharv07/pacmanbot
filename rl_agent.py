@@ -20,16 +20,17 @@ class GhostRLNetwork(None if not TORCH_AVAILABLE else nn.Module):
             super(GhostRLNetwork, self).__init__()
             self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=3, padding=1)
             self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+            self.pool = nn.MaxPool2d(2)
             self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
             self.conv4 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
-            self.fc1 = nn.Linear(128 * 33 * 41, 1024)
-            self.fc2 = nn.Linear(1024, output_dim)
+            self.fc1 = nn.Linear(128 * 8 * 10, 512)
+            self.fc2 = nn.Linear(512, output_dim)
 
     def forward(self, x):
         if not TORCH_AVAILABLE:
             return None
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
         x = F.relu(self.conv3(x))
         x = F.relu(self.conv4(x))
         x = x.view(x.size(0), -1)
@@ -58,7 +59,7 @@ class DQN_Trainer:
         self.gamma = gamma
         if TORCH_AVAILABLE:
             self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
-            self.criterion = nn.MSELoss()
+            self.criterion = nn.SmoothL1Loss()
             
     def train_step(self, buffer, batch_size):
         if not TORCH_AVAILABLE or len(buffer) < batch_size:
@@ -76,6 +77,7 @@ class DQN_Trainer:
         loss = self.criterion(q_values, target_q_values)
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
         self.optimizer.step()
         
     def sync_target(self):
@@ -138,7 +140,7 @@ class RLAgent:
         if TORCH_AVAILABLE:
             torch.save(self.model.state_dict(), self.model_path)
 
-    def score_tasks(self, tasks, personal_map, belief_map, ghost_pos):
+    def score_tasks(self, tasks, personal_map, belief_map, ghost_pos):          #for RL based task scoring -- setup only currently we use djikstra
         if not tasks:
             return []
         for t in tasks:

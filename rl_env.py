@@ -32,7 +32,7 @@ class PacmanMultiAgentEnv:
             if ghost.dead:
                 ghost.update((self.player.row, self.player.col), powered, self.ghosts)
                 continue
-            if gid in actions:
+            if gid in actions and (ghost.move_counter+1) >= ghost.move_every:
                 action = actions[gid]
                 if isinstance(action, tuple) and len(action) == 2:
                     dr, dc = action
