@@ -108,46 +108,47 @@ class Ghost:
         self.move_counter = 0
         #CBBA: get active task and move toward target
         active_task = self.cbba_agent.step(self, self.frame)
-        moved = False
-        if active_task is not None:
-            #using RL agent for pathfinding instead of a-star
-            target_pos = active_task.target_pos if hasattr(active_task, 'target_pos') else None
-            nxt, current_state, action_idx = self.rl_agent.get_next_step(self.personal_map, self.belief_map, (self.row, self.col), target_pos)
-            
-            self.last_state = current_state
-            self.last_action_idx = action_idx
-            
-            if (nxt is not None and nxt != (self.row, self.col) and self.grid[nxt[0]][nxt[1]] != WALL):
-                if self.pacman_powered and self.known_pacman is not None and nxt == self.known_pacman:
-                    pass
-                else:
+        if self.rl_agent is not None:
+            moved = False
+            if active_task is not None:
+                target_pos = active_task.target_pos if hasattr(active_task, 'target_pos') else None
+                nxt, current_state, action_idx = self.rl_agent.get_next_step(self.personal_map, self.belief_map, (self.row, self.col), target_pos)
+                
+                self.last_state = current_state
+                self.last_action_idx = action_idx
+                
+                if (nxt is not None and nxt != (self.row, self.col) and self.grid[nxt[0]][nxt[1]] != WALL):
+                    if self.pacman_powered and self.known_pacman is not None and nxt == self.known_pacman:
+                        pass
+                    else:
+                        self.prev_row, self.prev_col = self.row, self.col
+                        self.row, self.col = nxt
+                        self.last_dir = (self.row - self.prev_row, self.col - self.prev_col)
+                        if self.grid[self.row][self.col] == POWER:
+                            self.grid[self.row][self.col] = PELLET
+                        moved = True
+                        
+            if not moved:
+                rows = len(self.grid)
+                cols = len(self.grid[0])
+                pac_cell = self.known_pacman if (self.pacman_powered and self.known_pacman) else None
+                options = []
+                for dr, dc in DIRS:
+                    nr, nc = self.row + dr, self.col + dc
+                    if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL and (nr, nc) != pac_cell):
+                        options.append((dr, dc))
+                if options:
+                    if self.last_dir in options and random.random() < 0.70:
+                        options = [self.last_dir]
+                    else:
+                        random.shuffle(options)
+                    dr, dc = options[0]
                     self.prev_row, self.prev_col = self.row, self.col
-                    self.row, self.col = nxt
-                    self.last_dir = (self.row - self.prev_row, self.col - self.prev_col)
+                    self.row += dr
+                    self.col += dc
+                    self.last_dir = (dr, dc)
                     if self.grid[self.row][self.col] == POWER:
                         self.grid[self.row][self.col] = PELLET
-                    moved = True
-        if not moved:
-            rows = len(self.grid)
-            cols = len(self.grid[0])
-            pac_cell = self.known_pacman if (self.pacman_powered and self.known_pacman) else None
-            options = []
-            for dr, dc in DIRS:
-                nr, nc = self.row + dr, self.col + dc
-                if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL and (nr, nc) != pac_cell):   #exclude Pacman's cell when powered
-                    options.append((dr, dc))
-            if options:
-                if self.last_dir in options and random.random() < 0.70:
-                    options = [self.last_dir]
-                else:
-                    random.shuffle(options)
-                dr, dc = options[0]
-                self.prev_row, self.prev_col = self.row, self.col
-                self.row += dr
-                self.col += dc
-                self.last_dir = (dr, dc)
-                if self.grid[self.row][self.col] == POWER:
-                    self.grid[self.row][self.col] = PELLET
 
         self.pos_history.append((self.row, self.col))
         self._check_oscillation()

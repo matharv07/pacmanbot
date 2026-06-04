@@ -44,7 +44,10 @@ class PacmanMultiAgentEnv:
                         if self.grid[ghost.row][ghost.col] == POWER:
                             self.grid[ghost.row][ghost.col] = PELLET
                             rewards[gid] += 7.0
+            temp_agent = ghost.rl_agent
+            ghost.rl_agent = None
             newly_discovered = ghost.update((self.player.row, self.player.col), powered, self.ghosts)
+            ghost.rl_agent = temp_agent
             if newly_discovered:
                 rewards[gid] += newly_discovered * 0.25
         terminated = False
