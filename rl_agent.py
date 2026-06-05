@@ -15,7 +15,7 @@ except ImportError:
     device = "cpu"
 
 class GhostRLNetwork(None if not TORCH_AVAILABLE else nn.Module):
-    def __init__(self, input_channels=6, output_dim=4):
+    def __init__(self, input_channels=10, output_dim=4):
         if TORCH_AVAILABLE:
             super(GhostRLNetwork, self).__init__()
             self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=3, padding=1)
@@ -103,8 +103,8 @@ class RLAgent:
                 self.target_model = shared_target
                 self.trainer = shared_trainer
             else:
-                self.model = GhostRLNetwork(input_channels=6, output_dim=4).to(device)
-                self.target_model = GhostRLNetwork(input_channels=6, output_dim=4).to(device)
+                self.model = GhostRLNetwork(input_channels=10, output_dim=4).to(device)
+                self.target_model = GhostRLNetwork(input_channels=10, output_dim=4).to(device)
                 if os.path.exists(self.model_path):
                     try:
                         self.model.load_state_dict(torch.load(self.model_path, map_location=device))
@@ -119,23 +119,38 @@ class RLAgent:
             self.target_model = None
             self.trainer = None
 
-    def _prepare_state(self, personal_map, belief_map, target_pos=None):     #store state as (personal map + belief map)
-        rows, cols = len(personal_map), len(personal_map[0])
-        p_map = np.array(personal_map, dtype=np.int32)
+    def _prepare_state(self, ghost):
+        rows, cols = len(ghost.personal_map), len(ghost.personal_map[0])
+        p_map = np.array(ghost.personal_map, dtype=np.int32)
         one_hot = np.zeros((4, rows, cols), dtype=np.float32)
         for i in range(4):
             one_hot[i] = (p_map == i).astype(np.float32)
         b_map = np.zeros((rows, cols), dtype=np.float32)
-        if hasattr(belief_map, '_b'):
-            for r in range(rows):
-                for c in range(cols):
-                    b_map[r][c] = belief_map._b[r][c]
+        if hasattr(ghost.belief_map, '_initialised') and ghost.belief_map._initialised:
+            b_map = np.array(ghost.belief_map._b, dtype=np.float32)
         target_map = np.zeros((rows, cols), dtype=np.float32)
-        if target_pos is not None:
-            target_map[target_pos[0]][target_pos[1]] = 1.0
-        state = np.concatenate([one_hot, np.expand_dims(b_map, axis=0), np.expand_dims(target_map, axis=0)], axis=0)
+        for idx, task_key in enumerate(ghost.cbba_agent.path):
+            task = ghost.cbba_agent._task_map.get(task_key)
+            if task and hasattr(task, 'target_pos') and task.target_pos:
+                tr, tc = task.target_pos
+                intensity = max(0.1, 1.0 * (0.7 ** idx))
+                target_map[tr][tc] = max(target_map[tr][tc], intensity)
+        ghost_map = np.zeros((rows, cols), dtype=np.float32)
+        ghost_map[ghost.row][ghost.col] = 1.0
+        ally_map = np.zeros((rows, cols), dtype=np.float32)
+        if ghost.known_agents:
+            for ally_gid, pos in ghost.known_agents.items():
+                if pos != "UNKNOWN" and pos is not None:
+                    ally_map[pos[0]][pos[1]] = 1.0
+        pacman_map = np.zeros((rows, cols), dtype=np.float32)
+        if ghost.known_pacman is not None:
+            pacman_map[ghost.known_pacman[0]][ghost.known_pacman[1]] = 1.0
+        pacman_last_seen_map = np.zeros((rows, cols), dtype=np.float32)
+        if ghost.pacman_last_seen is not None and ghost.pacman_last_seen >= 0:
+            pacman_last_seen_map[:] = np.clip(ghost.pacman_last_seen / 1000.0, 0.0, 1.0)
+        state = np.concatenate([one_hot, np.expand_dims(b_map, axis=0), np.expand_dims(target_map, axis=0), np.expand_dims(ghost_map, axis=0), np.expand_dims(ally_map, axis=0), np.expand_dims(pacman_map, axis=0), np.expand_dims(pacman_last_seen_map, axis=0)], axis=0)
         return state
-        
+                
     def save_model(self):
         if TORCH_AVAILABLE:
             torch.save(self.model.state_dict(), self.model_path)
@@ -147,21 +162,29 @@ class RLAgent:
             t.score = random.uniform(0.1, 10.0)
         return tasks
 
-    def get_next_step(self, personal_map, belief_map, current_pos, target_pos=None, training_mode=False):    #predicts optimal immediate next step (dr, dc)
-        state = self._prepare_state(personal_map, belief_map, target_pos)
-        rows, cols = len(personal_map), len(personal_map[0])
+    def get_next_step(self, ghost, training_mode=False):
+        state = self._prepare_state(ghost)
+        rows, cols = len(ghost.grid), len(ghost.grid[0])
         valid_actions = []
         for i, (dr, dc) in enumerate(self.DIRS):
-            nr, nc = current_pos[0] + dr, current_pos[1] + dc
-            if 0 <= nr < rows and 0 <= nc < cols and personal_map[nr][nc] != 1:
+            nr, nc = ghost.row + dr, ghost.col + dc
+            if 0 <= nr < rows and 0 <= nc < cols and ghost.grid[nr][nc] != 1:
                 valid_actions.append(i)
+        reverse_idx = -1
+        if hasattr(ghost, 'last_dir') and ghost.last_dir:
+            for i, (dr, dc) in enumerate(self.DIRS):
+                if dr == -ghost.last_dir[0] and dc == -ghost.last_dir[1]:
+                    reverse_idx = i
+                    break
+        if len(valid_actions) > 1 and reverse_idx in valid_actions:
+            valid_actions.remove(reverse_idx)
         if not valid_actions:
-            return current_pos, state, -1
+            return (ghost.row, ghost.col), state, -1
         action_idx = self.act(state, valid_actions, training_mode)
         if action_idx == -1:
-            return current_pos, state, -1
+            return (ghost.row, ghost.col), state, -1
         dr, dc = self.DIRS[action_idx]
-        nr, nc = current_pos[0] + dr, current_pos[1] + dc
+        nr, nc = ghost.row + dr, ghost.col + dc
         return (nr, nc), state, action_idx
         
     def act(self, state, valid_actions, training_mode=False):

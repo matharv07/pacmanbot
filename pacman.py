@@ -1,6 +1,7 @@
 import pygame
 import random
 import math
+import numpy as np
 import sys
 import os
 from collections import deque
@@ -362,7 +363,7 @@ class Game:
             self.small = pygame.font.Font(None, 16)
         self.shared_model = None
         if TORCH_AVAILABLE:
-            self.shared_model = GhostRLNetwork(input_channels=6, output_dim=4).to(device)
+            self.shared_model = GhostRLNetwork(input_channels=10, output_dim=4).to(device)
             model_path = "ghostweights.pth"
             if os.path.exists(model_path):
                 try:
@@ -378,10 +379,24 @@ class Game:
         self.grid, self.player_start = generate_map()
         self.player = Player(self.grid, self.player_start)
         self.total_pellets = sum(1 for r in self.grid for c in r if c in (PELLET, POWER))
-        open_cells = [(r, c) for r in range(ROWS) for c in range(COLS) if self.grid[r][c] != WALL]
-        pr, pc = self.player_start
-        open_cells.sort(key=lambda p: -abs(p[0] - pr) - abs(p[1] - pc))
-        ghost_starts = open_cells[:7]
+        grid_array = np.array(self.grid)
+        open_cells = np.argwhere(grid_array != WALL)
+        pac_pos = np.array(self.player_start)
+        dist_pac = np.sum(np.abs(open_cells - pac_pos), axis=1)
+        min_dist_to_ghosts = np.full(len(open_cells), np.inf)
+        available = np.ones(len(open_cells), dtype=bool)
+        first_idx = np.argmax(dist_pac)
+        ghost_starts = [tuple(open_cells[first_idx])]
+        available[first_idx] = False
+        for _ in range(6):
+            last_placed = np.array(ghost_starts[-1])
+            dist_to_last = np.sum(np.abs(open_cells - last_placed), axis=1)
+            min_dist_to_ghosts = np.minimum(min_dist_to_ghosts, dist_to_last)
+            scores = np.minimum(dist_pac, min_dist_to_ghosts)
+            scores[~available] = -1
+            best_idx = np.argmax(scores)
+            ghost_starts.append(tuple(open_cells[best_idx]))
+            available[best_idx] = False
         self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i], self.player_start, rl_agent=self.agents[i]) for i, pos in enumerate(ghost_starts)}
         self.state = "playing"
         self.message_timer = 0

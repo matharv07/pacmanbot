@@ -8,12 +8,12 @@ from vector_env import SubprocVecEnv
 from rl_agent import RLAgent, GhostRLNetwork, DQN_Trainer, ReplayBuffer, TORCH_AVAILABLE, device
 
 def train(episodes=1000, start_episode=0):
-    NUM_ENVS = 6
+    NUM_ENVS = 10
     print(f"Starting headless MARL training -- {NUM_ENVS} parallel environments!!!")
     vec_env = SubprocVecEnv(num_envs=NUM_ENVS)
     if TORCH_AVAILABLE:
-        shared_model = GhostRLNetwork(input_channels=6, output_dim=4).to(device)
-        shared_target = GhostRLNetwork(input_channels=6, output_dim=4).to(device)
+        shared_model = GhostRLNetwork(input_channels=10, output_dim=4).to(device)
+        shared_target = GhostRLNetwork(input_channels=10, output_dim=4).to(device)
         model_path = "ghostweights.pth"
         if os.path.exists(model_path):
             try:

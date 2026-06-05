@@ -7,17 +7,28 @@ import pacman
 from rl_env import PacmanMultiAgentEnv
 
 def _get_valid_actions(env):
-    va = {}
+    DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    WALL = 1
+    ROWS = len(env.grid)
+    COLS = len(env.grid[0])
+    valid = {}
     for gid, ghost in env.ghosts.items():
         if ghost.dead:
-            continue
-        opts = []
-        for i, (dr, dc) in enumerate([(-1, 0), (1, 0), (0, -1), (0, 1)]):
+            valid[gid] = []
+            continue            
+        v = []
+        reverse_idx = -1
+        for i, (dr, dc) in enumerate(DIRS): 
             nr, nc = ghost.row + dr, ghost.col + dc
-            if 0 <= nr < len(ghost.grid) and 0 <= nc < len(ghost.grid[0]) and ghost.grid[nr][nc] != 1:
-                opts.append(i)
-        va[gid] = opts if opts else [0]
-    return va
+            if 0 <= nr < ROWS and 0 <= nc < COLS and env.grid[nr][nc] != WALL:
+                v.append(i)
+            if hasattr(ghost, 'last_dir') and ghost.last_dir:
+                if dr == -ghost.last_dir[0] and dc == -ghost.last_dir[1]:
+                    reverse_idx = i
+        if len(v) > 1 and reverse_idx in v:
+            v.remove(reverse_idx)            
+        valid[gid] = v
+    return valid
 
 def worker(remote, parent_remote):
     parent_remote.close()
@@ -26,30 +37,34 @@ def worker(remote, parent_remote):
     np.random.seed(seed)
     pacman.AUTO_MODE = True     
     env = PacmanMultiAgentEnv(max_steps=500)
+    accumulated_rewards = {g: 0.0 for g in range(7)}    
     while True:
         cmd, data = remote.recv()
         if cmd == 'step':
             active_gids = list(env.ghosts.keys())
-            prev_dead = {gid: env.ghosts[gid].dead for gid in active_gids}
-            action_executed = {}
-            for gid, ghost in env.ghosts.items():
-                if not ghost.dead:
-                    action_executed[gid] = ((ghost.move_counter + 1) >= ghost.move_every)
-            obs, rewards, terminated, truncated, info = env.step(data)
-            agent_dones = {}
-            for gid in active_gids:
-                just_died = env.ghosts[gid].dead and not prev_dead.get(gid, False)
-                agent_dones[gid] = terminated or truncated or just_died
-            terminal_info = info.copy()
+            obs, env_rewards, terminated, truncated, info = env.step(data)
             env_done = terminated or truncated
+            agent_dones = {gid: ghost.dead for gid, ghost in env.ghosts.items()}
+            action_executed = info.get('action_executed', {})
+            for gid, ghost in env.ghosts.items():
+                if ghost.dead: continue
+                accumulated_rewards[gid] = accumulated_rewards.get(gid, 0.0) + env_rewards.get(gid, 0.0)
+            final_rewards = {}
+            for gid in active_gids:
+                if action_executed.get(gid, False) or env_done:
+                    final_rewards[gid] = accumulated_rewards[gid]
+                    accumulated_rewards[gid] = 0.0  
+                else:
+                    final_rewards[gid] = 0.0  
+            terminal_info = info.copy()
             if env_done:
                 obs, info = env.reset()
+                info['terminal_info'] = terminal_info
+                accumulated_rewards = {g: 0.0 for g in range(7)}
             info['valid_actions'] = _get_valid_actions(env)
             info['action_executed'] = action_executed
-            if env_done:
-                info['terminal_info'] = terminal_info
-            remote.send((obs, rewards, agent_dones, env_done, info))
-            
+            remote.send((obs, final_rewards, agent_dones, env_done, info))
+
         elif cmd == 'reset':
             obs, info = env.reset()
             info['valid_actions'] = _get_valid_actions(env)
