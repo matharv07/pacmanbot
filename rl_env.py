@@ -138,7 +138,13 @@ class PacmanMultiAgentEnv:
             for ally_gid, pos in ghost.known_agents.items():
                 if pos != "UNKNOWN" and pos is not None:
                     ally_map[pos[0]][pos[1]] = 1.0
-            state = np.concatenate([one_hot, np.expand_dims(b_map, axis=0), np.expand_dims(target_map, axis=0), np.expand_dims(ghost_map, axis=0), np.expand_dims(ally_map, axis=0)], axis=0)
+            pacman_map = np.zeros((ROWS, COLS), dtype=np.float32)
+            if ghost.known_pacman is not None:
+                pacman_map[ghost.known_pacman[0]][ghost.known_pacman[1]] = 1.0
+            pacman_last_seen_map = np.zeros((ROWS, COLS), dtype=np.float32)
+            if hasattr(ghost, 'pacman_last_seen') and ghost.pacman_last_seen is not None and ghost.pacman_last_seen >= 0:
+                pacman_last_seen_map[:] = np.clip(ghost.pacman_last_seen / 1000.0, 0.0, 1.0)
+            state = np.concatenate([one_hot, np.expand_dims(b_map, axis=0), np.expand_dims(target_map, axis=0), np.expand_dims(ghost_map, axis=0), np.expand_dims(ally_map, axis=0), np.expand_dims(pacman_map, axis=0), np.expand_dims(pacman_last_seen_map, axis=0)], axis=0)
             obs[gid] = state
         return obs
 
