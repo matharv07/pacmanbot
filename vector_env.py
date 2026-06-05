@@ -29,7 +29,7 @@ def _get_valid_actions(env):
             v.remove(reverse_idx)            
         valid[gid] = v
     return valid
-
+    
 def worker(remote, parent_remote):
     parent_remote.close()
     seed = (os.getpid() + int(time.time() * 1000)) % (2**32)
@@ -37,34 +37,23 @@ def worker(remote, parent_remote):
     np.random.seed(seed)
     pacman.AUTO_MODE = True     
     env = PacmanMultiAgentEnv(max_steps=500)
-    accumulated_rewards = {g: 0.0 for g in range(7)}    
     while True:
         cmd, data = remote.recv()
         if cmd == 'step':
-            active_gids = list(env.ghosts.keys())
+            was_alive = {gid for gid, ghost in env.ghosts.items() if not ghost.dead}
             obs, env_rewards, terminated, truncated, info = env.step(data)
             env_done = terminated or truncated
-            agent_dones = {gid: ghost.dead for gid, ghost in env.ghosts.items()}
             action_executed = info.get('action_executed', {})
-            for gid, ghost in env.ghosts.items():
-                if ghost.dead: continue
-                accumulated_rewards[gid] = accumulated_rewards.get(gid, 0.0) + env_rewards.get(gid, 0.0)
-            final_rewards = {}
-            for gid in active_gids:
-                if action_executed.get(gid, False) or env_done:
-                    final_rewards[gid] = accumulated_rewards[gid]
-                    accumulated_rewards[gid] = 0.0  
-                else:
-                    final_rewards[gid] = 0.0  
+            agent_dones = {gid: (ghost.dead and gid in was_alive) for gid, ghost in env.ghosts.items()}
+            final_rewards = env_rewards
             terminal_info = info.copy()
             if env_done:
                 obs, info = env.reset()
                 info['terminal_info'] = terminal_info
-                accumulated_rewards = {g: 0.0 for g in range(7)}
-            info['valid_actions'] = _get_valid_actions(env)
-            info['action_executed'] = action_executed
+                info['action_executed'] = action_executed
+            info['valid_actions'] = _get_valid_actions(env)    
             remote.send((obs, final_rewards, agent_dones, env_done, info))
-
+            
         elif cmd == 'reset':
             obs, info = env.reset()
             info['valid_actions'] = _get_valid_actions(env)

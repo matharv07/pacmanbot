@@ -82,7 +82,9 @@ def train(episodes=1000, start_episode=0):
                 action = flat_action_indices[i]
                 reward = rewards_list[env_idx].get(gid, 0)
                 next_state = next_obs_list[env_idx].get(gid, state)
-                done = agent_dones_list[env_idx].get(gid, False)
+                env_done = env_dones_list[env_idx]
+                ghost_dead = agent_dones_list[env_idx].get(gid, False)
+                done = ghost_dead or env_done                
                 executed = next_info_list[env_idx].get('action_executed', {}).get(gid, False)
                 if executed or done:
                     agents[gid].buffer.push(state, action, reward, next_state, done)
@@ -90,8 +92,10 @@ def train(episodes=1000, start_episode=0):
                 total_rewards[env_idx] += sum(rewards_list[env_idx].values())
             if all_states:
                 agents[0].train()
+            any_done = False            
             for env_idx in range(NUM_ENVS):
                 if env_dones_list[env_idx]:
+                    any_done = True
                     ep_counts[env_idx] += 1
                     completed_eps = sum(ep_counts)
                     elapsed_seconds = int(time.time() - start_time)
@@ -101,10 +105,10 @@ def train(episodes=1000, start_episode=0):
                     p_score = final_info.get('player_score', 0)
                     print(f"[{formatted_time}] Total Eps: {completed_eps}/{episodes} | Env {env_idx} | Steps: {steps} | Pacman Score: {p_score} | Ghost Score: {total_rewards[env_idx]:.2f} | Epsilon: {agents[0].epsilon:.3f}")
                     total_rewards[env_idx] = 0
-                    if agents[0].epsilon > agents[0].epsilon_min:
-                        new_epsilon = agents[0].epsilon * agents[0].epsilon_decay
-                        for gid in agents:
-                            agents[gid].epsilon = max(agents[0].epsilon_min, new_epsilon)
+            if any_done and agents[0].epsilon > agents[0].epsilon_min:
+                new_epsilon = agents[0].epsilon * agents[0].epsilon_decay
+                for gid in agents:
+                    agents[gid].epsilon = max(agents[0].epsilon_min, new_epsilon)
             obs_list = next_obs_list
             info_list = next_info_list
     finally:

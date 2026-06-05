@@ -35,26 +35,32 @@ class PacmanMultiAgentEnv:
             ghost_starts.append(tuple(open_cells[best_idx]))
             available[best_idx] = False
         self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i], self.player_start) for i, pos in enumerate(ghost_starts)}
+        self.pos_history = {i: [] for i in self.ghosts.keys()}
         return self._get_observations(), self._get_info()
     
     def step(self, actions):
         self.step_count += 1
+        action_executed = {}
         self.player.update(self.ghosts)
         powered = self.player.powered
         rewards = {i: -0.5 for i in self.ghosts.keys()}
         prev_dist = {}
+        prev_pac_dists = {gid: abs(g.row - self.player.row) + abs(g.col - self.player.col) for gid, g in self.ghosts.items()}
+        prev_task_pos = {}
         for gid, ghost in self.ghosts.items():
-            if ghost.dead:
-                continue
-            task = ghost.cbba_agent.get_active_task()
-            if task and task.target_pos:
-                tr, tc = task.target_pos
-                prev_dist[gid] = abs(ghost.row - tr) + abs(ghost.col - tc)
+            if not ghost.dead:
+                task = ghost.cbba_agent.get_active_task()
+                if task and task.target_pos:
+                    prev_task_pos[gid] = task.target_pos
+                    prev_dist[gid] = abs(ghost.row - task.target_pos[0]) + abs(ghost.col - task.target_pos[1])
         for gid, ghost in self.ghosts.items():
             if ghost.dead:
                 ghost.update((self.player.row, self.player.col), powered, self.ghosts)
+                action_executed[gid] = False
                 continue
-            if gid in actions and (ghost.move_counter+1) >= ghost.move_every:
+            on_move_frame = (ghost.move_counter+1) >= ghost.move_every
+            action_executed[gid] = on_move_frame
+            if gid in actions and on_move_frame:
                 action = actions[gid]
                 if isinstance(action, tuple) and len(action) == 2:
                     dr, dc = action
@@ -65,7 +71,7 @@ class PacmanMultiAgentEnv:
                         ghost.last_dir = (dr, dc)
                         if self.grid[ghost.row][ghost.col] == POWER:
                             self.grid[ghost.row][ghost.col] = PELLET
-                            rewards[gid] += 7.0
+                            rewards[gid] += 12.0
             temp_agent = ghost.rl_agent
             ghost.rl_agent = None
             newly_discovered = ghost.update((self.player.row, self.player.col), powered, self.ghosts)
@@ -74,15 +80,30 @@ class PacmanMultiAgentEnv:
                 rewards[gid] += newly_discovered * 0.25
         for gid, ghost in self.ghosts.items():
             if ghost.dead:
+                rewards[gid] = 0.0
                 continue
-            if gid in prev_dist:
-                task = ghost.cbba_agent.get_active_task()
-                if task and task.target_pos:
-                    tr, tc = task.target_pos
-                    new_dist = abs(ghost.row - tr) + abs(ghost.col - tc)
-                    delta = prev_dist[gid] - new_dist 
-                    if delta > 0:
-                        rewards[gid] += delta * 0.1         
+            if gid in prev_dist and gid in prev_task_pos:
+                tr, tc = prev_task_pos[gid]
+                new_dist = abs(ghost.row - tr) + abs(ghost.col - tc)
+                delta = prev_dist[gid] - new_dist
+                rewards[gid] += delta * 0.1      
+            if action_executed.get(gid, False):
+                current_pos = (ghost.row, ghost.col)
+                if current_pos in self.pos_history.get(gid, []):
+                    rewards[gid] -= 2.5        
+                if gid not in self.pos_history:
+                    self.pos_history[gid] = []
+                self.pos_history[gid].append(current_pos)
+                if len(self.pos_history[gid]) > 10:
+                    self.pos_history[gid].pop(0)
+            new_pac_dist = abs(ghost.row - self.player.row) + abs(ghost.col - self.player.col)
+            pac_delta = prev_pac_dists[gid] - new_pac_dist  
+            if self.player.powered:
+                if new_pac_dist <= 4:
+                    rewards[gid] -= pac_delta * 5.0         
+            else:
+                if new_pac_dist <= 3:
+                    rewards[gid] += pac_delta * 10.0
         terminated = False
         truncated = self.step_count >= self.max_steps
         if not self.player.dead:
@@ -98,9 +119,13 @@ class PacmanMultiAgentEnv:
                         self.player.score += 200
                     else:
                         rewards[gid] += 1000.0
-                        for g, pos in ghost.known_agents.items():
-                            if pos != "UNKNOWN":
-                                rewards[g] += 400.0
+                        for g_id, g_obj in self.ghosts.items():
+                            if g_id == gid or g_obj.dead:
+                                continue
+                            if ghost.known_agents.get(g_id) != "UNKNOWN":
+                                dist = abs(g_obj.row - self.player.row) + abs(g_obj.col - self.player.col)
+                                if dist <= 7:  
+                                    rewards[g_id] += 400.0
                         self.player.die()
                         terminated = True
                         break
@@ -111,7 +136,9 @@ class PacmanMultiAgentEnv:
         if truncated and not terminated:
             for g in self.ghosts.keys():
                 rewards[g] -= 300.0
-        return self._get_observations(), rewards, terminated, truncated, self._get_info()
+        info = self._get_info()
+        info['action_executed'] = action_executed
+        return self._get_observations(), rewards, terminated, truncated, info
 
     def _get_observations(self):
         obs = {}
