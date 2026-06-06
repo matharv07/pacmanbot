@@ -47,17 +47,17 @@ DIRS  = [UP, DOWN, LEFT, RIGHT]
 
 def generate_map():
     rows, cols = ROWS, COLS
-    grid = [[WALL] * cols for _ in range(rows)]
+    grid = np.full((rows, cols), WALL, dtype=np.int8)
 
     def in_bounds(r, c):
         return 0 < r < rows - 1 and 0 < c < cols - 1
 
     def carve(r, c):
-        grid[r][c] = EMPTY
+        grid[r, c] = EMPTY
         neighbours = []
         for dr, dc in [(-2, 0), (2, 0), (0, -2), (0, 2)]:
             nr, nc = r + dr, c + dc
-            if in_bounds(nr, nc) and grid[nr][nc] == WALL:
+            if in_bounds(nr, nc) and grid[nr, nc] == WALL:
                 neighbours.append((nr, nc, r + dr // 2, c + dc // 2))
         random.shuffle(neighbours)
         return neighbours
@@ -74,20 +74,18 @@ def generate_map():
     for _ in range(int(rows * cols * 0.1)):
         r = random.randrange(1, rows - 1)
         c = random.randrange(1, cols - 1)
-        grid[r][c] = EMPTY
-    for c in range(cols):
-        grid[0][c] = WALL
-        grid[rows - 1][c] = WALL
-    for r in range(rows):
-        grid[r][0] = WALL
-        grid[r][cols - 1] = WALL
-    open_cells = [(r, c) for r in range(rows) for c in range(cols) if grid[r][c] == EMPTY]
+        grid[r, c] = EMPTY
+    grid[0, :] = WALL
+    grid[rows - 1, :] = WALL
+    grid[:, 0] = WALL
+    grid[:, cols - 1] = WALL
+    open_cells = list(map(tuple, np.argwhere(grid == EMPTY)))
     centre = (rows // 2, cols // 2)
     open_cells.sort(key=lambda p: abs(p[0] - centre[0]) + abs(p[1] - centre[1]))
     player_start = open_cells[0]
     for r, c in open_cells:
         if abs(r - player_start[0]) + abs(c - player_start[1]) > 2:
-            grid[r][c] = PELLET
+            grid[r, c] = PELLET
     random.shuffle(open_cells)
     placed = 0
     for r, c in open_cells:
@@ -378,9 +376,8 @@ class Game:
     def new_game(self):
         self.grid, self.player_start = generate_map()
         self.player = Player(self.grid, self.player_start)
-        self.total_pellets = sum(1 for r in self.grid for c in r if c in (PELLET, POWER))
-        grid_array = np.array(self.grid)
-        open_cells = np.argwhere(grid_array != WALL)
+        self.total_pellets = int(np.sum(np.isin(self.grid, (PELLET, POWER))))
+        open_cells = np.argwhere(self.grid != WALL)
         pac_pos = np.array(self.player_start)
         dist_pac = np.sum(np.abs(open_cells - pac_pos), axis=1)
         min_dist_to_ghosts = np.full(len(open_cells), np.inf)
@@ -479,8 +476,6 @@ class Game:
         if self.pellets_left() == 0:
             self.state = "win"
             self.message_timer = 60 if not AUTO_MODE else 0
-            
-
 
     def draw_grid(self):
         surf = self.screen

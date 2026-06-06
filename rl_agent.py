@@ -122,26 +122,30 @@ class RLAgent:
     def _prepare_state(self, ghost):
         rows, cols = len(ghost.personal_map), len(ghost.personal_map[0])
         p_map = np.array(ghost.personal_map, dtype=np.int32)
-        one_hot = np.zeros((4, rows, cols), dtype=np.float32)
-        for i in range(4):
-            one_hot[i] = (p_map == i).astype(np.float32)
+        one_hot = (p_map[None, :, :] == np.arange(4)[:, None, None]).astype(np.float32)
         b_map = np.zeros((rows, cols), dtype=np.float32)
         if hasattr(ghost.belief_map, '_initialised') and ghost.belief_map._initialised:
             b_map = np.array(ghost.belief_map._b, dtype=np.float32)
         target_map = np.zeros((rows, cols), dtype=np.float32)
+        r_idxs = []
+        c_idxs = []
+        intensities = []
         for idx, task_key in enumerate(ghost.cbba_agent.path):
             task = ghost.cbba_agent._task_map.get(task_key)
             if task and hasattr(task, 'target_pos') and task.target_pos:
                 tr, tc = task.target_pos
                 intensity = max(0.1, 1.0 * (0.7 ** idx))
-                target_map[tr][tc] = max(target_map[tr][tc], intensity)
+                r_idxs.append(tr); c_idxs.append(tc); intensities.append(intensity)
+        if r_idxs:
+            np.maximum.at(target_map, (np.array(r_idxs, dtype=int), np.array(c_idxs, dtype=int)), np.array(intensities, dtype=np.float32))
         ghost_map = np.zeros((rows, cols), dtype=np.float32)
         ghost_map[ghost.row][ghost.col] = 1.0
         ally_map = np.zeros((rows, cols), dtype=np.float32)
         if ghost.known_agents:
-            for ally_gid, pos in ghost.known_agents.items():
-                if pos != "UNKNOWN" and pos is not None:
-                    ally_map[pos[0]][pos[1]] = 1.0
+            positions = [pos for pos in ghost.known_agents.values() if pos is not None and pos != "UNKNOWN"]
+            if positions:
+                rs, cs = zip(*positions)
+                ally_map[np.array(rs, dtype=int), np.array(cs, dtype=int)] = 1.0
         pacman_map = np.zeros((rows, cols), dtype=np.float32)
         if ghost.known_pacman is not None:
             pacman_map[ghost.known_pacman[0]][ghost.known_pacman[1]] = 1.0
