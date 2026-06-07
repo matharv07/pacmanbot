@@ -2,8 +2,9 @@ import pygame
 import random
 import math
 from collections import deque
+import numpy as np
+from pathfinder import dijkstra_multi
 from cbba import CBBA_Agent
-from pathfinder import next_step
 from beliefmap import BeliefMap
 from allocator import TaskType
 from rl_agent import RLAgent
@@ -81,11 +82,14 @@ class Ghost:
         self.cbba_agent = CBBA_Agent(gid) #CBBA auction agent for this ghost
         self.pos_history: deque = deque(maxlen=OSCILLATION_WINDOW)  #rolling position window for oscillation detection
         self.belief_map = BeliefMap(gid, self.personal_map, pacman_start=player_start)
+        self._proximity_channel_cache = None
+        self._proximity_channel_frame = -1
+        self._proximity_channel_target = None
         self.rl_agent = rl_agent
         self.last_state = None
         self.last_action_idx = -1
 
-    def update(self, player_pos, powered, all_ghosts):
+    def update(self, player_pos, powered, all_ghosts, skip_movement=False):
         self.frame += 1
         newly_discovered = 0
         if self.dead:
@@ -106,6 +110,10 @@ class Ghost:
         if self.move_counter < self.move_every:
             return newly_discovered
         self.move_counter = 0
+        if skip_movement:
+            self.pos_history.append((self.row, self.col))
+            self._check_oscillation()
+            return newly_discovered
         #CBBA: get active task and move toward target
         active_task = self.cbba_agent.step(self, self.frame)
         if self.rl_agent is not None:
@@ -159,6 +167,56 @@ class Ghost:
         if self.known_pacman is None and self.last_lost_pacman is not None:
             self.last_lost_pacman = None
             self.pos_history.clear()  
+
+    def get_target_proximity_channel(self):
+        rows = len(self.personal_map)
+        cols = len(self.personal_map[0])
+        channel = np.zeros((rows, cols), dtype=np.float32)
+        if not getattr(self.belief_map, '_initialised', False):
+            return channel
+
+        target = self.known_pacman or self.last_lost_pacman
+        if target is None:
+            top = self.belief_map.top_cells(n=1)
+            if top:
+                target = top[0]
+
+        if target is None:
+            self._proximity_channel_cache = channel
+            self._proximity_channel_frame = self.frame
+            self._proximity_channel_target = None
+            return channel
+
+        if self._proximity_channel_frame == self.frame and self._proximity_channel_target == target and self._proximity_channel_cache is not None:
+            return self._proximity_channel_cache
+
+        if self.frame % self.move_every != 0 and self._proximity_channel_cache is not None:
+            return self._proximity_channel_cache
+
+        dists = dijkstra_multi(self.grid, (self.row, self.col), [target])
+        info = dists.get(target)
+        if not info or info[0] == math.inf:
+            self._proximity_channel_cache = channel
+            self._proximity_channel_frame = self.frame
+            self._proximity_channel_target = target
+            return channel
+
+        max_d = info[0] if info[0] > 0 else 1.0
+        all_targets = [
+            (r, c)
+            for r in range(rows)
+            for c in range(cols)
+            if self.personal_map[r][c] not in (1, -1)
+        ]
+        all_dists = dijkstra_multi(self.grid, target, all_targets)
+        for (r, c), (d, _) in all_dists.items():
+            if d != math.inf:
+                channel[r, c] = max(0.0, min(1.0, 1.0 - d / (max_d * 3.0)))
+
+        self._proximity_channel_cache = channel
+        self._proximity_channel_frame = self.frame
+        self._proximity_channel_target = target
+        return channel
 
     def _check_liveness(self, all_ghosts):
         for gid in list(self.last_heartbeat.keys()):

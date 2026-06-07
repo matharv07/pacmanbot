@@ -40,11 +40,8 @@ def worker(remote, parent_remote):
     while True:
         cmd, data = remote.recv()
         if cmd == 'step':
-            was_alive = {gid for gid, ghost in env.ghosts.items() if not ghost.dead}
-            obs, env_rewards, terminated, truncated, info = env.step(data)
-            env_done = terminated or truncated
+            obs, env_rewards, agent_dones, env_done, info = env.step(data)
             action_executed = info.get('action_executed', {})
-            agent_dones = {gid: (ghost.dead and gid in was_alive) for gid, ghost in env.ghosts.items()}
             final_rewards = env_rewards
             terminal_info = info.copy()
             if env_done:

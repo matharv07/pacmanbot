@@ -19,10 +19,10 @@ from typing import List, Optional
 
 from pathfinder import dijkstra_multi
 
-WALL = 1
-EMPTY = 0
-PELLET = 2
-POWER = 3
+WALL    = 1
+EMPTY   = 0
+PELLET  = 2
+POWER   = 3
 UNKNOWN = -1
 
 #Setup decay constants for CBBA
@@ -40,6 +40,7 @@ class TaskType(IntEnum):
     CONVERT     = 1
     EVADE_TRACK = 2
     EXPLORE     = 3
+    DYNAMIC     = 4     #rl generated waypoints that dont fit the above
 
 @dataclass
 class Task:
@@ -168,7 +169,7 @@ def generate_tasks(ghost, frame: int) -> List[Task]:
     explore_tasks = _score_explore(ghost, frame)
     for et in explore_tasks:
         targets.add(et.target_pos)
-    dists = dijkstra_multi(ghost.personal_map, start, list(targets))
+    dists = dijkstra_multi(ghost.grid, start, list(targets))
     tasks: list[Task] = []
     hunt = _score_hunt(ghost, dists)
     if hunt is not None:

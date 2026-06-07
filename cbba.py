@@ -30,7 +30,11 @@ class CBBA_Agent:
     def step(self, ghost, frame: int) -> Optional[Task]:
         if frame - self._last_auction >= AUCTION_EVERY or not self.bundle:
             self._last_auction = frame
-            tasks = generate_tasks(ghost, frame)
+            tasks = []
+            if hasattr(ghost, 'rl_agent') and ghost.rl_agent is not None:       #dynamic rl tasks generation
+                tasks = ghost.rl_agent.generate_dynamic_tasks(ghost, frame, num_tasks=5)
+            if not tasks:
+                tasks = generate_tasks(ghost, frame)                
             self._task_map = {_task_key(t): t for t in tasks}
             self._phase1(ghost, tasks)
         return self.get_active_task()

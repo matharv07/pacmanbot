@@ -12,6 +12,17 @@ PELLET  =  2
 POWER   =  3
 UNKNOWN = -1
 
+# Optional SciPy accelerated graph cache (populated per-episode by the env)
+_SCIPY_AVAILABLE = False
+try:
+    from scipy.sparse.csgraph import dijkstra as scipy_dijkstra
+    _SCIPY_AVAILABLE = True
+except Exception:
+    scipy_dijkstra = None
+
+# cache: id(grid) -> (csr_matrix, open_cells_list, cell_to_idx)
+_SCIPY_GRAPH_CACHE = {}
+
 #cell costs for path planning - wall taken to be impassable
 _COST = {EMPTY: 1.0, PELLET: 1.0, POWER: 0.5, UNKNOWN: 3.0, WALL: math.inf}   #unknown territory taken to be passable but 3x more costly than known cells
 _DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
@@ -73,6 +84,40 @@ def astar(grid: list, start: tuple, goal: tuple) -> list:
     return []   #if goal is unreachable from start
 
 def dijkstra_multi(grid: list, start: tuple, targets: list) -> dict:
+    # Try SciPy accelerated path when a precomputed graph for this grid exists
+    if _SCIPY_AVAILABLE:
+        cache = _SCIPY_GRAPH_CACHE.get(id(grid))
+        if cache is not None:
+            graph, open_cells, cell_to_idx = cache
+            # map start and targets to indices
+            if start not in cell_to_idx:
+                return {}
+            src_idx = cell_to_idx[start]
+            # compute all distances and predecessors from source
+            dist_arr, predecessors = scipy_dijkstra(csgraph=graph, directed=False, indices=src_idx, return_predecessors=True)
+            results: dict = {}
+            for t in targets:
+                if t not in cell_to_idx:
+                    continue
+                tidx = cell_to_idx[t]
+                d = float(dist_arr[tidx])
+                if not math.isfinite(d):
+                    results[t] = (math.inf, [])
+                    continue
+                # reconstruct path from src_idx -> tidx using predecessors
+                path_idx = []
+                node = tidx
+                while node != -9999 and node >= 0 and node != src_idx:
+                    path_idx.append(node)
+                    node = int(predecessors[node])
+                if node == src_idx:
+                    path_idx.append(src_idx)
+                path_idx.reverse()
+                path = [open_cells[i] for i in path_idx]
+                results[t] = (d, path)
+            return results
+
+    # Fallback: original Python implementation
     if not targets:
         return {}
     rows = len(grid)

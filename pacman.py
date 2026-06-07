@@ -6,7 +6,7 @@ import sys
 import os
 from collections import deque
 from ghost import Ghost, UNKNOWN
-from rl_agent import RLAgent, GhostRLNetwork, TORCH_AVAILABLE, device
+from rl_agent import RLAgent, GhostActorCritic, TORCH_AVAILABLE, device
 if TORCH_AVAILABLE:
     import torch
 
@@ -286,8 +286,11 @@ class Player:
                 
                 if scored_moves:
                     scored_moves.sort(key=lambda x: x[0], reverse=True)
-                    if random.random() < 0.08 and len(scored_moves) > 1:
-                        self.dir = scored_moves[1][1]
+                    rand_val = random.random()
+                    if rand_val < 0.05 and len(scored_moves) > 2:
+                        self.dir = scored_moves[2][1]    #occasional wild move
+                    elif rand_val < 0.18 and len(scored_moves) > 1:
+                        self.dir = scored_moves[1][1]    #suboptimal move
                     else:
                         self.dir = scored_moves[0][1]
                 elif fallback_moves:
@@ -361,7 +364,7 @@ class Game:
             self.small = pygame.font.Font(None, 16)
         self.shared_model = None
         if TORCH_AVAILABLE:
-            self.shared_model = GhostRLNetwork(input_channels=10, output_dim=4).to(device)
+            self.shared_model = GhostActorCritic(input_channels=7, rows=ROWS, cols=COLS, num_scalars=5, num_actions=4).to(device)
             model_path = "ghostweights.pth"
             if os.path.exists(model_path):
                 try:
@@ -370,7 +373,7 @@ class Game:
                 except Exception as e:
                     pass
             self.shared_model.eval()
-        self.agents = {i: RLAgent(i, shared_model=self.shared_model, shared_target=self.shared_model) for i in range(7)}
+        self.agents = {i: RLAgent(i, shared_model=self.shared_model) for i in range(7)}
         self.new_game()
 
     def new_game(self):

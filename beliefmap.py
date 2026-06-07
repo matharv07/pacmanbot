@@ -1,17 +1,18 @@
 from __future__ import annotations
 import math
 from typing import Optional
+import numpy as np
 
 WALL = 1
 
-ALPHA_UNIFORM      = 0.18   #fraction of mass diffused to each neighbour every frame
+ALPHA_UNIFORM      = 0.20   #fraction of mass diffused to each neighbour every frame
 ALPHA_MOMENTUM     = 0.25   #direction-based mass sharing
 MOMENTUM_DECAY     = 50     #lower value removes trust from older sightings
 TAU_RECENCY        = 60     #lower value adds trust to older messages
 MIN_CONFIDENCE     = 0.02   #minimum trust in any received message
 LOS_CERTAINTY      = 0.99   #trust in a direct sighting
-LOST_SPREAD        = 0.40   #how to spread out probability if we lose sight of pacman
-COMPRESS_THRESHOLD = 0.001  #cells below this are omitted from payload
+LOST_SPREAD        = 0.60   #how to spread out probability if we lose sight of pacman
+COMPRESS_THRESHOLD = 0.0005 #cells below this are omitted from payload
 
 DANGER_SIGMA       = 6.0    #Gaussian variance cells for ghost danger falloff
 STALENESS_DECAY    = 40.0   #frames half-life for un-refreshed ghost positions
@@ -21,7 +22,7 @@ MIN_SAFETY         = 1e-6   #minimum safety per cell to avoid divide-by-zero in 
 SAFETY_RECOMPUTE_EVERY = 3  #recompute safety map at most every N frames;
 
 HUNT_SIGMA         = 5.0    #Gaussian variance for attraction falloff toward ghosts
-HUNT_CROWD_WEIGHT = 0.4     #blend factor for crowd scoring vs proximal scoring: 0.0 = pure proximal, 1.0 = pure crowd, 0.4 = blend
+HUNT_CROWD_WEIGHT  = 0.4    #blend factor for crowd scoring vs proximal scoring: 0.0 = pure proximal, 1.0 = pure crowd, 0.4 = blend
 
 class BeliefMap:
     """
@@ -50,7 +51,7 @@ class BeliefMap:
         self.grid = grid
         self.rows = len(grid)
         self.cols = len(grid[0])
-        self._b: list[list[float]] = [[0.0] * self.cols for _ in range(self.rows)]   #stores gridwise beliefmap
+        self._b = np.zeros((self.rows, self.cols), dtype=np.float32)   #stores gridwise beliefmap
         self._initialised = False
         self.last_known_pos: Optional[tuple] = None
         self.last_known_dir: tuple = (0, 0)
@@ -58,9 +59,15 @@ class BeliefMap:
         self._pacman_start: Optional[tuple] = pacman_start
         self._neighbours: dict[tuple, list[tuple]] = {}
         self._open_cells: list[tuple] = []
+        self._open_arr = np.empty((0, 2), dtype=np.int32)
+        self._open_idx = np.full((self.rows, self.cols), -1, dtype=np.int32)
+        self._nbr_idx = np.empty((0, 0), dtype=np.int32)
+        self._nbr_count = np.empty((0,), dtype=np.int32)
+        self._b_flat = np.empty((0,), dtype=np.float32)
         self._compute_topology()
+        self._sync_b_to_flat()
         #SafetyMap: _safety[r][c] contains [0, 1], where 1 = perfectly safe, 0 = ghost present
-        self._safety: list[list[float]] = [[1.0] * self.cols for _ in range(self.rows)]
+        self._safety = np.ones((self.rows, self.cols), dtype=np.float32)
         self._last_ghost_snapshot: dict = {}     #store last known ghost positions for bayesian modelling
         self._ghost_last_seen: dict[int, int] = {}
         #Throttle tracking - skips recompute if nothing changed
@@ -70,6 +77,8 @@ class BeliefMap:
     def observe(self, pacman_pos: tuple, pacman_dir: tuple = (0, 0)):
         self._ensure_initialised()
         r, c = pacman_pos
+        if self.grid[r][c] == WALL:
+            return
         total = sum(self._b[rr][cc] for rr, cc in self._open_cells) or 1.0
         spike    = total * LOS_CERTAINTY
         residual = total * (1.0 - LOS_CERTAINTY)
@@ -84,8 +93,11 @@ class BeliefMap:
     def observe_lost(self, last_pos: tuple):
         self._ensure_initialised()
         r, c       = last_pos
+        if self.grid[r][c] == WALL:
+            return
         outgoing   = self._b[r][c] * LOST_SPREAD
-        neighbours = self._neighbours.get((r, c), [])
+        neighbours = [n for n in self._neighbours.get((r, c), [])
+                      if self.grid[n[0]][n[1]] != WALL]
         if neighbours and self.last_known_dir != (0, 0):
             dr, dc   = self.last_known_dir
             weights  = {}
@@ -130,23 +142,29 @@ class BeliefMap:
         if not cells:
             return
         confidence = max(MIN_CONFIDENCE, math.exp(-sender_fss / TAU_RECENCY))
-        #projecting recieved changes onto full map
-        s = [[0.0] * self.cols for _ in range(self.rows)]
+        n = len(self._open_arr)
+        if n == 0:
+            return
+        s_flat = np.zeros(n, dtype=np.float32)
         s_total = 0.0
         for key, val in cells.items():
             r, c = key if isinstance(key, tuple) else (key[0], key[1])
-            s[r][c] = float(val)
-            s_total += float(val)
+            if 0 <= r < self.rows and 0 <= c < self.cols:
+                idx = int(self._open_idx[r, c])
+                if idx >= 0:
+                    v = float(val)
+                    s_flat[idx] = v
+                    s_total += v
         if s_total < 1e-9:
             return
-        for r, c in self._open_cells:
-            s[r][c] /= s_total
-        new_b = [row[:] for row in self._b]
-        for r, c in self._open_cells:
-            log_prior = math.log(max(self._b[r][c], 1e-12))
-            log_sender = math.log(max(s[r][c], 1e-12))
-            new_b[r][c] = math.exp((1.0 - confidence) * log_prior + confidence * log_sender)    #log-loss compute
-        self._b = new_b
+        s_flat /= s_total
+        #log-space mixing: new = exp((1-conf)*log(prior) + conf*log(sender))
+        prior_flat = self._b_flat.astype(np.float32)
+        log_prior = np.log(np.maximum(prior_flat, 1e-12))
+        log_sender = np.log(np.maximum(s_flat, 1e-12))
+        new_flat = np.exp((1.0 - confidence) * log_prior + confidence * log_sender)
+        self._b_flat = new_flat
+        self._sync_flat_to_b()
         lkp = payload.get("lkp")
         if lkp is not None and sender_fss < self.frames_since_sighting:
             self.last_known_pos = tuple(lkp)
@@ -244,7 +262,6 @@ class BeliefMap:
                         visited.add((nr, nc))
                         next_queue.append((nr, nc, steps + 1))
                 queue = next_queue
-                
         if not powered:
             max_score = max(scores.values()) if scores else 1.0
             if max_score < MIN_SAFETY:
@@ -285,13 +302,16 @@ class BeliefMap:
 
     def update_local_map_cell(self, pos: tuple, value: int):
         r, c = pos
-        old  = self.grid[r][c]
-        if old == value:
-            return
+        was_open = self._open_idx[r, c] >= 0
         self.grid[r][c] = value
         if value == WALL:
             mass = self._b[r][c]
-            neighbours = self._neighbours.get(pos, [])
+            self._b[r][c] = 0.0
+            self._safety[r][c] = 1.0
+            if not was_open:
+                return
+            neighbours = [n for n in self._neighbours.get(pos, [])
+                          if self.grid[n[0]][n[1]] != WALL and self._open_idx[n[0], n[1]] >= 0]
             if mass > 0 and neighbours:
                 weights = {}
                 total_w = 0.0
@@ -315,9 +335,7 @@ class BeliefMap:
                     for (nr, nc), w in weights.items():
                         self._b[nr][nc] += mass * (w / total_w)
             self._remove_open_cell(pos)
-            self._b[r][c] = 0.0
-            self._safety[r][c] = 1.0
-        elif old == WALL:
+        elif not was_open and value != WALL:
             self._add_open_cell(pos)
         self._normalise()
 
@@ -332,6 +350,7 @@ class BeliefMap:
             nbr_key = (nr, nc)
             if nbr_key in self._neighbours and pos in self._neighbours[nbr_key]:
                 self._neighbours[nbr_key].remove(pos)
+        self._rebuild_topology()
 
     def _add_open_cell(self, pos: tuple):
         r, c = pos
@@ -347,9 +366,12 @@ class BeliefMap:
         for nbr in neighbours:
             if nbr in self._neighbours and pos not in self._neighbours[nbr]:
                 self._neighbours[nbr].append(pos)
+        self._rebuild_topology()
 
     def _compute_topology(self):
         DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        self._open_cells = []
+        self._neighbours = {}
         for r in range(self.rows):
             for c in range(self.cols):
                 if self.grid[r][c] == WALL:
@@ -361,54 +383,82 @@ class BeliefMap:
                     if (0 <= nr < self.rows and 0 <= nc < self.cols and self.grid[nr][nc] != WALL):
                         nbrs.append((nr, nc))
                 self._neighbours[(r, c)] = nbrs
+        n = len(self._open_cells)
+        self._open_arr = np.array(self._open_cells, dtype=np.int32)
+        self._open_idx = np.full((self.rows, self.cols), -1, dtype=np.int32)
+        for i, (r, c) in enumerate(self._open_cells):
+            self._open_idx[r, c] = i
+        max_nbrs = max((len(v) for v in self._neighbours.values()), default=0)
+        self._nbr_idx = np.full((n, max_nbrs), -1, dtype=np.int32)
+        self._nbr_count = np.zeros(n, dtype=np.int32)
+        for i, cell in enumerate(self._open_cells):
+            nbrs = self._neighbours[cell]
+            for j, nbr in enumerate(nbrs):
+                self._nbr_idx[i, j] = self._open_idx[nbr]
+            self._nbr_count[i] = len(nbrs)
+
+    def _rebuild_topology(self):
+        self._compute_topology()
+        self._sync_b_to_flat()
+
+    def _sync_b_to_flat(self):
+        self._b_flat = self._b[self._open_arr[:, 0], self._open_arr[:, 1]].astype(np.float32)
+
+    def _sync_flat_to_b(self):
+        self._b.fill(0.0)
+        if self._open_arr.size > 0:
+            self._b[self._open_arr[:, 0], self._open_arr[:, 1]] = self._b_flat
 
     def _ensure_initialised(self):
         if self._initialised:
             return
         if (self._pacman_start is not None and self._pacman_start in self._open_cells):
+            self._b.fill(0.0)
             r, c = self._pacman_start
-            self._b[r][c] = 1.0
+            self._b[r, c] = 1.0
         else:
+            self._b.fill(0.0)
             n = len(self._open_cells)
-            p = 1.0 / n if n else 0.0
-            for rr, cc in self._open_cells:
-                self._b[rr][cc] = p
+            if n:
+                self._b_flat[:] = 1.0 / n
+                self._sync_flat_to_b()
+        self._sync_b_to_flat()
         self._initialised = True
 
+    def _zero_walls(self):
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if self.grid[r][c] == WALL:
+                    self._b[r][c] = 0.0
+
     def _normalise(self):
-        total = sum(self._b[r][c] for r, c in self._open_cells)
+        if len(self._open_cells) == 0:
+            return
+        self._zero_walls()
+        self._sync_b_to_flat()
+        total = float(self._b_flat.sum())
         if total < 1e-12:
             n = len(self._open_cells)
-            p = 1.0 / n if n else 0.0
-            for r, c in self._open_cells:
-                self._b[r][c] = p
+            self._b_flat[:] = 1.0 / n
         else:
-            for r, c in self._open_cells:
-                self._b[r][c] /= total
+            self._b_flat /= total
+        self._sync_flat_to_b()
 
     def _uniform_diffuse(self):
-        delta = [[0.0] * self.cols for _ in range(self.rows)]
+        if len(self._open_cells) == 0:
+            return
+        delta = np.zeros_like(self._b, dtype=np.float32)
         for r, c in self._open_cells:
             nbrs = self._neighbours[(r, c)]
-            if not nbrs:
+            valid = [(nr, nc) for nr, nc in nbrs if self.grid[nr][nc] != WALL]
+            if not valid:
                 continue
             outflow = self._b[r][c] * ALPHA_UNIFORM
-            #compute weights based on the path's safety map
-            nbr_weights = []
-            total_w = 0.0
-            for nr, nc in nbrs:
-                safety_val = self._safety[nr][nc]
-                w = math.exp(safety_val * 3.0) 
-                nbr_weights.append(((nr, nc), w))
-                total_w += w
+            share = outflow / len(valid)
             delta[r][c] -= outflow
-            if total_w > 0:
-                for (nr, nc), w in nbr_weights:
-                    delta[nr][nc] += outflow * (w / total_w)
-            else:
-                share = outflow / len(nbrs)
-                for nr, nc in nbrs:
-                    delta[nr][nc] += share
+            for nr, nc in valid:
+                delta[nr][nc] += share
+
         for r, c in self._open_cells:
             self._b[r][c] = max(0.0, self._b[r][c] + delta[r][c])
 
@@ -418,15 +468,21 @@ class BeliefMap:
         strength = ALPHA_MOMENTUM * math.exp(-self.frames_since_sighting / MOMENTUM_DECAY)
         if strength < 1e-4:
             return
-        lr, lc = self.last_known_pos
         dr, dc = self.last_known_dir
-        candidates = [(r, c) for r, c in self._neighbours.get((lr, lc), []) if (r - lr) * dr + (c - lc) * dc > 0]
-        if not candidates:
-            return
-        source_mass = self._b[lr][lc] * strength
-        if source_mass < 1e-9:
-            return
-        share = source_mass / len(candidates)
-        self._b[lr][lc] -= source_mass
-        for r, c in candidates:
-            self._b[r][c] += share
+        #push from every cell with meaningful mass
+        min_mass = 1e-4
+        delta = np.zeros_like(self._b, dtype=np.float32)
+        for r, c in self._open_cells:
+            if self._b[r][c] < min_mass:
+                continue
+            fwd = [(nr, nc) for nr, nc in self._neighbours.get((r, c), [])
+                   if (nr - r) * dr + (nc - c) * dc > 0 and self.grid[nr][nc] != WALL]
+            if not fwd:
+                continue
+            push = self._b[r][c] * strength
+            share = push / len(fwd)
+            delta[r][c] -= push
+            for nr, nc in fwd:
+                delta[nr][nc] += share
+        for r, c in self._open_cells:
+            self._b[r][c] = max(0.0, self._b[r][c] + delta[r][c])

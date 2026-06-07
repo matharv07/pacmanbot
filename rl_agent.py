@@ -1,219 +1,291 @@
-import math
-import random
 import os
-from collections import deque
 import numpy as np
+from allocator import Task, TaskType, WALL
 try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
     import torch.optim as optim
+    from torch.distributions import Categorical
     TORCH_AVAILABLE = True
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 except ImportError:
     TORCH_AVAILABLE = False
     device = "cpu"
 
-class GhostRLNetwork(None if not TORCH_AVAILABLE else nn.Module):
-    def __init__(self, input_channels=10, output_dim=4):
-        if TORCH_AVAILABLE:
-            super(GhostRLNetwork, self).__init__()
-            self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=3, padding=1)
-            self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-            self.pool = nn.MaxPool2d(2)
-            self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-            self.conv4 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
-            self.fc1 = nn.Linear(128 * 8 * 10, 512)
-            self.fc2 = nn.Linear(512, output_dim)
+DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]   # up, down, left, right
 
-    def forward(self, x):
+class GhostActorCritic(None if not TORCH_AVAILABLE else nn.Module):
+    """
+    7-channel spatial input + 5 scalar inputs → 4-direction categorical actor + scalar critic.
+    Channels: is_wall, is_pellet, is_power, is_unknown, belief_map, self_pos, ally_pos
+    Scalars:  pacman_powered, pacman_known, pacman_staleness, target_row, target_col
+    """
+    def __init__(self, input_channels=7, rows=33, cols=41, num_scalars=5, num_actions=4):
         if not TORCH_AVAILABLE:
-            return None
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
+            return
+        super(GhostActorCritic, self).__init__()
+        self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=3, padding=1, stride=2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+
+        def conv2d_size_out(size, kernel_size=3, stride=2, padding=1):
+            return (size + 2 * padding - (kernel_size - 1) - 1) // stride + 1
+        
+        convw = conv2d_size_out(conv2d_size_out(cols))
+        convh = conv2d_size_out(conv2d_size_out(rows))
+        linear_input_size = convw * convh * 128 + num_scalars
+        self.shared_fc = nn.Linear(linear_input_size, 512)
+
+        self.actor_fc = nn.Linear(512, 128)
+        self.actor_out = nn.Linear(128, num_actions)
+
+        self.critic_fc = nn.Linear(512, 128)
+        self.critic_out = nn.Linear(128, 1)
+
+    def forward(self, x, scalars=None):
+        if not TORCH_AVAILABLE:
+            return None, None
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
         x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        return self.fc2(x)
+        if scalars is not None:
+            x = torch.cat([x, scalars], dim=-1)
+        shared_features = F.relu(self.shared_fc(x))
 
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
+        actor_features = F.relu(self.actor_fc(shared_features))
+        logits = self.actor_out(actor_features)
+
+        critic_features = F.relu(self.critic_fc(shared_features))
+        state_value = self.critic_out(critic_features)
+        return logits, state_value
+
+
+class PPOMemory:
+    def __init__(self):
+        self.states = []
+        self.scalars = []
+        self.actions = []
+        self.logprobs = []
+        self.rewards = []
+        self.values = []
+        self.dones = []
+        self.returns = []
+        self.valid_masks = []
     
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
-    
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        state, action, reward, next_state, done = map(np.stack, zip(*batch))
-        return state, action, reward, next_state, done
+    def clear(self):
+        for lst in [self.states, self.scalars, self.actions, self.logprobs, self.rewards, self.values, self.dones, self.returns, self.valid_masks]:
+            lst.clear()
 
-    def __len__(self):
-        return len(self.buffer)
 
-class DQN_Trainer:
-    def __init__(self, model, target_model, lr=1e-4, gamma=0.99):
+class PPO_Trainer:
+    def __init__(self, model, lr=3e-4, gamma=0.99, eps_clip=0.2, k_epochs=6, mini_batch_size=2048):
         self.model = model
-        self.target_model = target_model
         self.gamma = gamma
+        self.eps_clip = eps_clip
+        self.k_epochs = k_epochs
+        self.mini_batch_size = mini_batch_size
         if TORCH_AVAILABLE:
             self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
-            self.criterion = nn.SmoothL1Loss()
+            self.huber_loss = nn.HuberLoss(delta=1.0)
             
-    def train_step(self, buffer, batch_size):
-        if not TORCH_AVAILABLE or len(buffer) < batch_size:
-            return
-        states, actions, rewards, next_states, dones = buffer.sample(batch_size)
-        states = torch.FloatTensor(states).to(device)
-        actions = torch.LongTensor(actions).unsqueeze(1).to(device)
-        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)
-        next_states = torch.FloatTensor(next_states).to(device)
-        dones = torch.FloatTensor(dones).unsqueeze(1).to(device)
-        q_values = self.model(states).gather(1, actions)
-        with torch.no_grad():
-            next_q_values = self.target_model(next_states).max(1)[0].unsqueeze(1)
-            target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
-        loss = self.criterion(q_values, target_q_values)
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-        self.optimizer.step()
-        
-    def sync_target(self):
-        if TORCH_AVAILABLE:
-            self.target_model.load_state_dict(self.model.state_dict())
+    def update(self, memory):
+        if not TORCH_AVAILABLE or len(memory.states) < 2:
+            memory.clear()
+            return 0.0, 0.0, 0.0
+
+        returns_t = torch.tensor(memory.returns, dtype=torch.float32).to(device)
+        # Removed per-batch return normalization to preserve the absolute scale of the value function
+
+        old_states = torch.FloatTensor(np.array(memory.states)).to(device)
+        old_scalars = torch.FloatTensor(np.array(memory.scalars)).to(device)
+        old_actions = torch.LongTensor(memory.actions).to(device)
+        old_logprobs = torch.FloatTensor(memory.logprobs).to(device)
+        old_values = torch.FloatTensor(memory.values).to(device)
+        old_valid_masks = torch.BoolTensor(np.array(memory.valid_masks)).to(device)
+
+        advantages = (returns_t - old_values).detach()
+        adv_std = advantages.std()
+        if adv_std > 1e-7:
+            advantages = (advantages - advantages.mean()) / (adv_std + 1e-7)
+
+        batch_size = len(memory.states)
+        indices = np.arange(batch_size)
+        last_loss, last_entropy, last_vloss = 0.0, 0.0, 0.0
+
+        for _ in range(self.k_epochs):
+            np.random.shuffle(indices)
+            for start in range(0, batch_size, self.mini_batch_size):
+                end = min(start + self.mini_batch_size, batch_size)
+                mb_idx = indices[start:end]
+
+                mb_states = old_states[mb_idx]
+                mb_scalars = old_scalars[mb_idx]
+                mb_actions = old_actions[mb_idx]
+                mb_old_logprobs = old_logprobs[mb_idx]
+                mb_advantages = advantages[mb_idx]
+                mb_returns = returns_t[mb_idx]
+                mb_valid_masks = old_valid_masks[mb_idx]
+
+                logits, state_values = self.model(mb_states, mb_scalars)
+                # Mask invalid actions before computing distribution
+                logits = logits.masked_fill(~mb_valid_masks, float('-inf'))
+                dist = Categorical(logits=logits)
+                logprobs = dist.log_prob(mb_actions)
+                dist_entropy = dist.entropy()
+
+                ratios = torch.exp(logprobs - mb_old_logprobs)
+                surr1 = ratios * mb_advantages
+                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * mb_advantages
+                value_loss = self.huber_loss(state_values.squeeze(-1), mb_returns)
+                loss = -torch.min(surr1, surr2) + 0.5 * value_loss - 0.03 * dist_entropy
+
+                self.optimizer.zero_grad()
+                loss.mean().backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                self.optimizer.step()
+                last_loss = loss.mean().item()
+                last_entropy = dist_entropy.mean().item()
+                last_vloss = value_loss.item()
+
+        memory.clear()
+        return last_loss, last_entropy, last_vloss
+
 
 class RLAgent:
-    DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]  #UP, DOWN, LEFT, RIGHT
-    
-    def __init__(self, gid, pathfinder_model_path="ghostweights.pth", shared_model=None, shared_target=None, shared_trainer=None, shared_buffer=None):
+    def __init__(self, gid, pathfinder_model_path="ghostweights.pth", shared_model=None, shared_trainer=None, shared_memory=None):
         self.gid = gid
         self.model_path = pathfinder_model_path
-        self.epsilon = 1.0
-        self.epsilon_min = 0.05
-        self.epsilon_decay = 0.995
-        self.buffer = shared_buffer if shared_buffer is not None else ReplayBuffer(capacity=100000)
-        self.batch_size = 512
-        self.sync_target_frames = 1000
-        self.frame_count = 0
+        self.memory = shared_memory if shared_memory is not None else PPOMemory()
         if TORCH_AVAILABLE:
-            if shared_model is not None and shared_target is not None:
+            if shared_model is not None:
                 self.model = shared_model
-                self.target_model = shared_target
                 self.trainer = shared_trainer
             else:
-                self.model = GhostRLNetwork(input_channels=10, output_dim=4).to(device)
-                self.target_model = GhostRLNetwork(input_channels=10, output_dim=4).to(device)
+                self.model = GhostActorCritic().to(device)
                 if os.path.exists(self.model_path):
                     try:
                         self.model.load_state_dict(torch.load(self.model_path, map_location=device))
                         print(f"Ghost {self.gid} loaded weights from {self.model_path}")
                     except Exception as e:
                         print(f"Could not load weights: {e}")
-                self.target_model.load_state_dict(self.model.state_dict())
-                self.target_model.eval()
-                self.trainer = DQN_Trainer(self.model, self.target_model)
+                self.trainer = PPO_Trainer(self.model)
         else:
             self.model = None
-            self.target_model = None
             self.trainer = None
 
     def _prepare_state(self, ghost):
-        rows, cols = len(ghost.personal_map), len(ghost.personal_map[0])
+        """Build 7-channel spatial + 5 scalar observation from ghost state."""
         p_map = np.array(ghost.personal_map, dtype=np.int32)
-        one_hot = (p_map[None, :, :] == np.arange(4)[:, None, None]).astype(np.float32)
-        b_map = np.zeros((rows, cols), dtype=np.float32)
-        if hasattr(ghost.belief_map, '_initialised') and ghost.belief_map._initialised:
-            b_map = np.array(ghost.belief_map._b, dtype=np.float32)
-        target_map = np.zeros((rows, cols), dtype=np.float32)
-        r_idxs = []
-        c_idxs = []
-        intensities = []
-        for idx, task_key in enumerate(ghost.cbba_agent.path):
-            task = ghost.cbba_agent._task_map.get(task_key)
-            if task and hasattr(task, 'target_pos') and task.target_pos:
-                tr, tc = task.target_pos
-                intensity = max(0.1, 1.0 * (0.7 ** idx))
-                r_idxs.append(tr); c_idxs.append(tc); intensities.append(intensity)
-        if r_idxs:
-            np.maximum.at(target_map, (np.array(r_idxs, dtype=int), np.array(c_idxs, dtype=int)), np.array(intensities, dtype=np.float32))
-        ghost_map = np.zeros((rows, cols), dtype=np.float32)
-        ghost_map[ghost.row][ghost.col] = 1.0
-        ally_map = np.zeros((rows, cols), dtype=np.float32)
-        if ghost.known_agents:
-            positions = [pos for pos in ghost.known_agents.values() if pos is not None and pos != "UNKNOWN"]
-            if positions:
-                rs, cs = zip(*positions)
-                ally_map[np.array(rs, dtype=int), np.array(cs, dtype=int)] = 1.0
-        pacman_map = np.zeros((rows, cols), dtype=np.float32)
-        if ghost.known_pacman is not None:
-            pacman_map[ghost.known_pacman[0]][ghost.known_pacman[1]] = 1.0
-        pacman_last_seen_map = np.zeros((rows, cols), dtype=np.float32)
-        if ghost.pacman_last_seen is not None and ghost.pacman_last_seen >= 0:
-            pacman_last_seen_map[:] = np.clip(ghost.pacman_last_seen / 1000.0, 0.0, 1.0)
-        state = np.concatenate([one_hot, np.expand_dims(b_map, axis=0), np.expand_dims(target_map, axis=0), np.expand_dims(ghost_map, axis=0), np.expand_dims(ally_map, axis=0), np.expand_dims(pacman_map, axis=0), np.expand_dims(pacman_last_seen_map, axis=0)], axis=0)
-        return state
-                
-    def save_model(self):
-        if TORCH_AVAILABLE:
-            torch.save(self.model.state_dict(), self.model_path)
+        rows, cols = p_map.shape
+        c1_wall    = (p_map == 1).astype(np.float32)
+        c2_pellet  = (p_map == 2).astype(np.float32)
+        c3_power   = (p_map == 3).astype(np.float32)
+        c4_unknown = (p_map == -1).astype(np.float32)
 
-    def score_tasks(self, tasks, personal_map, belief_map, ghost_pos):          #for RL based task scoring -- setup only currently we use djikstra
-        if not tasks:
+        c5_belief = ghost.get_target_proximity_channel()
+
+        c6_self = np.zeros((rows, cols), dtype=np.float32)
+        c6_self[ghost.row, ghost.col] = 1.0
+
+        active_task = ghost.cbba_agent.get_active_task()
+        if active_task is not None and active_task.target_pos is not None:
+            target_row = float(active_task.target_pos[0]) / float(rows)
+            target_col = float(active_task.target_pos[1]) / float(cols)
+        else:
+            target_row = 0.0
+            target_col = 0.0
+
+        c7_allies = np.zeros((rows, cols), dtype=np.float32)
+        if ghost.known_agents:
+            valid_allies = [pos for pos in ghost.known_agents.values() if pos != "UNKNOWN"]
+            if valid_allies:
+                rs, cs = zip(*valid_allies)
+                c7_allies[np.array(rs), np.array(cs)] = 1.0
+
+        spatial = np.stack([c1_wall, c2_pellet, c3_power, c4_unknown, c5_belief, c6_self, c7_allies], axis=0)
+        powered = 1.0 if ghost.pacman_powered else 0.0
+        known = 1.0 if ghost.known_pacman is not None else 0.0
+        staleness = 0.0
+        if ghost.known_pacman is not None:
+            staleness = max(0.0, 1.0 - ((ghost.frame - ghost.pacman_last_seen) / 50.0))
+        scalars = np.array([powered, known, staleness, target_row, target_col], dtype=np.float32)
+        return {'spatial': spatial, 'scalars': scalars}
+
+    def _get_valid_mask(self, ghost):
+        """Return boolean mask of valid cardinal directions."""
+        rows, cols = len(ghost.grid), len(ghost.grid[0])
+        mask = np.zeros(4, dtype=bool)
+        for i, (dr, dc) in enumerate(DIRS):
+            nr, nc = ghost.row + dr, ghost.col + dc
+            if 0 <= nr < rows and 0 <= nc < cols and ghost.grid[nr][nc] != WALL:
+                mask[i] = True
+        return mask
+
+    def get_next_step(self, ghost):
+        """Game-time inference: return (next_pos, state, action_idx)."""
+        obs = self._prepare_state(ghost)
+        if not TORCH_AVAILABLE or self.model is None:
+            return None, obs['spatial'], -1
+        valid_mask = self._get_valid_mask(ghost)
+        if not valid_mask.any():
+            return None, obs['spatial'], -1
+        state_t = torch.FloatTensor(obs['spatial']).unsqueeze(0).to(device)
+        scalars_t = torch.FloatTensor(obs['scalars']).unsqueeze(0).to(device)
+        mask_t = torch.BoolTensor(valid_mask).unsqueeze(0).to(device)
+        with torch.no_grad():
+            logits, _ = self.model(state_t, scalars_t)
+            logits = logits.masked_fill(~mask_t, float('-inf'))
+            action_idx = torch.argmax(logits, dim=-1).item()
+        dr, dc = DIRS[action_idx]
+        return (ghost.row + dr, ghost.col + dc), obs['spatial'], action_idx
+
+    def generate_dynamic_tasks(self, ghost, frame, num_tasks=5):
+        """Use critic value + belief map top cells to generate CBBA tasks."""
+        if not TORCH_AVAILABLE or self.model is None:
             return []
-        for t in tasks:
-            t.score = random.uniform(0.1, 10.0)
+        obs = self._prepare_state(ghost)
+        state_t = torch.FloatTensor(obs['spatial']).unsqueeze(0).to(device)
+        scalars_t = torch.FloatTensor(obs['scalars']).unsqueeze(0).to(device)
+        with torch.no_grad():
+            _, state_value = self.model(state_t, scalars_t)
+        base_value = max(0.1, state_value.item())
+        top_cells = ghost.belief_map.top_cells(n=num_tasks)
+        tasks = []
+        for pos in top_cells:
+            prob = ghost.belief_map.probability_at(pos)
+            bid = base_value * prob * 10.0
+            tasks.append(Task(task_type=TaskType.DYNAMIC, target_pos=pos, score=bid, created_frame=frame))
+        tasks.sort(key=lambda t: t.score, reverse=True)
         return tasks
 
-    def get_next_step(self, ghost, training_mode=False):
-        state = self._prepare_state(ghost)
-        rows, cols = len(ghost.grid), len(ghost.grid[0])
-        valid_actions = []
-        for i, (dr, dc) in enumerate(self.DIRS):
-            nr, nc = ghost.row + dr, ghost.col + dc
-            if 0 <= nr < rows and 0 <= nc < cols and ghost.grid[nr][nc] != 1:
-                valid_actions.append(i)
-        reverse_idx = -1
-        if hasattr(ghost, 'last_dir') and ghost.last_dir:
-            for i, (dr, dc) in enumerate(self.DIRS):
-                if dr == -ghost.last_dir[0] and dc == -ghost.last_dir[1]:
-                    reverse_idx = i
-                    break
-        if len(valid_actions) > 1 and reverse_idx in valid_actions:
-            valid_actions.remove(reverse_idx)
-        if not valid_actions:
-            return (ghost.row, ghost.col), state, -1
-        action_idx = self.act(state, valid_actions, training_mode)
-        if action_idx == -1:
-            return (ghost.row, ghost.col), state, -1
-        dr, dc = self.DIRS[action_idx]
-        nr, nc = ghost.row + dr, ghost.col + dc
-        return (nr, nc), state, action_idx
-        
-    def act(self, state, valid_actions, training_mode=False):
-        if not valid_actions:
-            return -1
-        action_idx = -1
-        if training_mode and random.random() < self.epsilon:
-            action_idx = random.choice(valid_actions)
-        elif TORCH_AVAILABLE and self.model is not None:
-            with torch.no_grad():
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-                q_values = self.model(state_tensor).cpu().numpy()[0]
-                for i in range(4):
-                    if i not in valid_actions:
-                        q_values[i] = -float('inf')
-                action_idx = int(np.argmax(q_values))
-        else:
-            action_idx = random.choice(valid_actions)
-        return action_idx
-        
-    def train(self):
-        if not TORCH_AVAILABLE or self.trainer is None:
-            return
-        self.trainer.train_step(self.buffer, self.batch_size)
-        self.frame_count += 1
-        if self.frame_count % self.sync_target_frames == 0:
-            self.trainer.sync_target()
-            self.save_model()
+    def get_bid(self, ghost):
+        obs = self._prepare_state(ghost)
+        if not TORCH_AVAILABLE or self.model is None:
+            return 0.0
+        state_t = torch.FloatTensor(obs['spatial']).unsqueeze(0).to(device)
+        scalars_t = torch.FloatTensor(obs['scalars']).unsqueeze(0).to(device)
+        with torch.no_grad():
+            _, value = self.model(state_t, scalars_t)
+        return value.item()
+
+    def get_macro_waypoint(self, ghost):
+        obs = self._prepare_state(ghost)
+        if not TORCH_AVAILABLE or self.model is None:
+            return (ghost.row, ghost.col), np.array([0, 0]), 0.0, 0.0, obs['spatial']
+        state_t = torch.FloatTensor(obs['spatial']).unsqueeze(0).to(device)
+        scalars_t = torch.FloatTensor(obs['scalars']).unsqueeze(0).to(device)
+        with torch.no_grad():
+            logits, value = self.model(state_t, scalars_t)
+        top = ghost.belief_map.top_cells(n=1)
+        target = top[0] if top else (ghost.row, ghost.col)
+        valid_mask = self._get_valid_mask(ghost)
+        mask_t = torch.BoolTensor(valid_mask).unsqueeze(0).to(device)
+        logits = logits.masked_fill(~mask_t, float('-inf'))
+        action_idx = torch.argmax(logits, dim=-1).item() if valid_mask.any() else 0
+        return target, np.array(DIRS[action_idx]), 0.0, value.item(), obs['spatial']
+
+    def save_model(self):
+        if TORCH_AVAILABLE and self.model is not None:
+            torch.save(self.model.state_dict(), self.model_path)
