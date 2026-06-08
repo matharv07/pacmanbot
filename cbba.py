@@ -8,8 +8,7 @@ AUCTION_EVERY   = 5      #full auction every 0.5s
 LT              = 3
 LAMBDA          = 0.99   #time decay factor
 
-def _manhattan(a: tuple, b: tuple) -> float:
-    return float(abs(a[0] - b[0]) + abs(a[1] - b[1]))
+from pathfinder import dijkstra_multi
 
 def _task_key(task: Task) -> tuple:
     return (int(task.task_type), task.target_pos)
@@ -30,14 +29,7 @@ class CBBA_Agent:
     def step(self, ghost, frame: int) -> Optional[Task]:
         if frame - self._last_auction >= AUCTION_EVERY or not self.bundle:
             self._last_auction = frame
-            tasks = []
-            tasks = []
-            if hasattr(ghost, 'latest_rl_tasks') and ghost.latest_rl_tasks:
-                tasks = ghost.latest_rl_tasks
-            elif hasattr(ghost, 'rl_agent') and ghost.rl_agent is not None:
-                tasks = ghost.rl_agent.generate_task_bids(ghost, frame)
-            if not tasks:
-                tasks = generate_tasks(ghost, frame)                
+            tasks = generate_tasks(ghost, frame)                
             self._task_map = {_task_key(t): t for t in tasks}
             self._phase1(ghost, tasks)
         return self.get_active_task()
@@ -146,7 +138,8 @@ class CBBA_Agent:
             task = self._task_map.get(key)
             if task is None:
                 continue
-            d = _manhattan(prev_pos, task.target_pos)
+            res = dijkstra_multi(ghost.grid, prev_pos, [task.target_pos])
+            d = res.get(task.target_pos, (math.inf, []))[0]
             cumulative += d
             total += task.score * (self.lamda ** cumulative)
             prev_pos = task.target_pos

@@ -16,6 +16,7 @@ import math
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import List, Optional
+import numpy as np
 
 from pathfinder import dijkstra_multi
 
@@ -68,7 +69,6 @@ def _score_hunt(ghost, dists: dict) -> Optional[Task]:
     score = _dist_score(dist, HUNT_SCALE)
     return Task(task_type=TaskType.HUNT, target_pos=target, score=score)
 
-
 def _score_convert(ghost, dists: dict) -> List[Task]:
     tasks: list[Task] = []
     rows = len(ghost.personal_map)
@@ -89,20 +89,18 @@ def _score_convert(ghost, dists: dict) -> List[Task]:
 
 def _find_flee_pos(ghost, pacman_pos: tuple) -> Optional[tuple]:
     pr, pc = pacman_pos
-    best_pos  = None
-    best_dist = -1
-    rows = len(ghost.personal_map)
-    cols = len(ghost.personal_map[0])
-    for r in range(rows):
-        for c in range(cols):
-            if ghost.personal_map[r][c] in (WALL, UNKNOWN):
-                continue
-            d = abs(r - pr) + abs(c - pc)
-            if d > best_dist:
-                best_dist = d
-                best_pos  = (r, c)
-    return best_pos
-
+    p_map = np.array(ghost.personal_map)
+    valid = (p_map != WALL) & (p_map != UNKNOWN)
+    if not valid.any():
+        return None
+    rows, cols = p_map.shape
+    r_idx, c_idx = np.indices((rows, cols))
+    dists = np.abs(r_idx - pr) + np.abs(c_idx - pc)
+    dists[~valid] = -1
+    max_idx = np.argmax(dists)
+    best_r = max_idx // cols
+    best_c = max_idx % cols
+    return (int(best_r), int(best_c))
 
 def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
     if not ghost.pacman_powered:
@@ -165,7 +163,6 @@ def generate_tasks(ghost, frame: int) -> List[Task]:
     corners = [(1, 1), (1, cols - 2), (rows - 2, 1), (rows - 2, cols - 2)]
     for cn in corners:
         targets.add(cn)
-
     explore_tasks = _score_explore(ghost, frame)
     for et in explore_tasks:
         targets.add(et.target_pos)
@@ -179,14 +176,11 @@ def generate_tasks(ghost, frame: int) -> List[Task]:
     if evade_track is not None:
         tasks.append(evade_track)
     tasks.extend(explore_tasks)
-
     for t in tasks:
         if t.created_frame == 0:
             t.created_frame = frame
-
     tasks.sort(key=lambda t: t.score, reverse=True)
     return tasks
-
 
 def best_task(tasks: List[Task]) -> Optional[Task]:
     return max(tasks, key=lambda t: t.score) if tasks else None

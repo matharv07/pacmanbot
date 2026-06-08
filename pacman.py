@@ -6,9 +6,6 @@ import sys
 import os
 from collections import deque
 from ghost import Ghost, UNKNOWN
-from rl_agent import RLAgent, GhostDQN, TORCH_AVAILABLE, device
-if TORCH_AVAILABLE:
-    import torch
 
 CELL = 20
 COLS = 41
@@ -61,7 +58,6 @@ def generate_map():
                 neighbours.append((nr, nc, r + dr // 2, c + dc // 2))
         random.shuffle(neighbours)
         return neighbours
-
     sr = random.randrange(1, rows - 1, 2)
     sc = random.randrange(1, cols - 1, 2)
     frontier = carve(sr, sc)
@@ -124,41 +120,48 @@ class Player:
         self.next_dir = d
 
     def _get_bfs_map(self, start_pos):
-        rows, cols = len(self.grid), len(self.grid[0])
-        dist_map = [[float('inf')] * cols for _ in range(rows)]
+        grid_arr = np.array(self.grid)
+        dist_map = np.full(grid_arr.shape, np.inf)
         r_st, c_st = start_pos
-        dist_map[r_st][c_st] = 0
-        queue = deque([(r_st, c_st)])
-        while queue:
-            r, c = queue.popleft()
-            d = dist_map[r][c]
-            for dr, dc in DIRS:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL:
-                    if dist_map[nr][nc] == float('inf'):
-                        dist_map[nr][nc] = d+1
-                        queue.append((nr, nc))
-        return dist_map
+        dist_map[r_st, c_st] = 0
+        active = np.zeros_like(grid_arr, dtype=bool)
+        active[r_st, c_st] = True
+        wall_mask = (grid_arr == WALL)
+        d = 0
+        while active.any():
+            d += 1
+            shifted_up = np.roll(active, -1, axis=0)
+            shifted_down = np.roll(active, 1, axis=0)
+            shifted_left = np.roll(active, -1, axis=1)
+            shifted_right = np.roll(active, 1, axis=1)
+            new_active = shifted_up | shifted_down | shifted_left | shifted_right
+            new_active[wall_mask] = False
+            #mask out already visited
+            new_active = new_active & np.isinf(dist_map)
+            dist_map[new_active] = d
+            active = new_active
+        return dist_map.tolist()
 
     def _get_pellet_bfs_map(self):
-        rows, cols = len(self.grid), len(self.grid[0])
-        dist_map = [[float('inf')] * cols for _ in range(rows)]
-        queue = deque()
-        for r in range(rows):
-            for c in range(cols):
-                if self.grid[r][c] in (PELLET, POWER):
-                    dist_map[r][c] = 0
-                    queue.append((r, c))
-        while queue:
-            r, c = queue.popleft()
-            d = dist_map[r][c]
-            for dr, dc in DIRS:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL:
-                    if dist_map[nr][nc] == float('inf'):
-                        dist_map[nr][nc] = d + 1
-                        queue.append((nr, nc))
-        return dist_map
+        import numpy as np
+        grid_arr = np.array(self.grid)
+        dist_map = np.full(grid_arr.shape, np.inf)
+        active = (grid_arr == PELLET) | (grid_arr == POWER)
+        dist_map[active] = 0
+        wall_mask = (grid_arr == WALL)
+        d = 0
+        while active.any():
+            d += 1
+            shifted_up = np.roll(active, -1, axis=0)
+            shifted_down = np.roll(active, 1, axis=0)
+            shifted_left = np.roll(active, -1, axis=1)
+            shifted_right = np.roll(active, 1, axis=1)
+            new_active = shifted_up | shifted_down | shifted_left | shifted_right
+            new_active[wall_mask] = False
+            new_active = new_active & np.isinf(dist_map)
+            dist_map[new_active] = d
+            active = new_active
+        return dist_map.tolist()
 
     def _evaluate_potential(self, r, c, ghost_maps, pellet_map):
         rows, cols = len(self.grid), len(self.grid[0])
@@ -177,7 +180,6 @@ class Player:
                     ghost_repulsion += 200.0 / (d + 0.1)
                 elif d <= 8:
                     ghost_repulsion += 40.0 / (d + 0.1)
-
             p_dist = pellet_map[r][c]
             cell_type = self.grid[r][c]
             weight = 5.0 if cell_type == POWER else 1.2
@@ -195,19 +197,15 @@ class Player:
                 self.powered = False
                 self.power_timer = 0
             return
-
         if self.powered:
             self.power_timer -= 1
             if self.power_timer <= 0:
                 self.powered = False
-
         rows = len(self.grid)
         cols = len(self.grid[0])
-
         def can_move(r, c, d):
             nr, nc = r + d[0], c + d[1]
             return (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL)
-        
         self.prev_row, self.prev_col = self.row, self.col
         if AUTO_MODE:
             self.t += 1
@@ -278,7 +276,6 @@ class Player:
                                 if g_map[nr][nc] <= 1:
                                     is_immediate_lethal_threat = True
                                     break
-                        
                         if is_immediate_lethal_threat:
                             fallback_moves.append((score, (dr, dc)))
                         else:
@@ -312,12 +309,10 @@ class Player:
             if cell == POWER:
                 self.powered = True
                 self.power_timer = 40
-            
             #flush momentum info to prevent rubber-banding artifacts
             self.m_row, self.m_col = 0.0, 0.0
             self.v_row, self.v_col = 0.0, 0.0
             self.t = 0
-            
         self.mouth_tick += 1
         if self.mouth_tick >= 3:
             self.mouth_tick = 0
@@ -362,22 +357,13 @@ class Game:
         except Exception:
             self.font  = pygame.font.Font(None, 22)
             self.small = pygame.font.Font(None, 16)
-        self.shared_model = None
-        if TORCH_AVAILABLE:
-            self.shared_model = GhostDQN().to(device)
-            model_path = "ghostweights.pth"
-            if os.path.exists(model_path):
-                try:
-                    self.shared_model.load_state_dict(torch.load(model_path, map_location=device))
-                    print(f"Loaded weights from {model_path}")
-                except Exception as e:
-                    pass
-            self.shared_model.eval()
-        self.agents = {i: RLAgent(i, shared_model=self.shared_model) for i in range(7)}
+        pass
         self.new_game()
 
     def new_game(self):
         self.grid, self.player_start = generate_map()
+        import pathfinder
+        pathfinder.build_scipy_graph(self.grid)
         self.player = Player(self.grid, self.player_start)
         self.total_pellets = int(np.sum(np.isin(self.grid, (PELLET, POWER))))
         open_cells = np.argwhere(self.grid != WALL)
@@ -397,7 +383,7 @@ class Game:
             best_idx = np.argmax(scores)
             ghost_starts.append(tuple(open_cells[best_idx]))
             available[best_idx] = False
-        self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i], self.player_start, rl_agent=self.agents[i]) for i, pos in enumerate(ghost_starts)}
+        self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i], self.player_start) for i, pos in enumerate(ghost_starts)}
         self.state = "playing"
         self.message_timer = 0
         self.debug_ghost_id = 0

@@ -66,13 +66,16 @@ class BeliefMap:
         self._b_flat = np.empty((0,), dtype=np.float32)
         self._compute_topology()
         self._sync_b_to_flat()
-        #SafetyMap: _safety[r][c] contains [0, 1], where 1 = perfectly safe, 0 = ghost present
+        #safetyMap: _safety[r][c] contains [0, 1], where 1 = perfectly safe, 0 = ghost present
         self._safety = np.ones((self.rows, self.cols), dtype=np.float32)
         self._last_ghost_snapshot: dict = {}     #store last known ghost positions for bayesian modelling
         self._ghost_last_seen: dict[int, int] = {}
-        #Throttle tracking - skips recompute if nothing changed
+        self._topology_dirty = False
+        #throttle tracking - skips recompute if nothing changed
         self._last_safety_frame: int = -999
         self._last_powered: bool = False
+        self._payload_cache: dict | None = None
+        self._payload_dirty: bool = True
 
     def observe(self, pacman_pos: tuple, pacman_dir: tuple = (0, 0)):
         self._ensure_initialised()
@@ -89,6 +92,7 @@ class BeliefMap:
         self.last_known_dir        = pacman_dir
         self.frames_since_sighting = 0
         self._normalise()
+        self._payload_dirty = True
 
     def observe_lost(self, last_pos: tuple):
         self._ensure_initialised()
@@ -114,6 +118,7 @@ class BeliefMap:
         self.last_known_pos        = last_pos
         self.frames_since_sighting = 0
         self._normalise()
+        self._payload_dirty = True
 
     def observe_clear(self, visible_cells: set, pacman_pos=None):
         self._ensure_initialised()
@@ -145,7 +150,7 @@ class BeliefMap:
         n = len(self._open_arr)
         if n == 0:
             return
-        s_flat = np.zeros(n, dtype=np.float32)
+        s_flat = np.full(n, COMPRESS_THRESHOLD / 2.0, dtype=np.float32)
         s_total = 0.0
         for key, val in cells.items():
             r, c = key if isinstance(key, tuple) else (key[0], key[1])
@@ -157,8 +162,7 @@ class BeliefMap:
                     s_total += v
         if s_total < 1e-9:
             return
-        s_flat /= s_total
-        #log-space mixing: new = exp((1-conf)*log(prior) + conf*log(sender))
+        s_flat /= s_flat.sum()
         prior_flat = self._b_flat.astype(np.float32)
         log_prior = np.log(np.maximum(prior_flat, 1e-12))
         log_sender = np.log(np.maximum(s_flat, 1e-12))
@@ -174,13 +178,17 @@ class BeliefMap:
 
     def get_payload(self) -> dict:
         self._ensure_initialised()
+        if not self._payload_dirty and self._payload_cache is not None:
+            return self._payload_cache
         cells = {}
         for r, c in self._open_cells:
             v = self._b[r][c]
             if v >= COMPRESS_THRESHOLD:
                 cells[(r, c)] = round(v, 5)
-        return {"cells": cells, "fss":   self.frames_since_sighting, "lkp":   self.last_known_pos, "lkd":   self.last_known_dir}
-
+        self._payload_cache = {"cells": cells, "fss": self.frames_since_sighting, "lkp": self.last_known_pos, "lkd": self.last_known_dir}
+        self._payload_dirty = False
+        return self._payload_cache
+    
     def top_cells(self, n: int = 5) -> list[tuple]:
         self._ensure_initialised()
         ranked = sorted(self._open_cells, key=lambda rc: self._b[rc[0]][rc[1]], reverse=True)
@@ -234,7 +242,6 @@ class BeliefMap:
                 return
         DIRS4 = [(-1, 0), (1, 0), (0, -1), (0, 1)]
         proximal: dict[tuple, float] = {(r, c): 0.0 for r, c in self._open_cells} if powered else {}
-
         for gr, gc, weight in known_positions:
             visited: set = set()
             queue: list = [(gr, gc, 0)] #track actual path steps instead of coordinate distance
@@ -310,8 +317,7 @@ class BeliefMap:
             self._safety[r][c] = 1.0
             if not was_open:
                 return
-            neighbours = [n for n in self._neighbours.get(pos, [])
-                          if self.grid[n[0]][n[1]] != WALL and self._open_idx[n[0], n[1]] >= 0]
+            neighbours = [n for n in self._neighbours.get(pos, []) if self.grid[n[0]][n[1]] != WALL and self._open_idx[n[0], n[1]] >= 0]
             if mass > 0 and neighbours:
                 weights = {}
                 total_w = 0.0
@@ -337,7 +343,6 @@ class BeliefMap:
             self._remove_open_cell(pos)
         elif not was_open and value != WALL:
             self._add_open_cell(pos)
-        self._normalise()
 
     def _remove_open_cell(self, pos: tuple):
         r, c = pos
@@ -350,7 +355,7 @@ class BeliefMap:
             nbr_key = (nr, nc)
             if nbr_key in self._neighbours and pos in self._neighbours[nbr_key]:
                 self._neighbours[nbr_key].remove(pos)
-        self._rebuild_topology()
+        self._topology_dirty = True
 
     def _add_open_cell(self, pos: tuple):
         r, c = pos
@@ -366,7 +371,7 @@ class BeliefMap:
         for nbr in neighbours:
             if nbr in self._neighbours and pos not in self._neighbours[nbr]:
                 self._neighbours[nbr].append(pos)
-        self._rebuild_topology()
+        self._topology_dirty = True
 
     def _compute_topology(self):
         DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
@@ -410,6 +415,10 @@ class BeliefMap:
             self._b[self._open_arr[:, 0], self._open_arr[:, 1]] = self._b_flat
 
     def _ensure_initialised(self):
+        if self._topology_dirty:
+            self._rebuild_topology()
+            self._topology_dirty = False
+            
         if self._initialised:
             return
         if (self._pacman_start is not None and self._pacman_start in self._open_cells):
@@ -432,6 +441,7 @@ class BeliefMap:
                     self._b[r][c] = 0.0
 
     def _normalise(self):
+        self._ensure_initialised()
         if len(self._open_cells) == 0:
             return
         self._zero_walls()
@@ -443,24 +453,27 @@ class BeliefMap:
         else:
             self._b_flat /= total
         self._sync_flat_to_b()
+        self._payload_dirty = True
 
     def _uniform_diffuse(self):
         if len(self._open_cells) == 0:
             return
-        delta = np.zeros_like(self._b, dtype=np.float32)
-        for r, c in self._open_cells:
-            nbrs = self._neighbours[(r, c)]
-            valid = [(nr, nc) for nr, nc in nbrs if self.grid[nr][nc] != WALL]
-            if not valid:
-                continue
-            outflow = self._b[r][c] * ALPHA_UNIFORM
-            share = outflow / len(valid)
-            delta[r][c] -= outflow
-            for nr, nc in valid:
-                delta[nr][nc] += share
-
-        for r, c in self._open_cells:
-            self._b[r][c] = max(0.0, self._b[r][c] + delta[r][c])
+            
+        outflow = self._b_flat * ALPHA_UNIFORM
+        counts = self._nbr_count
+        share = np.zeros_like(outflow)
+        valid_mask = counts > 0
+        share[valid_mask] = outflow[valid_mask] / counts[valid_mask]
+        
+        self._b_flat -= outflow
+        
+        for i in range(self._nbr_idx.shape[1]):
+            nbrs = self._nbr_idx[:, i]
+            valid_nbrs = nbrs >= 0
+            np.add.at(self._b_flat, nbrs[valid_nbrs], share[valid_nbrs])
+            
+        self._b_flat = np.maximum(0.0, self._b_flat)
+        self._sync_flat_to_b()
 
     def _momentum_diffuse(self):
         if self.last_known_pos is None or self.last_known_dir == (0, 0):
@@ -469,20 +482,33 @@ class BeliefMap:
         if strength < 1e-4:
             return
         dr, dc = self.last_known_dir
-        #push from every cell with meaningful mass
-        min_mass = 1e-4
-        delta = np.zeros_like(self._b, dtype=np.float32)
-        for r, c in self._open_cells:
-            if self._b[r][c] < min_mass:
-                continue
-            fwd = [(nr, nc) for nr, nc in self._neighbours.get((r, c), [])
-                   if (nr - r) * dr + (nc - c) * dc > 0 and self.grid[nr][nc] != WALL]
-            if not fwd:
-                continue
-            push = self._b[r][c] * strength
-            share = push / len(fwd)
-            delta[r][c] -= push
-            for nr, nc in fwd:
-                delta[nr][nc] += share
-        for r, c in self._open_cells:
-            self._b[r][c] = max(0.0, self._b[r][c] + delta[r][c])
+        
+        r = self._open_arr[:, 0]
+        c = self._open_arr[:, 1]
+        push = self._b_flat * strength
+        
+        fwd_mask = np.zeros(self._nbr_idx.shape, dtype=bool)
+        for j in range(self._nbr_idx.shape[1]):
+            nbr_idx = self._nbr_idx[:, j]
+            valid = nbr_idx >= 0
+            nr = self._open_arr[nbr_idx[valid], 0]
+            nc = self._open_arr[nbr_idx[valid], 1]
+            alignment = (nr - r[valid]) * dr + (nc - c[valid]) * dc
+            fwd_mask[valid, j] = alignment > 0
+            
+        fwd_counts = fwd_mask.sum(axis=1)
+        has_fwd = fwd_counts > 0
+        
+        share = np.zeros_like(push)
+        valid_push = has_fwd & (self._b_flat >= 1e-4)
+        share[valid_push] = push[valid_push] / fwd_counts[valid_push]
+        
+        self._b_flat[valid_push] -= push[valid_push]
+        
+        for j in range(self._nbr_idx.shape[1]):
+            valid_receivers = valid_push & fwd_mask[:, j]
+            receivers = self._nbr_idx[valid_receivers, j]
+            np.add.at(self._b_flat, receivers, share[valid_receivers])
+            
+        self._b_flat = np.maximum(0.0, self._b_flat)
+        self._sync_flat_to_b()

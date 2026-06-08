@@ -3,11 +3,10 @@ import random
 import math
 from collections import deque
 import numpy as np
-from pathfinder import dijkstra_multi
+from pathfinder import dijkstra_multi, next_step
 from cbba import CBBA_Agent
 from beliefmap import BeliefMap
 from allocator import TaskType
-from rl_agent import RLAgent
 
 CELL = 20
 COLS = 41
@@ -50,7 +49,7 @@ RESYNC_EVERY      = 50
 OSCILLATION_WINDOW = 8   #position history length to prevent oscillations
 
 class Ghost:
-    def __init__(self, gid, grid, pos, color, player_start, rl_agent=None):
+    def __init__(self, gid, grid, pos, color, player_start):
         self.gid = gid
         self.grid = grid
         self.row, self.col = pos
@@ -70,24 +69,21 @@ class Ghost:
         self.message_queue = []
         self.seen_message_ids = {}
         self.seq = 0
-        self.known_agents = {}          #(row, col) | UNKNOWN for dead/out of reach agents
-        self.last_heartbeat = {}        #frame of last received heartbeat from every ghost
-        self.last_sync_frame = {}       #frame of last full sync sent to every ghost
-        self.known_pacman = None        #(row, col) | None for not seen yet
-        self.pacman_powered = False     #normal | powered | unknown
-        self.pacman_last_seen = -1      #frame of when pacman was last seen for tiebreaks
-        self.last_lost_pacman = None    #(row, col) of last invalidated pacman pos
-        self.prev_pac_row: int = -1     #pacman's row on previous frame - belief map
-        self.prev_pac_col: int = -1     #pacman's col on previous frame - belief map
-        self.cbba_agent = CBBA_Agent(gid) #CBBA auction agent for this ghost
+        self.known_agents = {}                  #(row, col) | UNKNOWN for dead/out of reach agents
+        self.last_heartbeat = {}                #frame of last received heartbeat from every ghost
+        self.last_sync_frame = {}               #frame of last full sync sent to every ghost
+        self.known_pacman = None                #(row, col) | None for not seen yet
+        self.pacman_powered = False             #normal | powered | unknown
+        self.pacman_last_seen = -1              #frame of when pacman was last seen for tiebreaks
+        self.last_lost_pacman = None            #(row, col) of last invalidated pacman pos
+        self.prev_pac_row: int = -1             #pacman's row on previous frame - belief map
+        self.prev_pac_col: int = -1             #pacman's col on previous frame - belief map
+        self.cbba_agent = CBBA_Agent(gid)       #CBBA auction agent for this ghost
         self.pos_history: deque = deque(maxlen=OSCILLATION_WINDOW)  #rolling position window for oscillation detection
         self.belief_map = BeliefMap(gid, self.personal_map, pacman_start=player_start)
         self._proximity_channel_cache = None
         self._proximity_channel_frame = -1
         self._proximity_channel_target = None
-        self.rl_agent = rl_agent
-        self.last_state = None
-        self.last_action_idx = -1
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False):
         self.frame += 1
@@ -116,11 +112,9 @@ class Ghost:
             return newly_discovered
         #CBBA: get active task and move toward target
         active_task = self.cbba_agent.step(self, self.frame)
-        if self.rl_agent is not None:
-            moved = False
-            nxt, current_state, action_idx = self.rl_agent.get_next_step(self)
-            self.last_state = current_state
-            self.last_action_idx = action_idx
+        moved = False
+        if active_task is not None:
+            nxt = next_step(self.grid, (self.row, self.col), active_task.target_pos)
             if (nxt is not None and nxt != (self.row, self.col) and self.grid[nxt[0]][nxt[1]] != WALL):
                 if self.pacman_powered and self.known_pacman is not None and nxt == self.known_pacman:
                     pass
@@ -131,29 +125,27 @@ class Ghost:
                     if self.grid[self.row][self.col] == POWER:
                         self.grid[self.row][self.col] = PELLET
                     moved = True
-                        
-            if not moved:
-                rows = len(self.grid)
-                cols = len(self.grid[0])
-                pac_cell = self.known_pacman if (self.pacman_powered and self.known_pacman) else None
-                options = []
-                for dr, dc in DIRS:
-                    nr, nc = self.row + dr, self.col + dc
-                    if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL and (nr, nc) != pac_cell):
-                        options.append((dr, dc))
-                if options:
-                    if self.last_dir in options and random.random() < 0.70:
-                        options = [self.last_dir]
-                    else:
-                        random.shuffle(options)
-                    dr, dc = options[0]
-                    self.prev_row, self.prev_col = self.row, self.col
-                    self.row += dr
-                    self.col += dc
-                    self.last_dir = (dr, dc)
-                    if self.grid[self.row][self.col] == POWER:
-                        self.grid[self.row][self.col] = PELLET
-
+        if not moved:
+            rows = len(self.grid)
+            cols = len(self.grid[0])
+            pac_cell = self.known_pacman if (self.pacman_powered and self.known_pacman) else None
+            options = []
+            for dr, dc in DIRS:
+                nr, nc = self.row + dr, self.col + dc
+                if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL and (nr, nc) != pac_cell):
+                    options.append((dr, dc))
+            if options:
+                if self.last_dir in options and random.random() < 0.70:
+                    options = [self.last_dir]
+                else:
+                    random.shuffle(options)
+                dr, dc = options[0]
+                self.prev_row, self.prev_col = self.row, self.col
+                self.row += dr
+                self.col += dc
+                self.last_dir = (dr, dc)
+                if self.grid[self.row][self.col] == POWER:
+                    self.grid[self.row][self.col] = PELLET
         self.pos_history.append((self.row, self.col))
         self._check_oscillation()
         return newly_discovered
@@ -174,25 +166,20 @@ class Ghost:
         channel = np.zeros((rows, cols), dtype=np.float32)
         if not getattr(self.belief_map, '_initialised', False):
             return channel
-
         target = self.known_pacman or self.last_lost_pacman
         if target is None:
             top = self.belief_map.top_cells(n=1)
             if top:
                 target = top[0]
-
         if target is None:
             self._proximity_channel_cache = channel
             self._proximity_channel_frame = self.frame
             self._proximity_channel_target = None
             return channel
-
         if self._proximity_channel_frame == self.frame and self._proximity_channel_target == target and self._proximity_channel_cache is not None:
             return self._proximity_channel_cache
-
         if self.frame % self.move_every != 0 and self._proximity_channel_cache is not None:
             return self._proximity_channel_cache
-
         dists = dijkstra_multi(self.grid, (self.row, self.col), [target])
         info = dists.get(target)
         if not info or info[0] == math.inf:
@@ -200,19 +187,12 @@ class Ghost:
             self._proximity_channel_frame = self.frame
             self._proximity_channel_target = target
             return channel
-
         max_d = info[0] if info[0] > 0 else 1.0
-        all_targets = [
-            (r, c)
-            for r in range(rows)
-            for c in range(cols)
-            if self.personal_map[r][c] not in (1, -1)
-        ]
+        all_targets = [(r, c) for r in range(rows) for c in range(cols) if self.personal_map[r][c] not in (1, -1)]
         all_dists = dijkstra_multi(self.grid, target, all_targets)
         for (r, c), (d, _) in all_dists.items():
             if d != math.inf:
                 channel[r, c] = max(0.0, min(1.0, 1.0 - d / (max_d * 3.0)))
-
         self._proximity_channel_cache = channel
         self._proximity_channel_frame = self.frame
         self._proximity_channel_target = target
@@ -230,25 +210,28 @@ class Ghost:
         rows = len(self.grid)
         cols = len(self.grid[0])
         visible[(self.row, self.col)] = self.grid[self.row][self.col]
-
-        for i in range(RAY_COUNT):
-            angle = math.radians(i)
-            dx = math.cos(angle)
-            dy = math.sin(angle)
-            rx = self.col + 0.5
-            ry = self.row + 0.5
-            for _ in range(MAX_RAY_DIST * 2):
-                rx += dx * 0.5
-                ry += dy * 0.5
-                c = int(rx)
-                r = int(ry)
-                if not (0 <= r < rows and 0 <= c < cols):
-                    break
-                cell_val = self.grid[r][c]
-                visible[(r, c)] = cell_val
-                if cell_val == WALL:
-                    break
-
+        angles = np.radians(np.arange(RAY_COUNT))
+        dx = np.cos(angles) * 0.5
+        dy = np.sin(angles) * 0.5
+        steps = np.arange(1, MAX_RAY_DIST * 2 + 1)[:, np.newaxis]
+        ray_x = self.col + 0.5 + steps * dx
+        ray_y = self.row + 0.5 + steps * dy
+        ray_c = ray_x.astype(int)
+        ray_r = ray_y.astype(int)
+        valid = (ray_r >= 0) & (ray_r < rows) & (ray_c >= 0) & (ray_c < cols)
+        safe_r = np.where(valid, ray_r, 0)
+        safe_c = np.where(valid, ray_c, 0)
+        grid_arr = np.array(self.grid)
+        cells = grid_arr[safe_r, safe_c]
+        is_wall = (cells == WALL) | (~valid)
+        first_wall_idx = np.argmax(is_wall, axis=0)
+        step_idx = np.arange(MAX_RAY_DIST * 2)[:, np.newaxis]
+        visible_mask = step_idx <= first_wall_idx
+        final_r = safe_r[visible_mask]
+        final_c = safe_c[visible_mask]
+        final_valid = valid[visible_mask]
+        for r, c in zip(final_r[final_valid], final_c[final_valid]):
+            visible[(r, c)] = self.grid[r][c]
         #check co-ghost visibility
         agent_diffs = []
         for gid, ghost in all_ghosts.items():
@@ -325,7 +308,8 @@ class Ghost:
     def _broadcast(self, diffs, all_ghosts, msg_id=None, hop=0):
         if not diffs:
             return
-        if msg_id is None:
+        is_new_msg = msg_id is None
+        if is_new_msg:
             msg_id = (self.gid, self.frame, self.seq)
             self.seq += 1
             cbba_payload   = self.cbba_agent.get_consensus_payload()
@@ -339,43 +323,40 @@ class Ghost:
             dist = abs(ghost.row - self.row) + abs(ghost.col - self.col)
             if dist <= RADIUS:
                 ghost.message_queue.append(msg)
-                last = self.last_sync_frame.get(ghost.gid, -1)
-                if self.frame - last >= RESYNC_EVERY:
-                    self.last_sync_frame[ghost.gid] = self.frame
-                    ghost.last_sync_frame[self.gid] = self.frame
-                    self._send_full_sync(ghost)
-                    ghost._send_full_sync(self)
+                if is_new_msg:
+                    last = self.last_sync_frame.get(ghost.gid, -1)
+                    if self.frame - last >= RESYNC_EVERY:
+                        self.last_sync_frame[ghost.gid] = self.frame
+                        ghost.last_sync_frame[self.gid] = self.frame
+                        self._send_full_sync(ghost)
+                        ghost._send_full_sync(self)
 
     def _send_full_sync(self, target_ghost):
         sync_diffs = []
         rows = len(self.personal_map)
         cols = len(self.personal_map[0])
-
         for r in range(rows):
             for c in range(cols):
                 val = self.personal_map[r][c]
                 if val != UNKNOWN:
                     sync_diffs.append(("cell", r, c, val))
-
         #iterate through agent positions and liveness
         for gid, pos in self.known_agents.items():
             if pos == "UNKNOWN":
                 sync_diffs.append(("agent_lost", gid))
             elif pos is not None:
                 sync_diffs.append(("agent", gid, pos[0], pos[1]))
-
         for gid, hb_frame in self.last_heartbeat.items():
             frames_ago = self.frame - hb_frame
             sync_diffs.append(("hb_sync", gid, frames_ago))
-
         #check & relay pacman state
         if self.known_pacman is not None:
             sync_diffs.append(("pacman", self.known_pacman[0], self.known_pacman[1], self.pacman_powered, self.pacman_last_seen))
         elif self.last_lost_pacman is not None and self.pacman_last_seen > -1:
             sync_diffs.append(("pacman_lost", self.last_lost_pacman[0], self.last_lost_pacman[1], self.pacman_last_seen))
-
         if sync_diffs:
             sync_id = ("sync", self.gid, target_ghost.gid, self.frame)
+            self.seen_message_ids[sync_id] = True
             target_ghost.message_queue.append({"id": sync_id, "diffs": sync_diffs, "hop": 0})
 
     def _process_messages(self, all_ghosts):
@@ -385,7 +366,6 @@ class Ghost:
             self.seen_message_ids[msg["id"]] = True
             hop  = msg.get("hop", 0)
             relay_diffs = []
-
             for diff in msg["diffs"]:
                 dtype = diff[0]
                 if dtype == "cell":
@@ -464,8 +444,17 @@ class Ghost:
                         continue
                     self.belief_map.merge(sender_gid, payload, self.frame)
                     relay_diffs.append(diff)  #always relay — belief spreads like heartbeats
-            self._broadcast(relay_diffs, all_ghosts, msg_id=msg["id"], hop=hop + 1)
+            if relay_diffs:
+                MAX_RELAY_SIZE = 50
+                for idx, i in enumerate(range(0, len(relay_diffs), MAX_RELAY_SIZE)):
+                    chunk = relay_diffs[i : i + MAX_RELAY_SIZE]
+                    if idx == 0:
+                        chunk_msg_id = msg["id"]
+                    else:
+                        chunk_msg_id = tuple(list(msg["id"]) + [f"chunk_{idx}"])                        
+                    self._broadcast(chunk, all_ghosts, msg_id=chunk_msg_id, hop=hop+1)
         self.message_queue.clear()
+        self.belief_map._ensure_initialised()  #make sure belief map is ready before we try to prune messages
         #rolling prune - keep newest 250, discarding rest post 500 messages
         if len(self.seen_message_ids) > 500:
             to_remove = list(self.seen_message_ids)[:250]

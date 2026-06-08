@@ -23,6 +23,39 @@ except Exception:
 # cache: id(grid) -> (csr_matrix, open_cells_list, cell_to_idx)
 _SCIPY_GRAPH_CACHE = {}
 
+def build_scipy_graph(grid: list):
+    if not _SCIPY_AVAILABLE:
+        return
+    import numpy as np
+    from scipy.sparse import csr_matrix
+    rows = len(grid)
+    cols = len(grid[0])
+    open_cells = []
+    cell_to_idx = {}
+    for r in range(rows):
+        for c in range(cols):
+            if grid[r][c] != WALL:
+                idx = len(open_cells)
+                open_cells.append((r, c))
+                cell_to_idx[(r, c)] = idx
+    
+    n = len(open_cells)
+    row_ind = []
+    col_ind = []
+    data = []
+    for i, (r, c) in enumerate(open_cells):
+        for dr, dc in _DIRS:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols and grid[nr][nc] != WALL:
+                j = cell_to_idx[(nr, nc)]
+                cost = _cost(grid, nr, nc)
+                row_ind.append(i)
+                col_ind.append(j)
+                data.append(cost)
+    
+    graph = csr_matrix((data, (row_ind, col_ind)), shape=(n, n))
+    _SCIPY_GRAPH_CACHE[id(grid)] = (graph, open_cells, cell_to_idx)
+
 #cell costs for path planning - wall taken to be impassable
 _COST = {EMPTY: 1.0, PELLET: 1.0, POWER: 0.5, UNKNOWN: 3.0, WALL: math.inf}   #unknown territory taken to be passable but 3x more costly than known cells
 _DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
