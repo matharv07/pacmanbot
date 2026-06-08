@@ -6,7 +6,7 @@ import sys
 import os
 from collections import deque
 from ghost import Ghost, UNKNOWN
-from rl_agent import RLAgent, GhostActorCritic, TORCH_AVAILABLE, device
+from rl_agent import RLAgent, GhostDQN, TORCH_AVAILABLE, device
 if TORCH_AVAILABLE:
     import torch
 
@@ -364,7 +364,7 @@ class Game:
             self.small = pygame.font.Font(None, 16)
         self.shared_model = None
         if TORCH_AVAILABLE:
-            self.shared_model = GhostActorCritic(input_channels=7, rows=ROWS, cols=COLS, num_scalars=5, num_actions=4).to(device)
+            self.shared_model = GhostDQN().to(device)
             model_path = "ghostweights.pth"
             if os.path.exists(model_path):
                 try:

@@ -31,8 +31,11 @@ class CBBA_Agent:
         if frame - self._last_auction >= AUCTION_EVERY or not self.bundle:
             self._last_auction = frame
             tasks = []
-            if hasattr(ghost, 'rl_agent') and ghost.rl_agent is not None:       #dynamic rl tasks generation
-                tasks = ghost.rl_agent.generate_dynamic_tasks(ghost, frame, num_tasks=5)
+            tasks = []
+            if hasattr(ghost, 'latest_rl_tasks') and ghost.latest_rl_tasks:
+                tasks = ghost.latest_rl_tasks
+            elif hasattr(ghost, 'rl_agent') and ghost.rl_agent is not None:
+                tasks = ghost.rl_agent.generate_task_bids(ghost, frame)
             if not tasks:
                 tasks = generate_tasks(ghost, frame)                
             self._task_map = {_task_key(t): t for t in tasks}
