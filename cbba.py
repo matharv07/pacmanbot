@@ -25,6 +25,7 @@ class CBBA_Agent:
         self.s: dict = {}       #last sync frames
         self._task_map: dict = {}
         self._last_auction: int = -1
+        self._dist_cache: dict = {}   # (pos) -> distance, cached per-auction
 
     def step(self, ghost, frame: int) -> Optional[Task]:
         if frame - self._last_auction >= AUCTION_EVERY or not self.bundle:
@@ -77,6 +78,15 @@ class CBBA_Agent:
     def _phase1(self, ghost, tasks: list):
         valid_keys = {_task_key(t) for t in tasks}
         self._task_map.update({_task_key(t): t for t in tasks})
+
+        # Single Dijkstra from ghost position to ALL task targets (BUG-4 fix)
+        all_targets = [t.target_pos for t in tasks]
+        if all_targets:
+            dists = dijkstra_multi(ghost.grid, (ghost.row, ghost.col), all_targets)
+            self._dist_cache = {pos: d for pos, (d, _) in dists.items()}
+        else:
+            self._dist_cache = {}
+
         #pruning bundle & path: keeping only tasks we still own in the new task set
         new_bundle = []
         for k in self.bundle:
@@ -138,11 +148,16 @@ class CBBA_Agent:
             task = self._task_map.get(key)
             if task is None:
                 continue
-            res = dijkstra_multi(ghost.grid, prev_pos, [task.target_pos])
-            d = res.get(task.target_pos, (math.inf, []))[0]
+            tgt = task.target_pos
+            if prev_pos == (ghost.row, ghost.col):
+                # First segment: use cached Dijkstra distance
+                d = self._dist_cache.get(tgt, math.inf)
+            else:
+                # Subsequent segments: Manhattan approximation (avoids Dijkstra)
+                d = abs(prev_pos[0] - tgt[0]) + abs(prev_pos[1] - tgt[1])
             cumulative += d
             total += task.score * (self.lamda ** cumulative)
-            prev_pos = task.target_pos
+            prev_pos = tgt
         return total
 
     def _table1(self, k: int, z_kj, z_ij, y_kj: float, y_ij: float, s_k: dict, s_i: dict) -> str:

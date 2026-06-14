@@ -28,8 +28,44 @@ POWERED_COLOR = (0, 120, 255)
 GHOST_COLORS  = [RED, PINK, CYAN, ORANGE, (180, 0, 180), (0, 180, 80), (220, 220, 0)]
 
 AUTO_MODE = False
+RL_MODE = True
 TOGGLE_WIDTH, TOGGLE_HEIGHT = 160, 32
-TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH - 10, ROWS * CELL + 8, TOGGLE_WIDTH, TOGGLE_HEIGHT)
+TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH * 2 - 20, ROWS * CELL + 8, TOGGLE_WIDTH, TOGGLE_HEIGHT)
+RL_TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH - 10, ROWS * CELL + 8, TOGGLE_WIDTH, TOGGLE_HEIGHT)
+
+RL_ACTOR = None
+RL_DEVICE = None
+
+def load_rl_model():
+    global RL_ACTOR, RL_DEVICE, RL_MODE
+    if RL_ACTOR is not None:
+        return True
+    print("Loading RL Model...")
+    try:
+        import torch
+        import glob
+        from net import GhostActor
+        RL_DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        ckpts = glob.glob("checkpoints/ckpt_*.pt")
+        if not ckpts:
+            print("No checkpoints found. RL Mode disabled.")
+            RL_MODE = False
+            return False
+            
+        latest = max(ckpts, key=os.path.getctime)
+        print(f"Loading checkpoint: {latest}")
+        
+        RL_ACTOR = GhostActor().to(RL_DEVICE)
+        checkpoint = torch.load(latest, map_location=RL_DEVICE)
+        RL_ACTOR.load_state_dict(checkpoint["actor"])
+        RL_ACTOR.eval()
+        print("RL Model loaded successfully.")
+        return True
+    except Exception as e:
+        print(f"Failed to load RL Model: {e}")
+        RL_MODE = False
+        return False
 
 WALL   = 1
 EMPTY  = 0
@@ -42,8 +78,14 @@ LEFT  = ( 0, -1)
 RIGHT = ( 0,  1)
 DIRS  = [UP, DOWN, LEFT, RIGHT]
 
-def generate_map():
-    rows, cols = ROWS, COLS
+def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = 28):
+    """Generate a random maze grid.
+
+    Parameters
+    ----------
+    rows, cols : grid dimensions (curriculum-adjustable)
+    n_power    : number of power pellets to place
+    """
     grid = np.full((rows, cols), WALL, dtype=np.int8)
 
     def in_bounds(r, c):
@@ -58,8 +100,12 @@ def generate_map():
                 neighbours.append((nr, nc, r + dr // 2, c + dc // 2))
         random.shuffle(neighbours)
         return neighbours
-    sr = random.randrange(1, rows - 1, 2)
-    sc = random.randrange(1, cols - 1, 2)
+
+    # Ensure start cell is on an odd row/col inside bounds
+    max_sr = max(1, rows - 2)
+    max_sc = max(1, cols - 2)
+    sr = random.randrange(1, max_sr + 1, 2) if max_sr >= 1 else 1
+    sc = random.randrange(1, max_sc + 1, 2) if max_sc >= 1 else 1
     frontier = carve(sr, sc)
     while frontier:
         idx = random.randrange(len(frontier))
@@ -68,14 +114,19 @@ def generate_map():
             grid[wr][wc] = EMPTY
             frontier.extend(carve(nr, nc))
     for _ in range(int(rows * cols * 0.1)):
-        r = random.randrange(1, rows - 1)
-        c = random.randrange(1, cols - 1)
+        r = random.randrange(1, max(2, rows - 1))
+        c = random.randrange(1, max(2, cols - 1))
         grid[r, c] = EMPTY
     grid[0, :] = WALL
     grid[rows - 1, :] = WALL
     grid[:, 0] = WALL
     grid[:, cols - 1] = WALL
     open_cells = list(map(tuple, np.argwhere(grid == EMPTY)))
+    if not open_cells:
+        # Fallback for tiny grids: force centre open
+        cr, cc = rows // 2, cols // 2
+        grid[cr, cc] = EMPTY
+        open_cells = [(cr, cc)]
     centre = (rows // 2, cols // 2)
     open_cells.sort(key=lambda p: abs(p[0] - centre[0]) + abs(p[1] - centre[1]))
     player_start = open_cells[0]
@@ -85,7 +136,7 @@ def generate_map():
     random.shuffle(open_cells)
     placed = 0
     for r, c in open_cells:
-        if placed >= 28:
+        if placed >= n_power:
             break
         if abs(r - player_start[0]) + abs(c - player_start[1]) > 4:
             grid[r][c] = POWER
@@ -114,7 +165,8 @@ class Player:
         self.beta1 = 0.9
         self.beta2 = 0.999
         self.eps = 1e-8
-        self.macro_routing_active = False   #Flag to indicate if we're currently in macro routing mode => following pellet gradients directly - adam gets confused and jittery otherwise
+        self.macro_routing_active = False   #flag to indicate if we're currently in macro routing mode => following pellet gradients directly - adam gets confused and jittery otherwise
+        self._bfs_cache = {}               #cache BFS maps per start position
 
     def set_dir(self, d):
         self.next_dir = d
@@ -140,7 +192,7 @@ class Player:
             new_active = new_active & np.isinf(dist_map)
             dist_map[new_active] = d
             active = new_active
-        return dist_map.tolist()
+        return dist_map
 
     def _get_pellet_bfs_map(self):
         import numpy as np
@@ -161,18 +213,21 @@ class Player:
             new_active = new_active & np.isinf(dist_map)
             dist_map[new_active] = d
             active = new_active
-        return dist_map.tolist()
+        return dist_map
 
     def _evaluate_potential(self, r, c, ghost_maps, pellet_map):
         rows, cols = len(self.grid), len(self.grid[0])
         if not (0 <= r < rows and 0 <= c < cols) or self.grid[r][c] == WALL:
             return 9999.0
-        g_dists = [g_map[r][c] for g_map in ghost_maps if g_map[r][c] != float('inf')]
+        g_dists = [g_map[r, c] for g_map in ghost_maps if not math.isinf(g_map[r, c]) and not math.isnan(g_map[r, c])]
         if self.powered:
             if g_dists:
                 return min(g_dists) * 15.0  #hyper-focused pull to execution point
             else:
-                return pellet_map[r][c] * 1.0
+                p_dist = pellet_map[r, c]
+                if math.isinf(p_dist) or math.isnan(p_dist):
+                    return 999.0
+                return p_dist * 1.0
         else:
             ghost_repulsion = 0.0
             for d in g_dists:
@@ -180,10 +235,10 @@ class Player:
                     ghost_repulsion += 200.0 / (d + 0.1)
                 elif d <= 8:
                     ghost_repulsion += 40.0 / (d + 0.1)
-            p_dist = pellet_map[r][c]
+            p_dist = pellet_map[r, c]
             cell_type = self.grid[r][c]
             weight = 5.0 if cell_type == POWER else 1.2
-            pellet_attraction = p_dist * weight if p_dist != float('inf') else 0.0
+            pellet_attraction = p_dist * weight if not math.isinf(p_dist) and not math.isnan(p_dist) else 0.0
             return ghost_repulsion + pellet_attraction
 
     def update(self, ghosts):
@@ -209,30 +264,36 @@ class Player:
         self.prev_row, self.prev_col = self.row, self.col
         if AUTO_MODE:
             self.t += 1
+            self._bfs_cache.clear()    # invalidate BFS cache each frame (ghosts moved)
             ghost_maps = []
             min_ghost_dist = float('inf')
             for g in ghosts.values():
                 if not g.dead:
-                    g_map = self._get_bfs_map((g.row, g.col))
+                    cache_key = (g.row, g.col)
+                    if cache_key in self._bfs_cache:
+                        g_map = self._bfs_cache[cache_key]
+                    else:
+                        g_map = self._get_bfs_map(cache_key)
+                        self._bfs_cache[cache_key] = g_map
                     ghost_maps.append(g_map)
-                    if g_map[self.row][self.col] < min_ghost_dist:
-                        min_ghost_dist = g_map[self.row][self.col]
+                    if g_map[self.row, self.col] < min_ghost_dist:
+                        min_ghost_dist = g_map[self.row, self.col]
             pellet_map = self._get_pellet_bfs_map()
-            current_cell_pellet_dist = pellet_map[self.row][self.col]
+            current_cell_pellet_dist = pellet_map[self.row, self.col]
             if self.macro_routing_active:           #break out of macro navigation only if we come across pellets or if a ghost intercepts us
                 if current_cell_pellet_dist <= 1 or min_ghost_dist <= 4:
                     self.macro_routing_active = False
             else:                                   #enter macro navigation strategy if we are completely isolated
                 if current_cell_pellet_dist > 3 and min_ghost_dist > 6:
                     self.macro_routing_active = True
-            if self.macro_routing_active and current_cell_pellet_dist != float('inf'):
+            if self.macro_routing_active and not math.isinf(current_cell_pellet_dist) and not math.isnan(current_cell_pellet_dist):
                 best_macro_dir = self.dir
                 min_macro_dist = current_cell_pellet_dist
                 for dr, dc in DIRS:
                     if can_move(self.row, self.col, (dr, dc)):
                         nr, nc = self.row + dr, self.col + dc
-                        if pellet_map[nr][nc] < min_macro_dist:
-                            min_macro_dist = pellet_map[nr][nc]
+                        if pellet_map[nr, nc] < min_macro_dist:
+                            min_macro_dist = pellet_map[nr, nc]
                             best_macro_dir = (dr, dc)
                 self.dir = best_macro_dir
                 self.row += self.dir[0]
@@ -254,12 +315,19 @@ class Player:
                 self.m_col = self.beta1 * self.m_col + (1.0 - self.beta1) * grad_col
                 self.v_row = self.beta2 * self.v_row + (1.0 - self.beta2) * (grad_row**2)
                 self.v_col = self.beta2 * self.v_col + (1.0 - self.beta2) * (grad_col**2)
-                m_hat_r = self.m_row / (1.0 - self.beta1**self.t)
-                m_hat_c = self.m_col / (1.0 - self.beta1**self.t)
-                v_hat_r = self.v_row / (1.0 - self.beta2**self.t)
-                v_hat_c = self.v_col / (1.0 - self.beta2**self.t)
-                step_row = m_hat_r / (math.sqrt(v_hat_r) + self.eps)
-                step_col = m_hat_c / (math.sqrt(v_hat_c) + self.eps)
+                t_val = max(1, self.t)
+                m_hat_r = self.m_row / (1.0 - self.beta1**t_val)
+                m_hat_c = self.m_col / (1.0 - self.beta1**t_val)
+                v_hat_r = self.v_row / (1.0 - self.beta2**t_val)
+                v_hat_c = self.v_col / (1.0 - self.beta2**t_val)
+                denom_r = math.sqrt(max(0.0, v_hat_r)) + self.eps
+                denom_c = math.sqrt(max(0.0, v_hat_c)) + self.eps
+                step_row = m_hat_r / denom_r
+                step_col = m_hat_c / denom_c
+                if math.isnan(step_row) or math.isinf(step_row):
+                    step_row = 0.0
+                if math.isnan(step_col) or math.isinf(step_col):
+                    step_col = 0.0
                 scored_moves = []
                 fallback_moves = []
                 for dr, dc in DIRS:
@@ -273,7 +341,7 @@ class Player:
                         is_immediate_lethal_threat = False
                         if not self.powered:
                             for g_map in ghost_maps:
-                                if g_map[nr][nc] <= 1:
+                                if g_map[nr, nc] <= 1:
                                     is_immediate_lethal_threat = True
                                     break
                         if is_immediate_lethal_threat:
@@ -313,6 +381,7 @@ class Player:
             self.m_row, self.m_col = 0.0, 0.0
             self.v_row, self.v_col = 0.0, 0.0
             self.t = 0
+            self._bfs_cache.clear()  # grid changed, invalidate BFS cache
         self.mouth_tick += 1
         if self.mouth_tick >= 3:
             self.mouth_tick = 0
@@ -387,6 +456,15 @@ class Game:
         self.state = "playing"
         self.message_timer = 0
         self.debug_ghost_id = 0
+        self.frame_counter = 0
+        
+        from obs import MAX_H, MAX_W
+        self.recent_nom = {
+            i: np.zeros((MAX_H, MAX_W), dtype=np.float32) for i in range(len(self.ghosts))
+        }
+
+        if RL_MODE:
+            load_rl_model()
 
     def pellets_left(self):
         return sum(1 for r in self.grid for c in r if c in (PELLET, POWER))
@@ -415,12 +493,18 @@ class Game:
                     self.player.score = score
             if event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1: 
-                    if self.state == "playing" and TOGGLE_RECT.collidepoint(event.pos):
-                        global AUTO_MODE
-                        AUTO_MODE = not AUTO_MODE
-                        self.player.m_row, self.player.m_col = 0.0, 0.0
-                        self.player.v_row, self.player.v_col = 0.0, 0.0
-                        self.player.t = 0
+                    if self.state == "playing":
+                        if TOGGLE_RECT.collidepoint(event.pos):
+                            global AUTO_MODE
+                            AUTO_MODE = not AUTO_MODE
+                            self.player.m_row, self.player.m_col = 0.0, 0.0
+                            self.player.v_row, self.player.v_col = 0.0, 0.0
+                            self.player.t = 0
+                        elif RL_TOGGLE_RECT.collidepoint(event.pos):
+                            global RL_MODE
+                            RL_MODE = not RL_MODE
+                            if RL_MODE:
+                                load_rl_model()
 
     def update(self):
         if self.state != "playing":
@@ -436,6 +520,52 @@ class Game:
                 elif self.state == "gameover":
                     self.new_game()
             return
+
+        self.frame_counter += 1
+        if RL_MODE and self.frame_counter % 5 == 0:
+            if RL_ACTOR is None:
+                load_rl_model()
+            if RL_ACTOR is not None:
+                from obs import build_spatial, build_vector, build_valid_mask, actions_to_tasks
+                import torch
+                
+                alive = [gid for gid, g in self.ghosts.items() if not g.dead]
+                cbba = {gid: g.cbba_agent.get_active_task() for gid, g in self.ghosts.items()}
+                
+                sp, ve, vm = [], [], []
+                for gid in alive:
+                    g = self.ghosts[gid]
+                    sp.append(build_spatial(g, self.recent_nom[gid]))
+                    ve.append(build_vector(g, cbba))
+                    vm.append(build_valid_mask(g))
+                    
+                if alive:
+                    t_sp = torch.tensor(np.stack(sp), device=RL_DEVICE, dtype=torch.float32)
+                    t_ve = torch.tensor(np.stack(ve), device=RL_DEVICE, dtype=torch.float32)
+                    t_vm = torch.tensor(np.stack(vm), device=RL_DEVICE, dtype=torch.bool)
+                    
+                    with torch.no_grad():
+                        idx, _, scores, _, _ = RL_ACTOR(t_sp, t_ve, t_vm, K=3)
+                    
+                    idx_np = idx.cpu().numpy()
+                    sc_np  = scores.cpu().numpy()
+                    n_cols = len(self.grid[0])
+                    
+                    for i, gid in enumerate(alive):
+                        g = self.ghosts[gid]
+                        indices = [(int(x // n_cols), int(x % n_cols)) for x in idx_np[i]]
+                        scores_map = sc_np[i]
+                        
+                        self.recent_nom[gid] *= 0.8
+                        for r, c in indices:
+                            if 0 <= r < len(self.grid) and 0 <= c < len(self.grid[0]):
+                                self.recent_nom[gid][r, c] = 1.0
+                                
+                        tasks = actions_to_tasks(g, scores_map, indices, self.frame_counter)
+                        if tasks:
+                            g.cbba_agent._last_auction = self.frame_counter
+                            g.cbba_agent._task_map = {(int(t.task_type), t.target_pos): t for t in tasks}
+                            g.cbba_agent._phase1(g, tasks)
 
         self.player.update(self.ghosts)
         powered = self.player.powered
@@ -500,6 +630,13 @@ class Game:
         text_btn = self.small.render(lbl_msg, True, WHITE)
         text_rect = text_btn.get_rect(center=TOGGLE_RECT.center)
         self.screen.blit(text_btn, text_rect)
+
+        bg_btn_rl = (200, 0, 100) if RL_MODE else GREY
+        pygame.draw.rect(self.screen, bg_btn_rl, RL_TOGGLE_RECT, border_radius=4)
+        lbl_msg_rl = "RL MODE ON" if RL_MODE else "RL MODE OFF"
+        text_btn_rl = self.small.render(lbl_msg_rl, True, WHITE)
+        text_rect_rl = text_btn_rl.get_rect(center=RL_TOGGLE_RECT.center)
+        self.screen.blit(text_btn_rl, text_rect_rl)
 
     def draw_personal_map(self):
         ghost = self.ghosts.get(self.debug_ghost_id)

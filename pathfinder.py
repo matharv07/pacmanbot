@@ -20,8 +20,10 @@ try:
 except Exception:
     scipy_dijkstra = None
 
-# cache: id(grid) -> (csr_matrix, open_cells_list, cell_to_idx)
+# cache: generation_id -> (csr_matrix, open_cells_list, cell_to_idx)
 _SCIPY_GRAPH_CACHE = {}
+_SCIPY_CACHE_GEN = 0   # monotonic counter
+_SCIPY_GRID_GEN = {}   # id(grid) -> generation_id (for lookup)
 
 def build_scipy_graph(grid: list):
     if not _SCIPY_AVAILABLE:
@@ -54,7 +56,15 @@ def build_scipy_graph(grid: list):
                 data.append(cost)
     
     graph = csr_matrix((data, (row_ind, col_ind)), shape=(n, n))
-    _SCIPY_GRAPH_CACHE[id(grid)] = (graph, open_cells, cell_to_idx)
+    global _SCIPY_CACHE_GEN
+    _SCIPY_CACHE_GEN += 1
+    gen = _SCIPY_CACHE_GEN
+    _SCIPY_GRAPH_CACHE[gen] = (graph, open_cells, cell_to_idx)
+    _SCIPY_GRID_GEN[id(grid)] = gen
+    # Clean old entries (keep only the latest 4 to handle multiple envs)
+    if len(_SCIPY_GRAPH_CACHE) > 4:
+        oldest = min(_SCIPY_GRAPH_CACHE.keys())
+        _SCIPY_GRAPH_CACHE.pop(oldest, None)
 
 #cell costs for path planning - wall taken to be impassable
 _COST = {EMPTY: 1.0, PELLET: 1.0, POWER: 0.5, UNKNOWN: 3.0, WALL: math.inf}   #unknown territory taken to be passable but 3x more costly than known cells
@@ -119,7 +129,8 @@ def astar(grid: list, start: tuple, goal: tuple) -> list:
 def dijkstra_multi(grid: list, start: tuple, targets: list) -> dict:
     # Try SciPy accelerated path when a precomputed graph for this grid exists
     if _SCIPY_AVAILABLE:
-        cache = _SCIPY_GRAPH_CACHE.get(id(grid))
+        gen = _SCIPY_GRID_GEN.get(id(grid))
+        cache = _SCIPY_GRAPH_CACHE.get(gen) if gen is not None else None
         if cache is not None:
             graph, open_cells, cell_to_idx = cache
             # map start and targets to indices

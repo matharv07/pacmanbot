@@ -56,15 +56,13 @@ class Ghost:
         self.prev_row, self.prev_col = pos
         self.color = color
         self.dead = False
-        self.respawn = pos
-        self.dead_timer = 0
         self.move_counter = 0
         self.move_every = 2
         self.last_dir = random.choice(DIRS)
         rows = len(grid)
         cols = len(grid[0])
-        self.personal_map = [[UNKNOWN] * cols for _ in range(rows)]
-        self.last_seen = [[-1] * cols for _ in range(rows)]
+        self.personal_map = np.full((rows, cols), UNKNOWN, dtype=np.int8)
+        self.last_seen = np.full((rows, cols), -1, dtype=np.int32)
         self.frame = 0
         self.message_queue = []
         self.seen_message_ids = {}
@@ -84,18 +82,16 @@ class Ghost:
         self._proximity_channel_cache = None
         self._proximity_channel_frame = -1
         self._proximity_channel_target = None
+        self._last_synced_map: dict[int, np.ndarray] = {}   # per-peer snapshot for delta sync
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False):
         self.frame += 1
         newly_discovered = 0
+        stale_refreshed = 0.0
         if self.dead:
-            self.dead_timer -= 1
-            if self.dead_timer <= 0:
-                self.dead = False
-                self.row, self.col = self.respawn
-            return newly_discovered
+            return newly_discovered, stale_refreshed
         self._check_liveness(all_ghosts)
-        diffs, newly_discovered = self._update_personal_map(all_ghosts, player_pos, powered)
+        diffs, newly_discovered, stale_refreshed = self._update_personal_map(all_ghosts, player_pos, powered)
         #piggyback heartbeat every N=5 frames
         if self.frame % HEARTBEAT_EVERY == 0:
             diffs.append(("heartbeat", self.gid, self.row, self.col, self.frame))
@@ -109,7 +105,7 @@ class Ghost:
         if skip_movement:
             self.pos_history.append((self.row, self.col))
             self._check_oscillation()
-            return newly_discovered
+            return newly_discovered, stale_refreshed
         #CBBA: get active task and move toward target
         active_task = self.cbba_agent.step(self, self.frame)
         moved = False
@@ -148,7 +144,7 @@ class Ghost:
                     self.grid[self.row][self.col] = PELLET
         self.pos_history.append((self.row, self.col))
         self._check_oscillation()
-        return newly_discovered
+        return newly_discovered, stale_refreshed
 
     def _check_oscillation(self):
         if len(self.pos_history) < OSCILLATION_WINDOW:
@@ -275,13 +271,19 @@ class Ghost:
         visible, agent_diffs, pacman_diff = self._get_visible_cells(all_ghosts, player_pos, powered)
         diffs = []
         newly_discovered = 0
+        stale_refreshed = 0.0
         for (r, c), val in visible.items():
-            old = self.personal_map[r][c]
-            self.last_seen[r][c] = self.frame
+            old = self.personal_map[r, c]
+            last = self.last_seen[r, c]
+            if last != -1:
+                staleness = min(self.frame - last, 200) / 200.0
+                if staleness > 0.25: # only reward if >= 50 frames stale
+                    stale_refreshed += staleness
+            self.last_seen[r, c] = self.frame
             if old != val:
                 if old == UNKNOWN:
                     newly_discovered += 1
-                self.personal_map[r][c] = val
+                self.personal_map[r, c] = val
                 if val == WALL:
                     self.belief_map.update_local_map_cell((r, c), WALL)
                 diffs.append(("cell", r, c, val))
@@ -303,7 +305,7 @@ class Ghost:
         self.belief_map.diffuse((self.row, self.col))
         pac_pos = (pr, pc) if pacman_in_los else None  #preserve Pacman's cell during clear
         self.belief_map.observe_clear(set(visible.keys()), pac_pos)
-        return diffs, newly_discovered
+        return diffs, newly_discovered, stale_refreshed
 
     def _broadcast(self, diffs, all_ghosts, msg_id=None, hop=0):
         if not diffs:
@@ -332,14 +334,18 @@ class Ghost:
                         ghost._send_full_sync(self)
 
     def _send_full_sync(self, target_ghost):
-        sync_diffs = []
-        rows = len(self.personal_map)
-        cols = len(self.personal_map[0])
-        for r in range(rows):
-            for c in range(cols):
-                val = self.personal_map[r][c]
-                if val != UNKNOWN:
-                    sync_diffs.append(("cell", r, c, val))
+        # Delta-compressed sync: only send cells changed since last sync to this peer
+        last = self._last_synced_map.get(target_ghost.gid)
+        if last is not None:
+            changed = (self.personal_map != last) & (self.personal_map != UNKNOWN)
+            rs, cs = np.nonzero(changed)
+        else:
+            # First sync: send all known cells
+            mask = self.personal_map != UNKNOWN
+            rs, cs = np.nonzero(mask)
+        sync_diffs = [("cell", int(r), int(c), int(self.personal_map[r, c])) for r, c in zip(rs, cs)]
+        # Snapshot current state for this peer
+        self._last_synced_map[target_ghost.gid] = self.personal_map.copy()
         #iterate through agent positions and liveness
         for gid, pos in self.known_agents.items():
             if pos == "UNKNOWN":
@@ -370,11 +376,11 @@ class Ghost:
                 dtype = diff[0]
                 if dtype == "cell":
                     _, r, c, val = diff
-                    old = self.personal_map[r][c]
+                    old = self.personal_map[r, c]
                     if old != val:
-                        if old != UNKNOWN and self.last_seen[r][c] >= self.frame - MEMORY_FRAMES:
+                        if old != UNKNOWN and self.last_seen[r, c] >= self.frame - MEMORY_FRAMES:
                             continue    #reject stale cell update if we have seen it recently
-                        self.personal_map[r][c] = val
+                        self.personal_map[r, c] = val
                         if val == WALL:
                             self.belief_map.update_local_map_cell((r, c), WALL)
                         relay_diffs.append(diff)
@@ -463,7 +469,6 @@ class Ghost:
 
     def kill(self):
         self.dead = True
-        self.dead_timer = 30
 
     def draw(self, surf):
         if self.dead:

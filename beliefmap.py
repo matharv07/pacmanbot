@@ -38,7 +38,7 @@ class BeliefMap:
 
     We include a uniform prior (PRIOR_UNIFORM_WT) so that cells with no ghost evidence are not treated as perfectly safe.  After summing, we normalise the
     danger map to [0,1] and define:
-        safety(c) = 1 − danger_norm(c)
+        safety(c) = 1 - danger_norm(c)
 
     Cells are then ranked descending by safety(c) - highest safety first.
      
@@ -71,6 +71,7 @@ class BeliefMap:
         self._last_ghost_snapshot: dict = {}     #store last known ghost positions for bayesian modelling
         self._ghost_last_seen: dict[int, int] = {}
         self._topology_dirty = False
+        self._dirty_cells: set = set()  # accumulate cell changes, rebuild once
         #throttle tracking - skips recompute if nothing changed
         self._last_safety_frame: int = -999
         self._last_powered: bool = False
@@ -82,12 +83,13 @@ class BeliefMap:
         r, c = pacman_pos
         if self.grid[r][c] == WALL:
             return
-        total = sum(self._b[rr][cc] for rr, cc in self._open_cells) or 1.0
-        spike    = total * LOS_CERTAINTY
-        residual = total * (1.0 - LOS_CERTAINTY)
-        for rr, cc in self._open_cells:
-            self._b[rr][cc] *= residual / total
-        self._b[r][c] += spike
+        total = float(self._b_flat.sum()) or 1.0
+        # Scale all cells down, then spike the observed cell
+        self._b_flat *= (1.0 - LOS_CERTAINTY)
+        idx = int(self._open_idx[r, c])
+        if idx >= 0:
+            self._b_flat[idx] += total * LOS_CERTAINTY
+        self._sync_flat_to_b()
         self.last_known_pos        = pacman_pos
         self.last_known_dir        = pacman_dir
         self.frames_since_sighting = 0
@@ -122,17 +124,31 @@ class BeliefMap:
 
     def observe_clear(self, visible_cells: set, pacman_pos=None):
         self._ensure_initialised()
-        changed = False
-        for (r, c) in visible_cells:
-            if (r, c) == pacman_pos:
-                continue
-            if self._b[r][c] > 1e-9:
-                self._b[r][c] = 0.0
-                changed = True
-        if changed:
-            self._normalise()
+        if not visible_cells or self._open_arr.size == 0:
+            return
+        vis_arr = np.array(list(visible_cells), dtype=np.int32)  # (K, 2)
+        # Remove pacman's cell from the clear set
+        if pacman_pos is not None:
+            keep = ~((vis_arr[:, 0] == pacman_pos[0]) & (vis_arr[:, 1] == pacman_pos[1]))
+            vis_arr = vis_arr[keep]
+        if vis_arr.size == 0:
+            return
+        # Look up flat indices for each visible cell
+        idxs = self._open_idx[vis_arr[:, 0], vis_arr[:, 1]]
+        valid = idxs >= 0
+        idxs = idxs[valid]
+        if idxs.size == 0 or not self._b_flat[idxs].any():
+            return
+        self._b_flat[idxs] = 0.0
+        self._sync_flat_to_b()
+        self._normalise()
 
     def diffuse(self, ghost_pos: tuple):
+        # Flush any accumulated topology changes ONCE per frame
+        if self._dirty_cells:
+            self._rebuild_topology()
+            self._dirty_cells.clear()
+            self._topology_dirty = False
         self._ensure_initialised()
         self.frames_since_sighting = min(self.frames_since_sighting + 1, 9999)
         self._uniform_diffuse()
@@ -144,35 +160,31 @@ class BeliefMap:
         self._ensure_initialised()
         sender_fss = payload.get("fss", 9999)
         cells: dict = payload.get("cells", {})
-        if not cells:
+        if not cells or self._open_arr.size == 0:
             return
         confidence = max(MIN_CONFIDENCE, math.exp(-sender_fss / TAU_RECENCY))
         n = len(self._open_arr)
-        if n == 0:
-            return
         s_flat = np.full(n, COMPRESS_THRESHOLD / 2.0, dtype=np.float32)
-        s_total = 0.0
-        for key, val in cells.items():
-            r, c = key if isinstance(key, tuple) else (key[0], key[1])
-            if 0 <= r < self.rows and 0 <= c < self.cols:
-                idx = int(self._open_idx[r, c])
-                if idx >= 0:
-                    v = float(val)
-                    s_flat[idx] = v
-                    s_total += v
+
+        # Vectorised payload loading — no Python loop
+        keys   = np.array(list(cells.keys()),   dtype=np.int32)   # (K, 2)
+        vals   = np.array(list(cells.values()), dtype=np.float32) # (K,)
+        idxs   = self._open_idx[keys[:, 0], keys[:, 1]]           # (K,) flat indices
+        valid  = idxs >= 0
+        s_flat[idxs[valid]] = vals[valid]
+
+        s_total = float(s_flat.sum())
         if s_total < 1e-9:
             return
-        s_flat /= s_flat.sum()
-        prior_flat = self._b_flat.astype(np.float32)
-        log_prior = np.log(np.maximum(prior_flat, 1e-12))
-        log_sender = np.log(np.maximum(s_flat, 1e-12))
-        new_flat = np.exp((1.0 - confidence) * log_prior + confidence * log_sender)
-        self._b_flat = new_flat
+        s_flat /= s_total
+        log_prior  = np.log(np.maximum(self._b_flat, 1e-12))
+        log_sender = np.log(np.maximum(s_flat,       1e-12))
+        self._b_flat = np.exp((1.0 - confidence) * log_prior + confidence * log_sender)
         self._sync_flat_to_b()
         lkp = payload.get("lkp")
         if lkp is not None and sender_fss < self.frames_since_sighting:
-            self.last_known_pos = tuple(lkp)
-            self.last_known_dir = tuple(payload.get("lkd", (0, 0)))
+            self.last_known_pos        = tuple(lkp)
+            self.last_known_dir        = tuple(payload.get("lkd", (0, 0)))
             self.frames_since_sighting = sender_fss
         self._normalise()
 
@@ -180,19 +192,29 @@ class BeliefMap:
         self._ensure_initialised()
         if not self._payload_dirty and self._payload_cache is not None:
             return self._payload_cache
-        cells = {}
-        for r, c in self._open_cells:
-            v = self._b[r][c]
-            if v >= COMPRESS_THRESHOLD:
-                cells[(r, c)] = round(v, 5)
+        # Vectorized: extract indices and values above threshold in one shot
+        above = self._b_flat >= COMPRESS_THRESHOLD
+        if not above.any():
+            cells = {}
+        else:
+            idxs = np.nonzero(above)[0]
+            vals = np.round(self._b_flat[idxs], 5)
+            cells = {
+                self._open_cells[int(i)]: float(v)
+                for i, v in zip(idxs, vals)
+            }
         self._payload_cache = {"cells": cells, "fss": self.frames_since_sighting, "lkp": self.last_known_pos, "lkd": self.last_known_dir}
         self._payload_dirty = False
         return self._payload_cache
     
     def top_cells(self, n: int = 5) -> list[tuple]:
         self._ensure_initialised()
-        ranked = sorted(self._open_cells, key=lambda rc: self._b[rc[0]][rc[1]], reverse=True)
-        return ranked[:n]
+        if len(self._b_flat) == 0:
+            return []
+        k = min(n, len(self._b_flat))
+        top_idx = np.argpartition(self._b_flat, -k)[-k:]
+        top_idx = top_idx[np.argsort(self._b_flat[top_idx])[::-1]]
+        return [self._open_cells[i] for i in top_idx]
 
     def probability_at(self, pos: tuple) -> float:
         self._ensure_initialised()
@@ -230,63 +252,50 @@ class BeliefMap:
             known_positions.append((gr, gc, weight))
         sigma = HUNT_SIGMA if powered else DANGER_SIGMA
         cutoff_steps = int(3.0 * sigma)
+        scores = np.zeros((self.rows, self.cols), dtype=np.float32)
+        proximal = np.zeros((self.rows, self.cols), dtype=np.float32)
+        
+        rs, cs = np.indices((self.rows, self.cols))
+        
+        for gr, gc, weight in known_positions:
+            dist = np.abs(rs - gr) + np.abs(cs - gc)
+            mask = dist <= cutoff_steps
+            
+            contrib = np.zeros_like(scores)
+            contrib[mask] = weight * np.exp(-(dist[mask] ** 2) / (2.0 * sigma ** 2))
+            
+            scores += contrib
+            if powered:
+                proximal = np.maximum(proximal, contrib)
+                
         if not powered:
             prior = PRIOR_UNIFORM_WT / n_open
             flat_unknown = n_unknown * (UNSEEN_GHOST_PRIOR / n_open)
-            scores: dict[tuple, float] = {(r, c): prior + flat_unknown for r, c in self._open_cells}
-        else:
-            scores = {(r, c): 0.0 for r, c in self._open_cells}
-            if not known_positions:
-                for r, c in self._open_cells:
-                    self._safety[r][c] = 1.0 / n_open
-                return
-        DIRS4 = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-        proximal: dict[tuple, float] = {(r, c): 0.0 for r, c in self._open_cells} if powered else {}
-        for gr, gc, weight in known_positions:
-            visited: set = set()
-            queue: list = [(gr, gc, 0)] #track actual path steps instead of coordinate distance
-            visited.add((gr, gc))
-            while queue:
-                next_queue = []
-                for r, c, steps in queue:
-                    if steps > cutoff_steps:
-                        continue
-                    contrib = weight * math.exp(-(steps ** 2) / (2.0 * sigma ** 2))
-                    key = (r, c)
-                    if key in scores:
-                        scores[key] += contrib
-                        if powered and contrib > proximal[key]:
-                            proximal[key] = contrib        
-                    for dr, dc in DIRS4:
-                        nr, nc = r + dr, c + dc
-                        if (nr, nc) in visited:
-                            continue
-                        if not (0 <= nr < self.rows and 0 <= nc < self.cols):
-                            continue
-                        if self.grid[nr][nc] == WALL:
-                            visited.add((nr, nc))
-                            continue
-                        visited.add((nr, nc))
-                        next_queue.append((nr, nc, steps + 1))
-                queue = next_queue
-        if not powered:
-            max_score = max(scores.values()) if scores else 1.0
+            scores += prior + flat_unknown
+            
+            max_score = np.max(scores)
             if max_score < MIN_SAFETY:
                 max_score = MIN_SAFETY
-            for r, c in self._open_cells:
-                self._safety[r][c] = 1.0 - (scores[(r, c)] / max_score)
+                
+            self._safety = 1.0 - (scores / max_score)
+            self._safety[self.grid == WALL] = 0.0
         else:
-            max_crowd = max(scores.values()) or MIN_SAFETY
-            max_prox = max(proximal.values()) or MIN_SAFETY
-            for r, c in self._open_cells:
-                c_norm = scores[(r, c)] / max_crowd
-                p_norm = proximal[(r, c)] / max_prox
-                if hunt_mode == "proximal":
-                    self._safety[r][c] = p_norm
-                elif hunt_mode == "crowd":
-                    self._safety[r][c] = c_norm
-                else:
-                    self._safety[r][c] = ((1.0 - HUNT_CROWD_WEIGHT) * p_norm + HUNT_CROWD_WEIGHT * c_norm)
+            max_crowd = np.max(scores)
+            if max_crowd < MIN_SAFETY: max_crowd = MIN_SAFETY
+                
+            max_prox = np.max(proximal)
+            if max_prox < MIN_SAFETY: max_prox = MIN_SAFETY
+            
+            c_norm = scores / max_crowd
+            p_norm = proximal / max_prox
+            
+            if hunt_mode == "proximal":
+                self._safety = p_norm
+            elif hunt_mode == "crowd":
+                self._safety = c_norm
+            else:
+                self._safety = ((1.0 - HUNT_CROWD_WEIGHT) * p_norm + HUNT_CROWD_WEIGHT * c_norm)
+            self._safety[self.grid == WALL] = 0.0
 
     def safety_at(self, pos: tuple) -> float:
         return self._safety[pos[0]][pos[1]]
@@ -341,8 +350,10 @@ class BeliefMap:
                     for (nr, nc), w in weights.items():
                         self._b[nr][nc] += mass * (w / total_w)
             self._remove_open_cell(pos)
+            self._dirty_cells.add(pos)
         elif not was_open and value != WALL:
             self._add_open_cell(pos)
+            self._dirty_cells.add(pos)
 
     def _remove_open_cell(self, pos: tuple):
         r, c = pos
@@ -355,7 +366,7 @@ class BeliefMap:
             nbr_key = (nr, nc)
             if nbr_key in self._neighbours and pos in self._neighbours[nbr_key]:
                 self._neighbours[nbr_key].remove(pos)
-        self._topology_dirty = True
+        # topology_dirty is now handled via _dirty_cells set
 
     def _add_open_cell(self, pos: tuple):
         r, c = pos
@@ -371,7 +382,7 @@ class BeliefMap:
         for nbr in neighbours:
             if nbr in self._neighbours and pos not in self._neighbours[nbr]:
                 self._neighbours[nbr].append(pos)
-        self._topology_dirty = True
+        # topology_dirty is now handled via _dirty_cells set
 
     def _compute_topology(self):
         DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
@@ -415,9 +426,10 @@ class BeliefMap:
             self._b[self._open_arr[:, 0], self._open_arr[:, 1]] = self._b_flat
 
     def _ensure_initialised(self):
-        if self._topology_dirty:
+        if self._topology_dirty or self._dirty_cells:
             self._rebuild_topology()
             self._topology_dirty = False
+            self._dirty_cells.clear()
             
         if self._initialised:
             return
@@ -435,16 +447,14 @@ class BeliefMap:
         self._initialised = True
 
     def _zero_walls(self):
-        for r in range(self.rows):
-            for c in range(self.cols):
-                if self.grid[r][c] == WALL:
-                    self._b[r][c] = 0.0
+        self._b[self.grid == WALL] = 0.0
 
     def _normalise(self):
         self._ensure_initialised()
         if len(self._open_cells) == 0:
             return
-        self._zero_walls()
+        # _zero_walls removed: walls are already excluded by the topology
+        # system (_open_cells / _b_flat never include wall indices)
         self._sync_b_to_flat()
         total = float(self._b_flat.sum())
         if total < 1e-12:

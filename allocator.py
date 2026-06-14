@@ -71,20 +71,17 @@ def _score_hunt(ghost, dists: dict) -> Optional[Task]:
 
 def _score_convert(ghost, dists: dict) -> List[Task]:
     tasks: list[Task] = []
-    rows = len(ghost.personal_map)
-    cols = len(ghost.personal_map[0])
-    for r in range(rows):
-        for c in range(cols):
-            if ghost.personal_map[r][c] == POWER:
-                pos = (r, c)
-                info = dists.get(pos)
-                if info is None:
-                    continue
-                dist, _ = info
-                if dist == math.inf:
-                    continue
-                score = _dist_score(dist, CONVERT_SCALE)
-                tasks.append(Task(task_type=TaskType.CONVERT, target_pos=pos, score=score))
+    power_cells = np.argwhere(ghost.personal_map == POWER)
+    for pos_arr in power_cells:
+        pos = (int(pos_arr[0]), int(pos_arr[1]))
+        info = dists.get(pos)
+        if info is None:
+            continue
+        dist, _ = info
+        if dist == math.inf:
+            continue
+        score = _dist_score(dist, CONVERT_SCALE)
+        tasks.append(Task(task_type=TaskType.CONVERT, target_pos=pos, score=score))
     return tasks
 
 def _find_flee_pos(ghost, pacman_pos: tuple) -> Optional[tuple]:
@@ -125,24 +122,45 @@ def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
     return Task(task_type=TaskType.EVADE_TRACK, target_pos=_find_flee_pos(ghost, target) or target, score=score, created_frame=frame)
 
 def _score_explore(ghost, frame: int) -> List[Task]:    #pick top-K locations with unknown or older info
-    rows = len(ghost.personal_map)
-    cols = len(ghost.personal_map[0])
-    scored: list = []
-    for r in range(1, rows - 1):
-        for c in range(1, cols - 1):
-            if ghost.personal_map[r][c] == WALL:
-                continue
-            if ghost.personal_map[r][c] == UNKNOWN:
-                age = frame + UNKNOWN_BONUS
-            else:
-                last = ghost.last_seen[r][c]
-                age = frame - last if last >= 0 else frame + 1
-            scored.append((age, (r, c)))
-    if not scored:
+    p = ghost.personal_map
+    rows, cols = p.shape
+    # Vectorised age computation
+    # Interior cells only (skip border walls)
+    interior = p[1:rows-1, 1:cols-1]
+    ls = ghost.last_seen[1:rows-1, 1:cols-1]
+    
+    wall_mask = (interior == WALL)
+    unknown_mask = (interior == UNKNOWN)
+    
+    # Age: unknown cells get frame + UNKNOWN_BONUS, known non-wall cells get frame - last_seen
+    ages = np.zeros_like(interior, dtype=np.float64)
+    ages[unknown_mask] = frame + UNKNOWN_BONUS
+    known_mask = (~wall_mask) & (~unknown_mask)
+    ages[known_mask] = np.where(
+        ls[known_mask] >= 0,
+        frame - ls[known_mask],
+        frame + 1
+    ).astype(np.float64)
+    ages[wall_mask] = -1  # exclude walls
+    
+    # Flatten and find top-K
+    flat_ages = ages.ravel()
+    n_valid = np.sum(flat_ages >= 0)
+    if n_valid == 0:
         return []
-    top = heapq.nlargest(EXPLORE_TOP_K, scored, key=lambda x: x[0])
+    k = min(EXPLORE_TOP_K, int(n_valid))
+    top_flat = np.argpartition(flat_ages, -k)[-k:]
+    top_flat = top_flat[np.argsort(flat_ages[top_flat])[::-1]]
+    
     tasks: list = []
-    for age, pos in top:
+    interior_cols = cols - 2
+    for idx in top_flat:
+        age = flat_ages[idx]
+        if age < 0:
+            continue
+        r = int(idx // interior_cols) + 1  # offset back to full grid coords
+        c = int(idx % interior_cols) + 1
+        pos = (r, c)
         score = 1.0 - math.exp(-age / RECENCY_SCALE)
         score *= _dist_score(abs(pos[0] - ghost.row) + abs(pos[1] - ghost.col), EXPLORE_SCALE)
         tasks.append(Task(task_type=TaskType.EXPLORE, target_pos=pos, score=score))
@@ -150,16 +168,15 @@ def _score_explore(ghost, frame: int) -> List[Task]:    #pick top-K locations wi
 
 def generate_tasks(ghost, frame: int) -> List[Task]:
     start = (ghost.row, ghost.col)
-    rows  = len(ghost.personal_map)
-    cols  = len(ghost.personal_map[0])
+    rows, cols = ghost.personal_map.shape
     targets: set = set()
     pac_pos = ghost.known_pacman or ghost.last_lost_pacman
     if pac_pos is not None:
         targets.add(pac_pos)
-    for r in range(rows):
-        for c in range(cols):
-            if ghost.personal_map[r][c] == POWER:
-                targets.add((r, c))
+    
+    power_cells = np.argwhere(ghost.personal_map == POWER)
+    for r, c in power_cells:
+        targets.add((int(r), int(c)))
     corners = [(1, 1), (1, cols - 2), (rows - 2, 1), (rows - 2, cols - 2)]
     for cn in corners:
         targets.add(cn)
