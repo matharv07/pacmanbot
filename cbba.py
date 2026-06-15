@@ -4,7 +4,7 @@ from typing import Optional
 import ast
 from allocator import TaskType, Task, generate_tasks
 
-AUCTION_EVERY   = 5      #full auction every 0.5s
+AUCTION_EVERY   = 5      #full auction every 0.5s 
 LT              = 3
 LAMBDA          = 0.99   #time decay factor
 

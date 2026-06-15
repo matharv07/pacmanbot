@@ -102,24 +102,30 @@ def _find_flee_pos(ghost, pacman_pos: tuple) -> Optional[tuple]:
 def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
     if not ghost.pacman_powered:
         return None
+        
     target = ghost.known_pacman
     if target is None:
         return None
+        
     info = dists.get(target)
-    if info is None:
+    if info is None or info[0] == math.inf:
         return None
+        
     dist, _ = info
-    if dist == math.inf:
-        return None
+    
     if dist < SAFE_RADIUS:
-        #inside danger zone - fleeing to farthest known cell
+        # Inside danger zone - Flee to the farthest cell!
         flee_pos = _find_flee_pos(ghost, target)
         if flee_pos is None:
             return None
-        return Task(task_type=TaskType.EVADE_TRACK,target_pos=flee_pos, score=2.0, created_frame=frame)
-    #outside danger zone - score by how far we are (farther => higher score)
-    score = 1.0 - _dist_score(dist, SAFE_SCALE)
-    return Task(task_type=TaskType.EVADE_TRACK, target_pos=_find_flee_pos(ghost, target) or target, score=score, created_frame=frame)
+        # High score to prioritize immediate survival
+        return Task(task_type=TaskType.EVADE_TRACK, target_pos=flee_pos, score=2.0, created_frame=frame)
+        
+    else:
+        # Outside danger zone - Shadow Pacman!
+        # Target Pacman directly, but with a lower score so it doesn't override critical exploration or fleeing peers
+        score = 0.5 
+        return Task(task_type=TaskType.EVADE_TRACK, target_pos=target, score=score, created_frame=frame)
 
 def _score_explore(ghost, frame: int) -> List[Task]:    #pick top-K locations with unknown or older info
     p = ghost.personal_map
@@ -185,14 +191,19 @@ def generate_tasks(ghost, frame: int) -> List[Task]:
         targets.add(et.target_pos)
     dists = dijkstra_multi(ghost.grid, start, list(targets))
     tasks: list[Task] = []
-    hunt = _score_hunt(ghost, dists)
-    if hunt is not None:
-        tasks.append(hunt)
-    tasks.extend(_score_convert(ghost, dists))
-    evade_track = _score_evade_track(ghost, dists, frame)
-    if evade_track is not None:
-        tasks.append(evade_track)
-    tasks.extend(explore_tasks)
+    if getattr(ghost, 'pacman_powered', False):
+        # Strict logic gate: Only evade and explore when powered
+        evade_track = _score_evade_track(ghost, dists, frame)
+        if evade_track is not None:
+            tasks.append(evade_track)
+        tasks.extend(explore_tasks)
+    else:
+        # Normal pursuit: Hunt, Convert, and Explore
+        hunt = _score_hunt(ghost, dists)
+        if hunt is not None:
+            tasks.append(hunt)
+        tasks.extend(_score_convert(ghost, dists))
+        tasks.extend(explore_tasks)
     for t in tasks:
         if t.created_frame == 0:
             t.created_frame = frame

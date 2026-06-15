@@ -36,8 +36,8 @@ from curriculum import CurriculumScheduler, STAGES
 
 # ── hyperparameters ──────────────────────────────────────────────────
 NUM_ENVS        = 8     # 8 is the perfect sweet spot for a 6-core/12-thread CPU
-ROLLOUT_STEPS   = 64
-MINI_BATCH      = 512  # 512 prevents the 6GB VRAM spike and OOM
+ROLLOUT_STEPS   = 256
+MINI_BATCH      = 1024  # 512 prevents the 6GB VRAM spike and OOM
 PPO_EPOCHS      = 12    # Kept at 12 to maximize learning per rollout
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
@@ -275,7 +275,7 @@ def train():
             stage = curriculum.stage
             vec_env.set_curriculum(stage.rows, stage.cols,
                                    stage.n_ghosts, stage.n_power,
-                                   static_pacman=(start_update <= 500))
+                                   static_pacman=(start_update <= 50))
             print(f"Resumed at update {start_update}, "
                   f"stage {curriculum.stage_idx} "
                   f"({stage.rows}×{stage.cols}, {stage.n_ghosts}g)")
@@ -288,7 +288,7 @@ def train():
     current_returns = [0.0] * NUM_ENVS
     
     for update in range(start_update, 50_001):
-        if update == 501:
+        if update == 51:
             print("Transitioning to moving Pacman (static_pacman = False)...")
             vec_env.set_curriculum(stage.rows, stage.cols,
                                    stage.n_ghosts, stage.n_power,
@@ -297,6 +297,7 @@ def train():
         # ── collect rollout ──────────────────────────────────────────
         # Per-env, per-step storage  (lists of length ROLLOUT_STEPS)
         buf_spatial   = [[] for _ in range(NUM_ENVS)]
+        buf_gsp       = [[] for _ in range(NUM_ENVS)]
         buf_vector    = [[] for _ in range(NUM_ENVS)]
         buf_mask      = [[] for _ in range(NUM_ENVS)]
         buf_htarget   = [[] for _ in range(NUM_ENVS)]
@@ -314,14 +315,14 @@ def train():
 
             # ── BUG-5 fix: batch forward pass across all envs ────────
             # Collect all alive ghosts across all environments
-            batch_sp, batch_ve, batch_vm = [], [], []
+            batch_sp, batch_ve, batch_vm, batch_gsp = [], [], [], []
             batch_env_idx = []   # which env each ghost belongs to
             batch_gids = []      # ghost id within its env
             env_n_ghosts = []    # how many ghosts per env (for splitting)
 
             for e in range(NUM_ENVS):
                 obs = vec_env.current_obs[e]
-                gids, sp, ve, vm, ht, grid_shape = obs
+                gids, sp, ve, vm, ht, global_sp, grid_shape = obs
                 n_g = len(gids)
                 env_n_ghosts.append(n_g)
 
@@ -329,6 +330,7 @@ def train():
                     buf_values[e].append({})
                     buf_gids[e].append([])
                     buf_spatial[e].append(np.empty((0, SPATIAL_CH, MAX_H, MAX_W), dtype=np.float32))
+                    buf_gsp[e].append(np.empty((0, 5, MAX_H, MAX_W), dtype=np.float32))
                     buf_vector[e].append(np.empty((0, 101), dtype=np.float32))
                     buf_mask[e].append(np.empty((0, MAX_H, MAX_W), dtype=bool))
                     buf_htarget[e].append(np.empty((0, MAX_H, MAX_W), dtype=np.float32))
@@ -340,8 +342,11 @@ def train():
                 sp_padded = _pad_spatial(sp, target_h=stage.rows, target_w=stage.cols)
                 vm_padded = _pad_spatial(vm, target_h=stage.rows, target_w=stage.cols)
                 ht_padded = _pad_spatial(ht, target_h=stage.rows, target_w=stage.cols)
+                gsp_padded = _pad_spatial(global_sp, target_h=stage.rows, target_w=stage.cols)
+                gsp_padded_batch = np.repeat(gsp_padded[np.newaxis, ...], n_g, axis=0)
 
                 batch_sp.append(sp_padded)
+                batch_gsp.append(gsp_padded_batch)
                 batch_ve.append(ve)
                 batch_vm.append(vm_padded.astype(bool))
                 batch_env_idx.extend([e] * n_g)
@@ -349,6 +354,7 @@ def train():
 
                 # Store padded obs for PPO buffer
                 buf_spatial[e].append(sp_padded)
+                buf_gsp[e].append(gsp_padded_batch)
                 buf_vector[e].append(ve)
                 buf_mask[e].append(vm_padded.astype(bool))
                 buf_htarget[e].append(ht_padded)
@@ -357,17 +363,19 @@ def train():
             # Run a single batched forward pass for ALL ghosts across ALL envs
             if batch_sp:
                 all_sp = np.concatenate(batch_sp, axis=0)
+                all_gsp = np.concatenate(batch_gsp, axis=0)
                 all_ve = np.concatenate(batch_ve, axis=0)
                 all_vm = np.concatenate(batch_vm, axis=0)
 
                 t_sp = torch.tensor(all_sp, device=DEVICE, dtype=torch.float32)
+                t_gsp = torch.tensor(all_gsp, device=DEVICE, dtype=torch.float32)
                 t_ve = torch.tensor(all_ve, device=DEVICE, dtype=torch.float32)
                 t_vm = torch.tensor(all_vm, device=DEVICE, dtype=torch.bool)
 
                 with torch.no_grad():
                     idx, lp, scores, pool, vec = actor(
                         t_sp, t_ve, t_vm, K=K_NOMINATIONS)
-                    val = _critic_value(critic, t_sp, t_ve, len(batch_gids))
+                    val = _critic_value(critic, t_gsp, t_ve, len(batch_gids))
 
                 idx_np = idx.cpu().numpy()
                 sc_np  = scores.cpu().numpy()
@@ -423,19 +431,22 @@ def train():
         total_steps += ROLLOUT_STEPS * NUM_ENVS
 
         # ── batched bootstrap values across ALL envs ──────────────────
-        boot_sp, boot_ve, boot_vm = [], [], []
+        boot_sp, boot_gsp, boot_ve, boot_vm = [], [], [], []
         boot_env_idx, boot_gids_list, boot_n_ghosts = [], [], []
         for e in range(NUM_ENVS):
             if len(buf_rewards[e]) == 0:
                 boot_n_ghosts.append(0)
                 continue
             obs = vec_env.current_obs[e]
-            gids, sp, ve, vm, _, grid_shape = obs
+            gids, sp, ve, vm, ht, global_sp, grid_shape = obs
             boot_n_ghosts.append(len(gids))
             if len(gids) > 0:
                 sp_padded = _pad_spatial(sp, target_h=stage.rows, target_w=stage.cols)
                 vm_padded = _pad_spatial(vm, target_h=stage.rows, target_w=stage.cols).astype(bool)
+                gsp_padded = _pad_spatial(global_sp, target_h=stage.rows, target_w=stage.cols)
+                gsp_padded_batch = np.repeat(gsp_padded[np.newaxis, ...], len(gids), axis=0)
                 boot_sp.append(sp_padded)
+                boot_gsp.append(gsp_padded_batch)
                 boot_ve.append(ve)
                 boot_vm.append(vm_padded)
                 boot_gids_list.append(gids)
@@ -444,14 +455,16 @@ def train():
         all_last_v = [{}] * NUM_ENVS
         if boot_sp:
             cat_sp = np.concatenate(boot_sp, axis=0)
+            cat_gsp = np.concatenate(boot_gsp, axis=0)
             cat_ve = np.concatenate(boot_ve, axis=0)
             cat_vm = np.concatenate(boot_vm, axis=0)
             t_sp = torch.tensor(cat_sp, device=DEVICE, dtype=torch.float32)
+            t_gsp = torch.tensor(cat_gsp, device=DEVICE, dtype=torch.float32)
             t_ve = torch.tensor(cat_ve, device=DEVICE, dtype=torch.float32)
             t_vm = torch.tensor(cat_vm, device=DEVICE, dtype=torch.bool)
             with torch.no_grad():
                 _, _, _, pool, vec = actor(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
-                val = _critic_value(critic, t_sp, t_ve, len(cat_sp))
+                val = _critic_value(critic, t_gsp, t_ve, len(cat_sp))
             v_np = val.cpu().numpy()
             offset = 0
             gids_iter = iter(boot_gids_list)
@@ -464,7 +477,7 @@ def train():
                 offset += n_g
 
         # ── flatten per-env rollouts into one big batch ──────────────
-        all_sp, all_ve, all_vm, all_ht = [], [], [], []
+        all_sp, all_gsp, all_ve, all_vm, all_ht = [], [], [], [], []
         all_act, all_lp, all_adv, all_ret = [], [], [], []
 
         for e in range(NUM_ENVS):
@@ -480,11 +493,13 @@ def train():
                 if len(buf_spatial[e]) <= t:
                     continue
                 sp_t  = buf_spatial[e][t]     # (N, C, H, W)
+                gsp_t = buf_gsp[e][t]
                 gids_t = buf_gids[e][t]
                 n_g   = len(gids_t)
                 for i in range(n_g):
                     gid = gids_t[i]
                     all_sp.append(sp_t[i])
+                    all_gsp.append(gsp_t[i])
                     all_ve.append(buf_vector[e][t][i])
                     all_vm.append(buf_mask[e][t][i])
                     all_ht.append(buf_htarget[e][t][i])
@@ -498,6 +513,7 @@ def train():
 
         # build dataset
         ds_sp  = torch.tensor(np.array(all_sp),  device=DEVICE, dtype=torch.float32)
+        ds_gsp = torch.tensor(np.array(all_gsp), device=DEVICE, dtype=torch.float32)
         ds_ve  = torch.tensor(np.array(all_ve),  device=DEVICE, dtype=torch.float32)
         ds_vm  = torch.tensor(np.array(all_vm),  device=DEVICE, dtype=torch.bool)
         ds_ht  = torch.tensor(np.array(all_ht),  device=DEVICE, dtype=torch.float32)
@@ -517,9 +533,9 @@ def train():
         ret_std  = ds_ret.std() + 1e-8
         ds_ret   = (ds_ret - ret_mean) / ret_std
 
-        # BC coefficient: starts at BC_INIT, decays to BC_FLOOR after update 500
-        decay_step = max(0, update - 500)
-        lam_bc = max(BC_FLOOR, BC_INIT * math.exp(-decay_step / BC_ANNEAL_UPDATES))
+        # BC coefficient: starts at BC_INIT, decays sharply after update 50
+        decay_step = max(0, update - 50)
+        lam_bc = max(BC_FLOOR, BC_INIT * math.exp(-decay_step / 200.0))
 
         # ── PPO epochs ───────────────────────────────────────────────
         metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0,
@@ -531,6 +547,7 @@ def train():
                 end = min(start + MINI_BATCH, N_total)
                 idx = indices[start:end]
                 b_sp  = ds_sp[idx]
+                b_gsp = ds_gsp[idx]
                 b_ve  = ds_ve[idx]
                 b_vm  = ds_vm[idx]
                 b_ht  = ds_ht[idx]
@@ -544,7 +561,7 @@ def train():
                     b_sp, b_ve, b_vm, b_act)
 
                 # value (per-ghost, IPPO CNN critic)
-                v_pred = critic(b_sp, b_ve).squeeze(-1)
+                v_pred = critic(b_gsp, b_ve).squeeze(-1)
 
                 # PPO clipped surrogate
                 ratio = torch.exp(new_lp - b_olp)
@@ -629,7 +646,7 @@ def train():
             print(f"CURRICULUM ADVANCE → Stage {curriculum.stage_idx} "
                   f"({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts)")
             print(f"{'='*60}\n")
-            is_static_pacman = (update <= 500)
+            is_static_pacman = (update <= 50)
             vec_env.set_curriculum(stage.rows, stage.cols,
                                   stage.n_ghosts, stage.n_power,
                                   static_pacman=is_static_pacman)

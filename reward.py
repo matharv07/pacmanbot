@@ -61,9 +61,15 @@ class RewardShaper:
         
         if math.isinf(d) or math.isnan(d):
             d = 999.0
+            
+        if getattr(ghost, 'pacman_powered', False):
+            return 0.0
+
         return -self.alpha * d
 
     def _phi_surround(self, ghost, all_ghosts) -> float:
+        if getattr(ghost, 'pacman_powered', False):
+            return 0.0
         target = self._pac_target(ghost)
         if target is None:
             return 0.0

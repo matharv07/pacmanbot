@@ -187,7 +187,7 @@ class GhostCritic(nn.Module):
     def __init__(self, vec_dim: int = 101):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(SPATIAL_CH, 64, 7, padding=3),
+            nn.Conv2d(5, 64, 7, padding=3),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.Conv2d(64, 128, 3, padding=1),

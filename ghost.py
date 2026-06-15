@@ -48,6 +48,10 @@ HEARTBEAT_TIMEOUT = 60
 RESYNC_EVERY      = 50
 OSCILLATION_WINDOW = 8   #position history length to prevent oscillations
 
+_ANGLES = np.radians(np.arange(RAY_COUNT))
+_DX = np.cos(_ANGLES) * 0.5
+_DY = np.sin(_ANGLES) * 0.5
+
 class Ghost:
     def __init__(self, gid, grid, pos, color, player_start):
         self.gid = gid
@@ -72,6 +76,7 @@ class Ghost:
         self.last_sync_frame = {}               #frame of last full sync sent to every ghost
         self.known_pacman = None                #(row, col) | None for not seen yet
         self.pacman_powered = False             #normal | powered | unknown
+        self.pacman_power_timer = 0
         self.pacman_last_seen = -1              #frame of when pacman was last seen for tiebreaks
         self.last_lost_pacman = None            #(row, col) of last invalidated pacman pos
         self.prev_pac_row: int = -1             #pacman's row on previous frame - belief map
@@ -86,6 +91,10 @@ class Ghost:
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False):
         self.frame += 1
+        if getattr(self, 'pacman_power_timer', 0) > 0:
+            self.pacman_power_timer -= 1
+            if self.pacman_power_timer <= 0:
+                self.pacman_powered = False
         newly_discovered = 0
         stale_refreshed = 0.0
         if self.dead:
@@ -206,12 +215,9 @@ class Ghost:
         rows = len(self.grid)
         cols = len(self.grid[0])
         visible[(self.row, self.col)] = self.grid[self.row][self.col]
-        angles = np.radians(np.arange(RAY_COUNT))
-        dx = np.cos(angles) * 0.5
-        dy = np.sin(angles) * 0.5
         steps = np.arange(1, MAX_RAY_DIST * 2 + 1)[:, np.newaxis]
-        ray_x = self.col + 0.5 + steps * dx
-        ray_y = self.row + 0.5 + steps * dy
+        ray_x = self.col + 0.5 + steps * _DX
+        ray_y = self.row + 0.5 + steps * _DY
         ray_c = ray_x.astype(int)
         ray_r = ray_y.astype(int)
         valid = (ray_r >= 0) & (ray_r < rows) & (ray_c >= 0) & (ray_c < cols)
@@ -251,7 +257,11 @@ class Ghost:
         if (pr, pc) in visible:
             if self.known_pacman != (pr, pc) or self.pacman_powered != powered:
                 self.known_pacman    = (pr, pc)
+                if powered and not self.pacman_powered:
+                    self.pacman_power_timer = 40
                 self.pacman_powered  = powered
+                if not powered:
+                    self.pacman_power_timer = 0
                 self.pacman_last_seen = self.frame
                 pacman_diff = ("pacman", pr, pc, powered, self.frame)
             else:
@@ -425,7 +435,11 @@ class Ghost:
                     _, r, c, powered, obs_frame = diff
                     if obs_frame > self.pacman_last_seen:
                         self.known_pacman     = (r, c)
+                        if powered and not self.pacman_powered:
+                            self.pacman_power_timer = 40
                         self.pacman_powered   = powered
+                        if not powered:
+                            self.pacman_power_timer = 0
                         self.pacman_last_seen = obs_frame
                         self.last_lost_pacman = None  #new sighting clears lost marker
                         relay_diffs.append(diff)

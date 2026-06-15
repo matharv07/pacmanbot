@@ -137,6 +137,10 @@ class Env:
 
         sp, ve, vm, ht = [], [], [], []
         R, C = self.grid_rows, self.grid_cols
+        
+        from obs import build_global_spatial
+        global_sp = build_global_spatial(self, R, C)
+
         for gid in alive:
             g = self.ghosts[gid]
             sp.append(build_spatial(g, self.recent_nom[gid], R, C))
@@ -154,11 +158,11 @@ class Env:
             z = lambda s: np.zeros(s, dtype=np.float32)
             return ([], z((0, SPATIAL_CH, R, C)), z((0, 101)),
                     np.zeros((0, R, C), dtype=bool),
-                    z((0, R, C)), (R, C))
+                    z((0, R, C)), z((5, R, C)), (R, C))
 
         return (alive,
                 np.stack(sp), np.stack(ve),
-                np.stack(vm), np.stack(ht),
+                np.stack(vm), np.stack(ht), global_sp,
                 (R, C))
 
     # ── step ─────────────────────────────────────────────────────────

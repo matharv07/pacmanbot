@@ -126,7 +126,8 @@ def build_vector(ghost, cbba_tasks: dict) -> np.ndarray:
 
     # ── scalar features ──────────────────────────────────────────────
     f.extend([ghost.row / rows, ghost.col / cols])                  # own pos
-    f.append(1.0 if ghost.pacman_powered else 0.0)                  # powered
+    timer = getattr(ghost, 'pacman_power_timer', 0)
+    f.append(timer / 40.0 if getattr(ghost, 'pacman_powered', False) else 0.0)  # powered
     since = ghost.frame - ghost.pacman_last_seen if ghost.pacman_last_seen >= 0 else 200
     f.append(min(since, 200) / 200.0)                               # time since sighting
 
@@ -217,3 +218,19 @@ def actions_to_tasks(ghost, scores_map: np.ndarray,
         tasks.append(Task(task_type=tt, target_pos=(r, c),
                           score=score, created_frame=frame))
     return tasks
+
+def build_global_spatial(env, rows, cols) -> np.ndarray:
+    """Builds the omniscient global state for the Critic."""
+    out = np.zeros((5, rows, cols), dtype=np.float32)
+    # 0: Walls, 1: Pellets, 2: Power
+    out[0] = (env.grid == 1)
+    out[1] = (env.grid == 2)
+    out[2] = (env.grid == 3)
+    # 3: True Pacman
+    if not env.player.dead:
+        out[3, env.player.row, env.player.col] = 1.0
+    # 4: True Ghosts
+    for g in env.ghosts.values():
+        if not g.dead:
+            out[4, g.row, g.col] = 1.0
+    return out

@@ -6,6 +6,7 @@ import sys
 import os
 from collections import deque
 from ghost import Ghost, UNKNOWN
+import pathfinder
 
 CELL = 20
 COLS = 41
@@ -273,17 +274,31 @@ class Player:
             self._bfs_cache.clear()    # invalidate BFS cache each frame (ghosts moved)
             ghost_maps = []
             min_ghost_dist = float('inf')
-            for g in ghosts.values():
-                if not g.dead:
-                    cache_key = (g.row, g.col)
-                    if cache_key in self._bfs_cache:
-                        g_map = self._bfs_cache[cache_key]
-                    else:
-                        g_map = self._get_bfs_map(cache_key)
-                        self._bfs_cache[cache_key] = g_map
-                    ghost_maps.append(g_map)
-                    if g_map[self.row, self.col] < min_ghost_dist:
-                        min_ghost_dist = g_map[self.row, self.col]
+            if pathfinder._SCIPY_AVAILABLE:
+                gen = pathfinder._SCIPY_GRID_GEN.get(id(self.grid))
+                graph, open_cells, cell_to_idx = pathfinder._SCIPY_GRAPH_CACHE[gen]
+                
+                g_indices = []
+                for g in ghosts.values():
+                    if not g.dead and (g.row, g.col) in cell_to_idx:
+                        g_indices.append(cell_to_idx[(g.row, g.col)])
+                
+                if g_indices:
+                    dist_matrix = pathfinder.scipy_dijkstra(csgraph=graph, directed=False, indices=g_indices)
+                    if dist_matrix.ndim == 1:
+                        dist_matrix = dist_matrix[np.newaxis, :]
+                    
+                    r_coords, c_coords = zip(*open_cells)
+                    r_coords = np.array(r_coords)
+                    c_coords = np.array(c_coords)
+                    
+                    for i in range(len(g_indices)):
+                        g_map = np.full(np.array(self.grid).shape, np.inf)
+                        g_map[r_coords, c_coords] = dist_matrix[i]
+                        ghost_maps.append(g_map)
+                        d = g_map[self.row, self.col]
+                        if d < min_ghost_dist:
+                            min_ghost_dist = d
             pellet_map = self._get_pellet_bfs_map()
             current_cell_pellet_dist = pellet_map[self.row, self.col]
             if self.macro_routing_active:           #break out of macro navigation only if we come across pellets or if a ghost intercepts us
