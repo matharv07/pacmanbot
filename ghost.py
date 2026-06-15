@@ -100,7 +100,7 @@ class Ghost:
         self.belief_map.update_safety_map(self.known_agents, self.frame, powered=self.pacman_powered)
         self.move_counter += 1
         if self.move_counter < self.move_every:
-            return newly_discovered
+            return newly_discovered, stale_refreshed
         self.move_counter = 0
         if skip_movement:
             self.pos_history.append((self.row, self.col))

@@ -183,17 +183,34 @@ class GhostActor(nn.Module):
 # ─────────────────────────────────────────────────────────────────────
 
 class GhostCritic(nn.Module):
-    """Sequence-agnostic IPPO Critic: evaluates each ghost token independently."""
-    TOKEN_DIM = 256   # 128 spatial + 128 vector
-
-    def __init__(self):
+    """Independent CNN-based Critic: evaluates each ghost state."""
+    def __init__(self, vec_dim: int = 101):
         super().__init__()
-        self.mlp  = nn.Sequential(
-            nn.Linear(self.TOKEN_DIM, 128), nn.GELU(),
-            nn.Linear(128, 128), nn.GELU(),
-            nn.Linear(128, 1),
+        self.stem = nn.Sequential(
+            nn.Conv2d(SPATIAL_CH, 64, 7, padding=3),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+        )
+        self.vec_mlp = nn.Sequential(
+            nn.Linear(vec_dim, 256), nn.GELU(),
+            nn.Linear(256, 128), nn.GELU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(128 + 128, 128), nn.GELU(),
+            nn.Linear(128, 64), nn.GELU(),
+            nn.Linear(64, 1),
         )
 
-    def forward(self, tokens, mask=None):
-        return self.mlp(tokens)
+    def forward(self, spatial, vector):
+        x = self.stem(spatial)
+        pool = F.adaptive_avg_pool2d(x, 1).flatten(1)
+        vec = self.vec_mlp(vector)
+        tokens = torch.cat([pool, vec], dim=-1)
+        return self.head(tokens)
 

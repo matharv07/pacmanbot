@@ -12,7 +12,10 @@ MAPPO training loop with:
   • JSON-lines metric logging + live curses terminal dashboard
 """
 
+import glob
 import math
+import sys
+import sys
 import time
 import json
 import os
@@ -32,14 +35,14 @@ from obs    import MAX_H, MAX_W, MAX_GHOSTS, SPATIAL_CH
 from curriculum import CurriculumScheduler, STAGES
 
 # ── hyperparameters ──────────────────────────────────────────────────
-NUM_ENVS        = 10    # 8 is the perfect sweet spot for a 6-core/12-thread CPU
+NUM_ENVS        = 8     # 8 is the perfect sweet spot for a 6-core/12-thread CPU
 ROLLOUT_STEPS   = 64
 MINI_BATCH      = 512  # 512 prevents the 6GB VRAM spike and OOM
 PPO_EPOCHS      = 12    # Kept at 12 to maximize learning per rollout
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
 CLIP_EPS        = 0.2
-ENT_COEF        = 0.01
+ENT_COEF        = 0.002
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 3e-4
@@ -77,11 +80,19 @@ def _pad_spatial(arr, target_h=MAX_H, target_w=MAX_W):
 
 # ── vectorised environment ───────────────────────────────────────────
 
-def _worker(env_id, conn, rows, cols, n_ghosts, n_power):
+def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
     """Child process: owns one Env, responds to step/reset/close/set_curriculum."""
-    env = Env(env_id, num_ghosts=n_ghosts, grid_rows=rows, grid_cols=cols, n_power=n_power)
-    obs = env.reset()
-    conn.send(obs)           # send initial observation
+    try:
+        print(f"Worker {env_id} started")
+        env = Env(env_id, num_ghosts=n_ghosts, grid_rows=rows, grid_cols=cols, n_power=n_power)
+        env.static_pacman = static_pacman
+        obs = env.reset()
+        conn.send(obs)           # send initial observation
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        conn.send(e)
+        return
     while True:
         cmd, data = conn.recv()
         if cmd == "step":
@@ -95,11 +106,12 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power):
             obs = env.reset()
             conn.send(obs)
         elif cmd == "set_curriculum":
-            rows, cols, n_ghosts, n_power = data
+            rows, cols, n_ghosts, n_power, static_pacman = data
             env.grid_rows = rows
             env.grid_cols = cols
             env.num_ghosts = n_ghosts
             env.n_power = n_power
+            env.static_pacman = static_pacman
             obs = env.reset()
             conn.send(obs)
         elif cmd == "close":
@@ -121,14 +133,14 @@ def _recv_unordered(conns, n):
 
 
 class VecEnv:
-    def __init__(self, n, rows=33, cols=41, n_ghosts=7, n_power=28):
+    def __init__(self, n, rows=33, cols=41, n_ghosts=7, n_power=28, static_pacman=False):
         self.n = n
         ctx = mp.get_context("spawn")
         self.parent, self.child = zip(*[ctx.Pipe() for _ in range(n)])
         self.procs = []
         for i, c in enumerate(self.child):
             p = ctx.Process(target=_worker,
-                            args=(i, c, rows, cols, n_ghosts, n_power),
+                            args=(i, c, rows, cols, n_ghosts, n_power, static_pacman),
                             daemon=True)
             p.start()
             self.procs.append(p)
@@ -141,10 +153,10 @@ class VecEnv:
         self.current_obs = _recv_unordered(self.parent, self.n)
         return self.current_obs
 
-    def set_curriculum(self, rows, cols, n_ghosts, n_power):
+    def set_curriculum(self, rows, cols, n_ghosts, n_power, static_pacman=False):
         """Reconfigure all workers for a new curriculum stage."""
         for p in self.parent:
-            p.send(("set_curriculum", (rows, cols, n_ghosts, n_power)))
+            p.send(("set_curriculum", (rows, cols, n_ghosts, n_power, static_pacman)))
         self.current_obs = _recv_unordered(self.parent, self.n)
         return self.current_obs
 
@@ -208,12 +220,11 @@ def compute_gae(buf_rewards_e, buf_values_e, buf_dones_e, last_val_dict_e, gamma
 
 # ── critic value helper ──────────────────────────────────────────────
 
-def _critic_value(critic, pools, vecs, n_alive):
-    """Build token tensor, run IPPO critic independently, return mean scalar."""
+def _critic_value(critic, spatial, vector, n_alive):
+    """Run IPPO critic independently, return mean scalar."""
     if n_alive == 0:
         return torch.zeros(0, device=DEVICE)
-    tokens = torch.cat([pools, vecs], dim=-1)          # (n_alive, 256)
-    return critic(tokens).squeeze(-1)                  # (n_alive,)
+    return critic(spatial, vector).squeeze(-1)                  # (n_alive,)
 
 
 # ── main training loop ───────────────────────────────────────────────
@@ -232,21 +243,57 @@ def train():
 
     print("Initializing VecEnv (spawn before CUDA to prevent hang)...")
     vec_env = VecEnv(NUM_ENVS, rows=stage.rows, cols=stage.cols,
-                     n_ghosts=stage.n_ghosts, n_power=stage.n_power)
+                     n_ghosts=stage.n_ghosts, n_power=stage.n_power,
+                     static_pacman=True)
 
     print("Initializing networks...")
     actor  = GhostActor().to(DEVICE)
     critic = GhostCritic().to(DEVICE)
     opt_actor  = torch.optim.Adam(actor.parameters(), lr=LR)
-    opt_critic = torch.optim.Adam(critic.parameters(), lr=LR)
+    opt_critic = torch.optim.Adam(critic.parameters(), lr=LR*2)
+
+    start_update = 1
+    episodes     = 0
+    total_steps  = 0
+    if "--resume" in sys.argv:
+        # find the latest checkpoint automatically
+        ckpts = sorted(glob.glob(os.path.join(CKPT_DIR, "ckpt_*.pt")),
+                       key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[1]))
+        if ckpts:
+            ckpt_path = ckpts[-1]
+            print(f"Resuming from {ckpt_path} ...")
+            ckpt = torch.load(ckpt_path, map_location=DEVICE)
+            actor.load_state_dict(ckpt["actor"])
+            critic.load_state_dict(ckpt["critic"])
+            opt_actor.load_state_dict(ckpt["opt_actor"])
+            opt_critic.load_state_dict(ckpt["opt_critic"])
+            curriculum.load_state_dict(ckpt["curriculum"])
+            start_update = ckpt["update"] + 1
+            episodes     = ckpt.get("episodes", 0)
+            total_steps  = ckpt.get("total_steps", ckpt["update"] * ROLLOUT_STEPS * NUM_ENVS)
+            # restore curriculum stage in VecEnv
+            stage = curriculum.stage
+            vec_env.set_curriculum(stage.rows, stage.cols,
+                                   stage.n_ghosts, stage.n_power,
+                                   static_pacman=(start_update <= 500))
+            print(f"Resumed at update {start_update}, "
+                  f"stage {curriculum.stage_idx} "
+                  f"({stage.rows}×{stage.cols}, {stage.n_ghosts}g)")
+        else:
+            print("No checkpoints found — starting from scratch.")
+
 
     print("VecEnv initialized. Starting training...")
-    episodes    = 0
-    total_steps = 0
     t0 = time.time()
     current_returns = [0.0] * NUM_ENVS
     
-    for update in range(1, 50_001):
+    for update in range(start_update, 50_001):
+        if update == 501:
+            print("Transitioning to moving Pacman (static_pacman = False)...")
+            vec_env.set_curriculum(stage.rows, stage.cols,
+                                   stage.n_ghosts, stage.n_power,
+                                   static_pacman=False)
+            # update vec_env's current_obs from the curriculum reset
         # ── collect rollout ──────────────────────────────────────────
         # Per-env, per-step storage  (lists of length ROLLOUT_STEPS)
         buf_spatial   = [[] for _ in range(NUM_ENVS)]
@@ -320,7 +367,7 @@ def train():
                 with torch.no_grad():
                     idx, lp, scores, pool, vec = actor(
                         t_sp, t_ve, t_vm, K=K_NOMINATIONS)
-                    val = _critic_value(critic, pool, vec, len(batch_gids))
+                    val = _critic_value(critic, t_sp, t_ve, len(batch_gids))
 
                 idx_np = idx.cpu().numpy()
                 sc_np  = scores.cpu().numpy()
@@ -404,7 +451,7 @@ def train():
             t_vm = torch.tensor(cat_vm, device=DEVICE, dtype=torch.bool)
             with torch.no_grad():
                 _, _, _, pool, vec = actor(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
-                val = _critic_value(critic, pool, vec, len(cat_sp))
+                val = _critic_value(critic, t_sp, t_ve, len(cat_sp))
             v_np = val.cpu().numpy()
             offset = 0
             gids_iter = iter(boot_gids_list)
@@ -470,8 +517,9 @@ def train():
         ret_std  = ds_ret.std() + 1e-8
         ds_ret   = (ds_ret - ret_mean) / ret_std
 
-        # BC coefficient: starts at BC_INIT (1.0), decays to BC_FLOOR (0.02)
-        lam_bc = max(BC_FLOOR, BC_INIT * math.exp(-update / BC_ANNEAL_UPDATES))
+        # BC coefficient: starts at BC_INIT, decays to BC_FLOOR after update 500
+        decay_step = max(0, update - 500)
+        lam_bc = max(BC_FLOOR, BC_INIT * math.exp(-decay_step / BC_ANNEAL_UPDATES))
 
         # ── PPO epochs ───────────────────────────────────────────────
         metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0,
@@ -495,9 +543,8 @@ def train():
                 new_lp, ent, pool, vec, flat_logits = actor.evaluate_actions(
                     b_sp, b_ve, b_vm, b_act)
 
-                # value (per-ghost token, IPPO)
-                v_pred = critic(
-                    torch.cat([pool, vec], dim=-1)).squeeze(-1)
+                # value (per-ghost, IPPO CNN critic)
+                v_pred = critic(b_sp, b_ve).squeeze(-1)
 
                 # PPO clipped surrogate
                 ratio = torch.exp(new_lp - b_olp)
@@ -582,8 +629,10 @@ def train():
             print(f"CURRICULUM ADVANCE → Stage {curriculum.stage_idx} "
                   f"({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts)")
             print(f"{'='*60}\n")
+            is_static_pacman = (update <= 500)
             vec_env.set_curriculum(stage.rows, stage.cols,
-                                  stage.n_ghosts, stage.n_power)
+                                  stage.n_ghosts, stage.n_power,
+                                  static_pacman=is_static_pacman)
             current_returns = [0.0] * NUM_ENVS
             # Halve LR on stage transition to prevent catastrophic forgetting
             for pg in opt_actor.param_groups:
@@ -605,9 +654,8 @@ def train():
             hrs, mins = divmod(mins, 60)
             runtime = f"{hrs}h {mins:02d}m {secs:02d}s" if hrs else f"{mins}m {secs:02d}s"
 
-            # Phase detection (adjusted thresholds for BC_INIT = 0.5)
             if lam_bc > 0.25:
-                phase = "\033[95mImitation Learning\033[0m"     # magenta
+                phase = "\033[95mHybrid RL + IL\033[0m"         # magenta
             elif lam_bc > 0.05:
                 phase = "\033[93mIL → RL Transition\033[0m"    # yellow
             else:
@@ -634,6 +682,7 @@ def train():
                          "opt_critic": opt_critic.state_dict(),
                          "update": update,
                          "episodes": episodes,
+                         "total_steps": total_steps,
                          "curriculum": curriculum.state_dict()}, path)
             with open(log_path, "a") as f:
                 f.write(json.dumps({"checkpoint": path, "update": update}) + "\n")

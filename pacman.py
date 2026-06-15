@@ -167,6 +167,7 @@ class Player:
         self.eps = 1e-8
         self.macro_routing_active = False   #flag to indicate if we're currently in macro routing mode => following pellet gradients directly - adam gets confused and jittery otherwise
         self._bfs_cache = {}               #cache BFS maps per start position
+        self.stationary = False            # if True, skips movement logic
 
     def set_dir(self, d):
         self.next_dir = d
@@ -262,7 +263,12 @@ class Player:
             nr, nc = r + d[0], c + d[1]
             return (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL)
         self.prev_row, self.prev_col = self.row, self.col
-        if AUTO_MODE:
+        
+        if self.stationary:
+            if not self.powered and random.random() < 0.0107:
+                self.powered = True
+                self.power_timer = 40
+        elif AUTO_MODE:
             self.t += 1
             self._bfs_cache.clear()    # invalidate BFS cache each frame (ghosts moved)
             ghost_maps = []

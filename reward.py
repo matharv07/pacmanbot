@@ -13,7 +13,7 @@ from pathfinder import dijkstra_multi
 class RewardShaper:
     """Tracks per-ghost potentials and returns the shaping delta each step."""
 
-    def __init__(self, alpha=0.1, beta=0.05, gamma_ex=0.005, delta=0.02, epsilon=0.05):
+    def __init__(self, alpha=0.4, beta=0.2, gamma_ex=0.005, delta=0.02, epsilon=0.05):
         """
         Parameters
         ----------
@@ -50,7 +50,17 @@ class RewardShaper:
         target = self._pac_target(ghost)
         if target is None:
             return 0.0
-        d = abs(ghost.row - target[0]) + abs(ghost.col - target[1])
+        # Use cached Dijkstra distance if available (from CBBA auction)
+        if hasattr(ghost, 'cbba_agent') and target in ghost.cbba_agent._dist_cache:
+            d = ghost.cbba_agent._dist_cache[target]
+            if math.isinf(d) or math.isnan(d):
+                d = abs(ghost.row - target[0]) + abs(ghost.col - target[1])
+        else:
+            # Fallback to Manhattan if cache miss
+            d = abs(ghost.row - target[0]) + abs(ghost.col - target[1])
+        
+        if math.isinf(d) or math.isnan(d):
+            d = 999.0
         return -self.alpha * d
 
     def _phi_surround(self, ghost, all_ghosts) -> float:

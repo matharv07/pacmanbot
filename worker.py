@@ -51,6 +51,7 @@ class Env:
         self.shaper     = RewardShaper()
         self.recent_nom: dict[int, np.ndarray] = {}
         self._cached_ht: dict[int, np.ndarray] = {}   # heuristic targets cached at auction boundary
+        self.static_pacman = False
 
     # ── reset ────────────────────────────────────────────────────────
 
@@ -59,6 +60,9 @@ class Env:
             rows=self.grid_rows, cols=self.grid_cols, n_power=self.n_power)
         pathfinder.build_scipy_graph(self.grid)
         self.player = Player(self.grid, self._player_start)
+        import random
+        if self.static_pacman:
+            self.player.stationary = True
 
         # scatter ghosts far from Pacman (same logic as pacman.py Game.new_game)
         open_cells = np.argwhere(self.grid != WALL)
@@ -102,6 +106,15 @@ class Env:
                     r, c = t.target_pos
                     if r < self.grid_rows and c < self.grid_cols:
                         target[r, c] = t.score
+                        # Gaussian blur for soft BC targets
+                        for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols:
+                                target[nr, nc] += t.score * 0.5
+                        for dr, dc in [(-1,-1), (-1,1), (1,-1), (1,1)]:
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols:
+                                target[nr, nc] += t.score * 0.25
                 self._cached_ht[gid] = target
         return self.observe()
 
@@ -188,6 +201,15 @@ class Env:
                     r, c = t.target_pos
                     if r < self.grid_rows and c < self.grid_cols:
                         target[r, c] = t.score
+                        # Gaussian blur for soft BC targets
+                        for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols:
+                                target[nr, nc] += t.score * 0.5
+                        for dr, dc in [(-1,-1), (-1,1), (1,-1), (1,1)]:
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols:
+                                target[nr, nc] += t.score * 0.25
                 self._cached_ht[gid] = target
 
         # run DECISION_INTERVAL frames of game logic
@@ -204,12 +226,18 @@ class Env:
                                                         powered, self.ghosts)
                 if gid in rewards:
                     explore_r = (new_cells * 0.01) + (stale_refresh * 0.005)
-                    rewards[gid] += min(explore_r, 0.04)  # cap exploration reward per frame to keep it below 0.05 step cost
+                    rewards[gid] += min(explore_r, 0.10)  # cap exploration reward per frame to keep it below 0.05 step cost
 
             if not self.player.dead:
                 for gid, ghost in list(self.ghosts.items()):
                     if ghost.dead:
                         continue
+                        
+                    # Dense adjacency reward for hunting
+                    dist_to_pac = abs(ghost.row - self.player.row) + abs(ghost.col - self.player.col)
+                    if dist_to_pac == 1 and not self.player.powered and gid in rewards:
+                        rewards[gid] += 1.0
+                        
                     same = (ghost.row == self.player.row
                             and ghost.col == self.player.col)
                     swap = (ghost.row == self.player.prev_row
