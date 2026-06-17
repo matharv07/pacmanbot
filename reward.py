@@ -13,7 +13,7 @@ from pathfinder import dijkstra_multi
 class RewardShaper:
     """Tracks per-ghost potentials and returns the shaping delta each step."""
 
-    def __init__(self, alpha=0.4, beta=0.2, gamma_ex=0.005, delta=0.02, epsilon=0.05):
+    def __init__(self, alpha=0.4, beta=1.2, gamma_ex=0.005, delta=0.02, epsilon=0.05, gamma=0.99):
         """
         Parameters
         ----------
@@ -22,12 +22,14 @@ class RewardShaper:
         gamma_ex : exploration shaping weight — SMALL so it doesn't
                    drown out pursuit signals (raw cell count is O(100))
         delta    : belief-entropy shaping weight
+        gamma    : RL discount factor for Ng et al. invariant shaping
         """
         self.alpha    = alpha
         self.beta     = beta
         self.gamma_ex = gamma_ex
         self.delta    = delta
         self.epsilon  = epsilon
+        self.gamma    = gamma
         self._prev: dict[int, float] = {}
 
     # ── individual potential components ───────────────────────────────
@@ -64,8 +66,10 @@ class RewardShaper:
             
         if getattr(ghost, 'pacman_powered', False):
             return 0.0
+            
+        diag = math.hypot(len(ghost.grid), len(ghost.grid[0]))
 
-        return -self.alpha * d
+        return -self.alpha * (d / diag)
 
     def _phi_surround(self, ghost, all_ghosts) -> float:
         if getattr(ghost, 'pacman_powered', False):
@@ -93,9 +97,8 @@ class RewardShaper:
     def _phi_explore(self, ghost) -> float:
         # Fraction of open cells known (0-1), NOT raw counts — keeps scale O(1)
         p = ghost.personal_map
-        total_open = np.sum(p != 1)            # everything that isn't a wall
-        if total_open == 0:
-            return 0.0
+        # Use total grid size for a monotonic denominator, as dynamically counting non-walls changes during exploration
+        total_open = p.shape[0] * p.shape[1]
         known = np.sum((p != -1) & (p != 1))   # not unknown, not wall
         return self.gamma_ex * (known / total_open)
 
@@ -124,7 +127,7 @@ class RewardShaper:
         if gid not in self._prev:
             self._prev[gid] = phi
             return 0.0
-        r = phi - self._prev[gid]
+        r = self.gamma * phi - self._prev[gid]
         self._prev[gid] = phi
         return r
 

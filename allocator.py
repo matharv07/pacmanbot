@@ -50,6 +50,7 @@ class Task:
     score:         float
     assigned_to:   int = -1
     created_frame: int = 0
+    owner:         int = -1
 
 def _dist_score(d: float, scale: float) -> float:   #normalize the distances received from dijkstra
     return math.exp(-d / scale) if d != math.inf and d >= 0 else 0.0
@@ -67,7 +68,7 @@ def _score_hunt(ghost, dists: dict) -> Optional[Task]:
     if dist == math.inf:
         return None
     score = _dist_score(dist, HUNT_SCALE)
-    return Task(task_type=TaskType.HUNT, target_pos=target, score=score)
+    return Task(task_type=TaskType.HUNT, target_pos=target, score=score, owner=ghost.gid)
 
 def _score_convert(ghost, dists: dict) -> List[Task]:
     tasks: list[Task] = []
@@ -119,13 +120,13 @@ def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
         if flee_pos is None:
             return None
         # High score to prioritize immediate survival
-        return Task(task_type=TaskType.EVADE_TRACK, target_pos=flee_pos, score=2.0, created_frame=frame)
+        return Task(task_type=TaskType.EVADE_TRACK, target_pos=flee_pos, score=2.0, created_frame=frame, owner=ghost.gid)
         
     else:
         # Outside danger zone - Shadow Pacman!
         # Target Pacman directly, but with a lower score so it doesn't override critical exploration or fleeing peers
         score = 0.5 
-        return Task(task_type=TaskType.EVADE_TRACK, target_pos=target, score=score, created_frame=frame)
+        return Task(task_type=TaskType.EVADE_TRACK, target_pos=target, score=score, created_frame=frame, owner=ghost.gid)
 
 def _score_explore(ghost, frame: int) -> List[Task]:    #pick top-K locations with unknown or older info
     p = ghost.personal_map
@@ -169,10 +170,14 @@ def _score_explore(ghost, frame: int) -> List[Task]:    #pick top-K locations wi
         pos = (r, c)
         score = 1.0 - math.exp(-age / RECENCY_SCALE)
         score *= _dist_score(abs(pos[0] - ghost.row) + abs(pos[1] - ghost.col), EXPLORE_SCALE)
+        if getattr(ghost, 'cbba_agent', None):
+            for key in ghost.cbba_agent.bundle:
+                if key[1] == pos:
+                    score += 0.5
         tasks.append(Task(task_type=TaskType.EXPLORE, target_pos=pos, score=score))
     return tasks
 
-def generate_tasks(ghost, frame: int) -> List[Task]:
+def generate_tasks(ghost, frame: int) -> tuple[List[Task], dict]:
     start = (ghost.row, ghost.col)
     rows, cols = ghost.personal_map.shape
     targets: set = set()
@@ -195,6 +200,9 @@ def generate_tasks(ghost, frame: int) -> List[Task]:
         # Strict logic gate: Only evade and explore when powered
         evade_track = _score_evade_track(ghost, dists, frame)
         if evade_track is not None:
+            if evade_track.target_pos not in dists:
+                extra_dist = dijkstra_multi(ghost.grid, start, [evade_track.target_pos])
+                dists.update(extra_dist)
             tasks.append(evade_track)
         tasks.extend(explore_tasks)
     else:
@@ -208,7 +216,7 @@ def generate_tasks(ghost, frame: int) -> List[Task]:
         if t.created_frame == 0:
             t.created_frame = frame
     tasks.sort(key=lambda t: t.score, reverse=True)
-    return tasks
+    return tasks, dists
 
 def best_task(tasks: List[Task]) -> Optional[Task]:
     return max(tasks, key=lambda t: t.score) if tasks else None

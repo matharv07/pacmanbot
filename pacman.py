@@ -28,12 +28,22 @@ GREY   = (80, 80, 80)
 POWERED_COLOR = (0, 120, 255)
 GHOST_COLORS  = [RED, PINK, CYAN, ORANGE, (180, 0, 180), (0, 180, 80), (220, 220, 0)]
 
+WALL   = 1
+EMPTY  = 0
+PELLET = 2
+POWER  = 3
+
+UP    = (-1,  0)
+DOWN  = ( 1,  0)
+LEFT  = ( 0, -1)
+RIGHT = ( 0,  1)
+DIRS  = [UP, DOWN, LEFT, RIGHT]
+
 AUTO_MODE = False
 RL_MODE = True
 TOGGLE_WIDTH, TOGGLE_HEIGHT = 160, 32
 TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH * 2 - 20, ROWS * CELL + 8, TOGGLE_WIDTH, TOGGLE_HEIGHT)
 RL_TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH - 10, ROWS * CELL + 8, TOGGLE_WIDTH, TOGGLE_HEIGHT)
-
 RL_ACTOR = None
 RL_DEVICE = None
 
@@ -47,51 +57,29 @@ def load_rl_model():
         import glob
         from net import GhostActor
         RL_DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
         ckpts = glob.glob("checkpoints/ckpt_*.pt")
         if not ckpts:
             print("No checkpoints found. RL Mode disabled.")
             RL_MODE = False
             return False
-            
         latest = max(ckpts, key=os.path.getctime)
         print(f"Loading checkpoint: {latest}")
-        
         RL_ACTOR = GhostActor().to(RL_DEVICE)
         checkpoint = torch.load(latest, map_location=RL_DEVICE)
         RL_ACTOR.load_state_dict(checkpoint["actor"])
         RL_ACTOR.eval()
         print("RL Model loaded successfully.")
         return True
+
     except Exception as e:
         print(f"Failed to load RL Model: {e}")
         RL_MODE = False
         return False
 
-WALL   = 1
-EMPTY  = 0
-PELLET = 2
-POWER  = 3
-
-UP    = (-1,  0)
-DOWN  = ( 1,  0)
-LEFT  = ( 0, -1)
-RIGHT = ( 0,  1)
-DIRS  = [UP, DOWN, LEFT, RIGHT]
-
 def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = 28):
-    """Generate a random maze grid.
-
-    Parameters
-    ----------
-    rows, cols : grid dimensions (curriculum-adjustable)
-    n_power    : number of power pellets to place
-    """
     grid = np.full((rows, cols), WALL, dtype=np.int8)
-
     def in_bounds(r, c):
         return 0 < r < rows - 1 and 0 < c < cols - 1
-
     def carve(r, c):
         grid[r, c] = EMPTY
         neighbours = []
@@ -101,8 +89,6 @@ def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = 28):
                 neighbours.append((nr, nc, r + dr // 2, c + dc // 2))
         random.shuffle(neighbours)
         return neighbours
-
-    # Ensure start cell is on an odd row/col inside bounds
     max_sr = max(1, rows - 2)
     max_sc = max(1, cols - 2)
     sr = random.randrange(1, max_sr + 1, 2) if max_sr >= 1 else 1
@@ -123,8 +109,7 @@ def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = 28):
     grid[:, 0] = WALL
     grid[:, cols - 1] = WALL
     open_cells = list(map(tuple, np.argwhere(grid == EMPTY)))
-    if not open_cells:
-        # Fallback for tiny grids: force centre open
+    if not open_cells:              #mandate no walls at centre
         cr, cc = rows // 2, cols // 2
         grid[cr, cc] = EMPTY
         open_cells = [(cr, cc)]
@@ -159,14 +144,13 @@ class Player:
         self.mouth_tick = 0
         self.dead = False
         self.dead_timer = 0
-        #Adam moment states for on-field processing 
         self.m_row, self.m_col = 0.0, 0.0
         self.v_row, self.v_col = 0.0, 0.0
         self.t = 0
         self.beta1 = 0.9
         self.beta2 = 0.999
         self.eps = 1e-8
-        self.macro_routing_active = False   #flag to indicate if we're currently in macro routing mode => following pellet gradients directly - adam gets confused and jittery otherwise
+        self.macro_routing_active = False  #flag to indicate if we're currently in macro routing mode => following pellet gradients directly - adam gets confused and jittery otherwise
         self._bfs_cache = {}               #cache BFS maps per start position
         self.stationary = False            # if True, skips movement logic
 
@@ -190,7 +174,6 @@ class Player:
             shifted_right = np.roll(active, 1, axis=1)
             new_active = shifted_up | shifted_down | shifted_left | shifted_right
             new_active[wall_mask] = False
-            #mask out already visited
             new_active = new_active & np.isinf(dist_map)
             dist_map[new_active] = d
             active = new_active
@@ -271,27 +254,24 @@ class Player:
                 self.power_timer = 40
         elif AUTO_MODE:
             self.t += 1
-            self._bfs_cache.clear()    # invalidate BFS cache each frame (ghosts moved)
+            self._bfs_cache.clear()
             ghost_maps = []
             min_ghost_dist = float('inf')
             if pathfinder._SCIPY_AVAILABLE:
-                gen = pathfinder._SCIPY_GRID_GEN.get(id(self.grid))
-                graph, open_cells, cell_to_idx = pathfinder._SCIPY_GRAPH_CACHE[gen]
-                
-                g_indices = []
+                cache = pathfinder.get_scipy_graph(self.grid)
+                if cache is not None:
+                    graph, open_cells, cell_to_idx = cache
+                    g_indices = []
                 for g in ghosts.values():
                     if not g.dead and (g.row, g.col) in cell_to_idx:
                         g_indices.append(cell_to_idx[(g.row, g.col)])
-                
                 if g_indices:
                     dist_matrix = pathfinder.scipy_dijkstra(csgraph=graph, directed=False, indices=g_indices)
                     if dist_matrix.ndim == 1:
                         dist_matrix = dist_matrix[np.newaxis, :]
-                    
                     r_coords, c_coords = zip(*open_cells)
                     r_coords = np.array(r_coords)
                     c_coords = np.array(c_coords)
-                    
                     for i in range(len(g_indices)):
                         g_map = np.full(np.array(self.grid).shape, np.inf)
                         g_map[r_coords, c_coords] = dist_matrix[i]
@@ -301,10 +281,10 @@ class Player:
                             min_ghost_dist = d
             pellet_map = self._get_pellet_bfs_map()
             current_cell_pellet_dist = pellet_map[self.row, self.col]
-            if self.macro_routing_active:           #break out of macro navigation only if we come across pellets or if a ghost intercepts us
+            if self.macro_routing_active:           #break out of macro navigation only if we come across pellets or if a ghost intercepts pacman
                 if current_cell_pellet_dist <= 1 or min_ghost_dist <= 4:
                     self.macro_routing_active = False
-            else:                                   #enter macro navigation strategy if we are completely isolated
+            else:                                   #enter macro navigation strategy if completely isolated
                 if current_cell_pellet_dist > 3 and min_ghost_dist > 6:
                     self.macro_routing_active = True
             if self.macro_routing_active and not math.isinf(current_cell_pellet_dist) and not math.isnan(current_cell_pellet_dist):
@@ -543,7 +523,7 @@ class Game:
             return
 
         self.frame_counter += 1
-        if RL_MODE and self.frame_counter % 5 == 0:
+        if RL_MODE and self.frame_counter % 6 == 0:
             if RL_ACTOR is None:
                 load_rl_model()
             if RL_ACTOR is not None:
@@ -565,7 +545,7 @@ class Game:
                     t_ve = torch.tensor(np.stack(ve), device=RL_DEVICE, dtype=torch.float32)
                     t_vm = torch.tensor(np.stack(vm), device=RL_DEVICE, dtype=torch.bool)
                     
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         idx, _, scores, _, _ = RL_ACTOR(t_sp, t_ve, t_vm, K=3)
                     
                     idx_np = idx.cpu().numpy()
@@ -583,10 +563,18 @@ class Game:
                                 self.recent_nom[gid][r, c] = 1.0
                                 
                         tasks = actions_to_tasks(g, scores_map, indices, self.frame_counter)
+                        
+                        g.cbba_agent._last_auction = self.frame_counter
+                        from allocator import generate_tasks as heuristic_generate_tasks
+                        h_tasks, h_dists = heuristic_generate_tasks(g, self.frame_counter)
+                        all_tasks = h_tasks + tasks
+                        g.cbba_agent._task_map.clear()
                         if tasks:
-                            g.cbba_agent._last_auction = self.frame_counter
-                            g.cbba_agent._task_map = {(int(t.task_type), t.target_pos): t for t in tasks}
-                            g.cbba_agent._phase1(g, tasks)
+                            all_targets = [t.target_pos for t in tasks]
+                            from pathfinder import dijkstra_multi
+                            dists = dijkstra_multi(g.grid, (g.row, g.col), all_targets)
+                            h_dists.update(dists)
+                        g.cbba_agent._phase1(g, all_tasks, h_dists)
 
         self.player.update(self.ghosts)
         powered = self.player.powered
@@ -601,11 +589,7 @@ class Game:
                 if (same_cell or swapped):
                     if self.player.powered:
 
-                        death_msg = {"id": ("death", gid, ghost.frame), "diffs": [("agent_lost", gid)], "hop": 0}
-                        for g in self.ghosts.values():
-                            if g.gid != gid:
-                                g.message_queue.append(death_msg)
-                        del self.ghosts[gid]
+                        ghost.kill()
                         self.player.score += 200
                     else:
 

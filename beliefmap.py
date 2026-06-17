@@ -57,8 +57,23 @@ class BeliefMap:
         self.last_known_dir: tuple = (0, 0)
         self.frames_since_sighting: int = 9999
         self._pacman_start: Optional[tuple] = pacman_start
-        self._neighbours: dict[tuple, list[tuple]] = {}
+        
         self._open_cells: list[tuple] = []
+        self._neighbours: dict[tuple, list[tuple]] = {}
+        DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if self.grid[r][c] == WALL:
+                    continue
+                self._open_cells.append((r, c))
+                nbrs = []
+                for dr, dc in DIRS:
+                    nr, nc = r + dr, c + dc
+                    if (0 <= nr < self.rows and 0 <= nc < self.cols and self.grid[nr][nc] != WALL):
+                        nbrs.append((nr, nc))
+                self._neighbours[(r, c)] = nbrs
+
+        self._topology_dirty = True
         self._open_arr = np.empty((0, 2), dtype=np.int32)
         self._open_idx = np.full((self.rows, self.cols), -1, dtype=np.int32)
         self._nbr_idx = np.empty((0, 0), dtype=np.int32)
@@ -349,10 +364,12 @@ class BeliefMap:
                 if total_w > 0:
                     for (nr, nc), w in weights.items():
                         self._b[nr][nc] += mass * (w / total_w)
-            self._remove_open_cell(pos)
-            self._dirty_cells.add(pos)
-        elif not was_open and value != WALL:
-            self._add_open_cell(pos)
+        now_open = value != WALL
+        if was_open != now_open:
+            if now_open:
+                self._add_open_cell(pos)
+            else:
+                self._remove_open_cell(pos)
             self._dirty_cells.add(pos)
 
     def _remove_open_cell(self, pos: tuple):
@@ -385,33 +402,32 @@ class BeliefMap:
         # topology_dirty is now handled via _dirty_cells set
 
     def _compute_topology(self):
-        DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-        self._open_cells = []
-        self._neighbours = {}
-        for r in range(self.rows):
-            for c in range(self.cols):
-                if self.grid[r][c] == WALL:
-                    continue
-                self._open_cells.append((r, c))
-                nbrs = []
-                for dr, dc in DIRS:
-                    nr, nc = r + dr, c + dc
-                    if (0 <= nr < self.rows and 0 <= nc < self.cols and self.grid[nr][nc] != WALL):
-                        nbrs.append((nr, nc))
-                self._neighbours[(r, c)] = nbrs
         n = len(self._open_cells)
+        if n == 0:
+            self._open_arr = np.zeros((0, 2), dtype=np.int32)
+            self._open_idx = np.full((self.rows, self.cols), -1, dtype=np.int32)
+            self._nbr_idx = np.full((0, 0), -1, dtype=np.int32)
+            self._nbr_count = np.zeros(0, dtype=np.int32)
+            return
+            
         self._open_arr = np.array(self._open_cells, dtype=np.int32)
         self._open_idx = np.full((self.rows, self.cols), -1, dtype=np.int32)
-        for i, (r, c) in enumerate(self._open_cells):
-            self._open_idx[r, c] = i
-        max_nbrs = max((len(v) for v in self._neighbours.values()), default=0)
-        self._nbr_idx = np.full((n, max_nbrs), -1, dtype=np.int32)
-        self._nbr_count = np.zeros(n, dtype=np.int32)
-        for i, cell in enumerate(self._open_cells):
+        self._open_idx[self._open_arr[:, 0], self._open_arr[:, 1]] = np.arange(n, dtype=np.int32)
+        
+        nbr_idx_list = []
+        nbr_count_list = []
+        for cell in self._open_cells:
             nbrs = self._neighbours[cell]
-            for j, nbr in enumerate(nbrs):
-                self._nbr_idx[i, j] = self._open_idx[nbr]
-            self._nbr_count[i] = len(nbrs)
+            n_idx = [int(self._open_idx[r, c]) for r, c in nbrs]
+            nbr_count_list.append(len(n_idx))
+            nbr_idx_list.append(n_idx)
+            
+        max_nbrs = max(nbr_count_list, default=0)
+        self._nbr_idx = np.full((n, max_nbrs), -1, dtype=np.int32)
+        for i, idxs in enumerate(nbr_idx_list):
+            if idxs:
+                self._nbr_idx[i, :len(idxs)] = idxs
+        self._nbr_count = np.array(nbr_count_list, dtype=np.int32)
 
     def _rebuild_topology(self):
         self._compute_topology()

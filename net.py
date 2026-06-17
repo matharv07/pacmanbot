@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from obs import SPATIAL_CH, MAX_H, MAX_W
+from obs import SPATIAL_CH, MAX_H, MAX_W, VEC_DIM, CRITIC_VEC_DIM, GLOBAL_SPATIAL_CH
 
 # ─────────────────────────────────────────────────────────────────────
 # Building blocks
@@ -19,11 +19,11 @@ class ResBlock(nn.Module):
     def __init__(self, c_in, c_out):
         super().__init__()
         self.conv1 = nn.Conv2d(c_in, c_out, 3, padding=1)
-        self.bn1   = nn.BatchNorm2d(c_out)
+        self.bn1   = nn.GroupNorm(8, c_out)
         self.conv2 = nn.Conv2d(c_out, c_out, 3, padding=1)
-        self.bn2   = nn.BatchNorm2d(c_out)
+        self.bn2   = nn.GroupNorm(8, c_out)
         self.skip  = (nn.Sequential(nn.Conv2d(c_in, c_out, 1),
-                                     nn.BatchNorm2d(c_out))
+                                     nn.GroupNorm(8, c_out))
                       if c_in != c_out else nn.Identity())
 
     def forward(self, x):
@@ -54,12 +54,12 @@ class FiLM(nn.Module):
 # ─────────────────────────────────────────────────────────────────────
 
 class GhostActor(nn.Module):
-    def __init__(self, vec_dim: int = 101):
+    def __init__(self, vec_dim: int = VEC_DIM):
         super().__init__()
         # CNN spatial encoder — preserves (H, W) resolution
         self.stem = nn.Sequential(
             nn.Conv2d(SPATIAL_CH, 64, 7, padding=3),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),
             nn.ReLU(),
         )
         self.res1 = ResBlock(64, 128)
@@ -121,11 +121,15 @@ class GhostActor(nn.Module):
 
         # Sequential sampling without replacement
         B = spatial.shape[0]
-        # clamp to finite range: all-inf rows (empty valid mask) would crash Categorical
         flat = logits.view(B, -1).clone()
         flat = torch.nan_to_num(flat, nan=float('-inf'))
         sel_idx, sel_lp = [], []
         for _ in range(K):
+            # clamp to finite range: all-inf rows (empty valid mask) would crash Categorical
+            inf_mask = torch.isinf(flat) & (flat < 0)
+            all_inf = inf_mask.all(dim=1, keepdim=True)
+            flat = torch.where(all_inf, 0.0, flat)
+
             dist = torch.distributions.Categorical(logits=flat)
             idx  = dist.sample()
             sel_idx.append(idx)
@@ -158,6 +162,9 @@ class GhostActor(nn.Module):
         logits = self.logits_from_features(feats, mask)
         flat_clean = torch.nan_to_num(
             logits.view(logits.shape[0], -1), nan=float('-inf'))
+        inf_mask_clean = torch.isinf(flat_clean) & (flat_clean < 0)
+        all_inf_clean = inf_mask_clean.all(dim=1, keepdim=True)
+        flat_clean = torch.where(all_inf_clean, 0.0, flat_clean)
 
         # Mutable copy for sequential categorical sampling
         flat = flat_clean.clone()
@@ -165,6 +172,10 @@ class GhostActor(nn.Module):
         lp_list, ent_list = [], []
         K = actions.shape[1]
         for k in range(K):
+            inf_mask = torch.isinf(flat) & (flat < 0)
+            all_inf = inf_mask.all(dim=1, keepdim=True)
+            flat = torch.where(all_inf, 0.0, flat)
+
             dist = torch.distributions.Categorical(logits=flat)
             lp_list.append(dist.log_prob(actions[:, k]))
             ent_list.append(dist.entropy())
@@ -174,7 +185,7 @@ class GhostActor(nn.Module):
             flat = torch.where(mask_k, float('-inf'), flat)
 
         logprobs = torch.stack(lp_list, 1).sum(1)    # (B,)
-        entropy  = torch.stack(ent_list, 1).mean(1)   # (B,)
+        entropy  = torch.stack(ent_list, 1).sum(1)   # (B,)
         return logprobs, entropy, pool, vec, flat_clean
 
 
@@ -184,22 +195,23 @@ class GhostActor(nn.Module):
 
 class GhostCritic(nn.Module):
     """Independent CNN-based Critic: evaluates each ghost state."""
-    def __init__(self, vec_dim: int = 101):
+    def __init__(self, vec_dim: int = CRITIC_VEC_DIM):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(5, 64, 7, padding=3),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(GLOBAL_SPATIAL_CH, 64, 7, padding=3),
+            nn.GroupNorm(8, 64),
             nn.ReLU(),
             nn.Conv2d(64, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(8, 128),
             nn.ReLU(),
             nn.Conv2d(128, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(8, 128),
             nn.ReLU(),
         )
         self.vec_mlp = nn.Sequential(
-            nn.Linear(vec_dim, 256), nn.GELU(),
-            nn.Linear(256, 128), nn.GELU(),
+            nn.Linear(vec_dim, 512), nn.LayerNorm(512), nn.GELU(),
+            nn.Linear(512, 256),     nn.LayerNorm(256), nn.GELU(),
+            nn.Linear(256, 128),     nn.LayerNorm(128), nn.GELU(),
         )
         self.head = nn.Sequential(
             nn.Linear(128 + 128, 128), nn.GELU(),
@@ -207,10 +219,16 @@ class GhostCritic(nn.Module):
             nn.Linear(64, 1),
         )
 
-    def forward(self, spatial, vector):
+    def encode_spatial(self, spatial):
         x = self.stem(spatial)
-        pool = F.adaptive_avg_pool2d(x, 1).flatten(1)
+        return F.adaptive_avg_pool2d(x, 1).flatten(1)
+
+    def forward_from_pool(self, pool, vector):
         vec = self.vec_mlp(vector)
         tokens = torch.cat([pool, vec], dim=-1)
         return self.head(tokens)
+
+    def forward(self, spatial, vector):
+        pool = self.encode_spatial(spatial)
+        return self.forward_from_pool(pool, vector)
 

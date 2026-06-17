@@ -44,7 +44,7 @@ MAX_RAY_DIST      = 10
 UNKNOWN           = -1
 MEMORY_FRAMES     = 10
 HEARTBEAT_EVERY   = 5
-HEARTBEAT_TIMEOUT = 60
+HEARTBEAT_TIMEOUT = 25
 RESYNC_EVERY      = 50
 OSCILLATION_WINDOW = 8   #position history length to prevent oscillations
 
@@ -60,7 +60,7 @@ class Ghost:
         self.prev_row, self.prev_col = pos
         self.color = color
         self.dead = False
-        self.move_counter = 0
+        self.in_fallback_mode = False
         self.move_every = 2
         self.last_dir = random.choice(DIRS)
         rows = len(grid)
@@ -107,19 +107,46 @@ class Ghost:
         self._broadcast(diffs, all_ghosts)
         self._process_messages(all_ghosts)
         self.belief_map.update_safety_map(self.known_agents, self.frame, powered=self.pacman_powered)
-        self.move_counter += 1
-        if self.move_counter < self.move_every:
+        if self.frame % self.move_every != 0:
             return newly_discovered, stale_refreshed
-        self.move_counter = 0
         if skip_movement:
             self.pos_history.append((self.row, self.col))
             self._check_oscillation()
             return newly_discovered, stale_refreshed
         #CBBA: get active task and move toward target
         active_task = self.cbba_agent.step(self, self.frame)
+        if active_task and self.pacman_powered and active_task.task_type == TaskType.HUNT:
+            active_task = None
+            
         moved = False
         if active_task is not None:
-            nxt = next_step(self.grid, (self.row, self.col), active_task.target_pos)
+            target = active_task.target_pos
+            if getattr(self, '_committed_target', None) != target or not getattr(self, '_committed_path', []):
+                from pathfinder import astar
+                full_path = astar(self.grid, (self.row, self.col), target)
+                if len(full_path) >= 2:
+                    self._committed_path = full_path[1:]
+                    self._committed_target = target
+                else:
+                    self._committed_path = []
+                    
+            nxt = None
+            while hasattr(self, '_committed_path') and self._committed_path:
+                cand = self._committed_path.pop(0)
+                if self.grid[cand[0]][cand[1]] != WALL:
+                    nxt = cand
+                    break
+                else:
+                    from pathfinder import astar
+                    full_path = astar(self.grid, (self.row, self.col), target)
+                    if len(full_path) >= 2:
+                        self._committed_path = full_path[1:]
+                        self._committed_target = target
+                        nxt = self._committed_path.pop(0)
+                    else:
+                        self._committed_path = []
+                    break
+                    
             if (nxt is not None and nxt != (self.row, self.col) and self.grid[nxt[0]][nxt[1]] != WALL):
                 if self.pacman_powered and self.known_pacman is not None and nxt == self.known_pacman:
                     pass
@@ -130,6 +157,7 @@ class Ghost:
                     if self.grid[self.row][self.col] == POWER:
                         self.grid[self.row][self.col] = PELLET
                     moved = True
+        self.in_fallback_mode = not moved
         if not moved:
             rows = len(self.grid)
             cols = len(self.grid[0])
@@ -159,49 +187,19 @@ class Ghost:
         if len(self.pos_history) < OSCILLATION_WINDOW:
             return
         cur = (self.row, self.col)
-        if self.pos_history.count(cur) < 2:
-            return
-        if self.known_pacman is None and self.last_lost_pacman is not None:
-            self.last_lost_pacman = None
-            self.pos_history.clear()  
-
-    def get_target_proximity_channel(self):
-        rows = len(self.personal_map)
-        cols = len(self.personal_map[0])
-        channel = np.zeros((rows, cols), dtype=np.float32)
-        if not getattr(self.belief_map, '_initialised', False):
-            return channel
-        target = self.known_pacman or self.last_lost_pacman
-        if target is None:
-            top = self.belief_map.top_cells(n=1)
-            if top:
-                target = top[0]
-        if target is None:
-            self._proximity_channel_cache = channel
-            self._proximity_channel_frame = self.frame
-            self._proximity_channel_target = None
-            return channel
-        if self._proximity_channel_frame == self.frame and self._proximity_channel_target == target and self._proximity_channel_cache is not None:
-            return self._proximity_channel_cache
-        if self.frame % self.move_every != 0 and self._proximity_channel_cache is not None:
-            return self._proximity_channel_cache
-        dists = dijkstra_multi(self.grid, (self.row, self.col), [target])
-        info = dists.get(target)
-        if not info or info[0] == math.inf:
-            self._proximity_channel_cache = channel
-            self._proximity_channel_frame = self.frame
-            self._proximity_channel_target = target
-            return channel
-        max_d = info[0] if info[0] > 0 else 1.0
-        all_targets = [(r, c) for r in range(rows) for c in range(cols) if self.personal_map[r][c] not in (1, -1)]
-        all_dists = dijkstra_multi(self.grid, target, all_targets)
-        for (r, c), (d, _) in all_dists.items():
-            if d != math.inf:
-                channel[r, c] = max(0.0, min(1.0, 1.0 - d / (max_d * 3.0)))
-        self._proximity_channel_cache = channel
-        self._proximity_channel_frame = self.frame
-        self._proximity_channel_target = target
-        return channel
+        
+        # 1. Clear stale pacman memory
+        if self.pos_history.count(cur) >= 2:
+            if self.known_pacman is None and self.last_lost_pacman is not None:
+                self.last_lost_pacman = None
+                self.pos_history.clear()
+                
+        # 2. Break physical movement loops
+        if self.pos_history.count(cur) >= 3:
+            # Drop current task to force re-evaluation
+            self.cbba_agent.bundle.clear()
+            self.cbba_agent.path.clear()
+            self.pos_history.clear()
 
     def _check_liveness(self, all_ghosts):
         for gid in list(self.last_heartbeat.keys()):

@@ -19,11 +19,11 @@ from ghost  import Ghost, GHOST_COLORS
 import pathfinder
 from obs    import (build_spatial, build_vector, build_valid_mask,
                     actions_to_tasks, MAX_H, MAX_W, MAX_GHOSTS, UNKNOWN,
-                    SPATIAL_CH)
+                    SPATIAL_CH, VEC_DIM)
 from reward import RewardShaper
 from allocator import generate_tasks as heuristic_generate_tasks
 
-DECISION_INTERVAL = 5   # frames between RL decisions (= CBBA AUCTION_EVERY)
+DECISION_INTERVAL = 6   # frames between RL decisions (= CBBA AUCTION_EVERY)
 NOM_DECAY = 0.8          # exponential decay on recent-nomination map
 
 # Default curriculum params (full grid)
@@ -100,7 +100,7 @@ class Env:
         for gid in self.ghosts:
             g = self.ghosts[gid]
             if not g.dead:
-                h_tasks = heuristic_generate_tasks(g, self.frame)
+                h_tasks, _ = heuristic_generate_tasks(g, self.frame)
                 target = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
                 for t in h_tasks[:3]:
                     r, c = t.target_pos
@@ -109,11 +109,11 @@ class Env:
                         # Gaussian blur for soft BC targets
                         for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
                             nr, nc = r + dr, c + dc
-                            if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols:
+                            if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols and self.grid[nr][nc] != 1:
                                 target[nr, nc] += t.score * 0.5
                         for dr, dc in [(-1,-1), (-1,1), (1,-1), (1,1)]:
                             nr, nc = r + dr, c + dc
-                            if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols:
+                            if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols and self.grid[nr][nc] != 1:
                                 target[nr, nc] += t.score * 0.25
                 self._cached_ht[gid] = target
         return self.observe()
@@ -132,8 +132,6 @@ class Env:
         grid_shape       : (rows, cols) int tuple   — for padding on GPU side
         """
         alive = [gid for gid, g in self.ghosts.items() if not g.dead]
-        cbba = {gid: g.cbba_agent.get_active_task()
-                for gid, g in self.ghosts.items()}
 
         sp, ve, vm, ht = [], [], [], []
         R, C = self.grid_rows, self.grid_cols
@@ -144,7 +142,7 @@ class Env:
         for gid in alive:
             g = self.ghosts[gid]
             sp.append(build_spatial(g, self.recent_nom[gid], R, C))
-            ve.append(build_vector(g, cbba))
+            ve.append(build_vector(g))
             vm.append(build_valid_mask(g, R, C))
 
             # Use cached heuristic target (computed at auction boundary in step())
@@ -156,7 +154,7 @@ class Env:
 
         if not alive:
             z = lambda s: np.zeros(s, dtype=np.float32)
-            return ([], z((0, SPATIAL_CH, R, C)), z((0, 101)),
+            return ([], z((0, SPATIAL_CH, R, C)), z((0, VEC_DIM)),
                     np.zeros((0, R, C), dtype=bool),
                     z((0, R, C)), z((5, R, C)), (R, C))
 
@@ -181,6 +179,31 @@ class Env:
         for gid in alive:
             g = self.ghosts[gid]
 
+            # 1. ALWAYS run heuristic tasks at DECISION_INTERVAL or if missing BC target
+            need_h_tasks = (self.frame % DECISION_INTERVAL == 0) or (gid not in self._cached_ht)
+            h_tasks = None
+            if need_h_tasks:
+                h_tasks, h_dists = heuristic_generate_tasks(g, self.frame)
+                
+                # Update BC target
+                target = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
+                if h_tasks:
+                    for t in h_tasks[:3]:
+                        r, c = t.target_pos
+                        if r < self.grid_rows and c < self.grid_cols:
+                            target[r, c] = t.score
+                            # Gaussian blur for soft BC targets
+                            for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
+                                nr, nc = r + dr, c + dc
+                                if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols and self.grid[nr][nc] != 1:
+                                    target[nr, nc] += t.score * 0.5
+                            for dr, dc in [(-1,-1), (-1,1), (1,-1), (1,1)]:
+                                nr, nc = r + dr, c + dc
+                                if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols and self.grid[nr][nc] != 1:
+                                    target[nr, nc] += t.score * 0.25
+                self._cached_ht[gid] = target
+
+            # 2. Merge RL tasks and auction
             if gid in action_dict:
                 indices, scores_map = action_dict[gid]
 
@@ -189,32 +212,22 @@ class Env:
                     if 0 <= r < self.grid_rows and 0 <= c < self.grid_cols:
                         self.recent_nom[gid][r, c] = 1.0
 
-                tasks = actions_to_tasks(g, scores_map, indices, self.frame)
-                if tasks:
+                if self.frame % DECISION_INTERVAL == 0:
+                    tasks = actions_to_tasks(g, scores_map, indices, self.frame)
                     g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
-                    g.cbba_agent._task_map = {
-                        (int(t.task_type), t.target_pos): t for t in tasks
-                    }
-                    g.cbba_agent._phase1(g, tasks)
-
-            # Refresh heuristic BC targets for ALL alive ghosts, not just those with actions
-            if self.frame % DECISION_INTERVAL == 0 or gid not in self._cached_ht:
-                h_tasks = heuristic_generate_tasks(g, self.frame)
-                target = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
-                for t in h_tasks[:3]:
-                    r, c = t.target_pos
-                    if r < self.grid_rows and c < self.grid_cols:
-                        target[r, c] = t.score
-                        # Gaussian blur for soft BC targets
-                        for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
-                            nr, nc = r + dr, c + dc
-                            if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols:
-                                target[nr, nc] += t.score * 0.5
-                        for dr, dc in [(-1,-1), (-1,1), (1,-1), (1,1)]:
-                            nr, nc = r + dr, c + dc
-                            if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols:
-                                target[nr, nc] += t.score * 0.25
-                self._cached_ht[gid] = target
+                    
+                    # Merge RL tasks with heuristic tasks generated for this auction
+                    all_tasks = h_tasks + tasks
+                    g.cbba_agent._task_map.clear()
+                    
+                    # Only calculate Dijkstra for RL tasks, h_dists already has heuristic distances
+                    if tasks:
+                        all_targets = [t.target_pos for t in tasks]
+                        from pathfinder import dijkstra_multi
+                        dists = dijkstra_multi(g.grid, (g.row, g.col), all_targets)
+                        h_dists.update(dists)
+                        
+                    g.cbba_agent._phase1(g, all_tasks, h_dists)
 
         # run DECISION_INTERVAL frames of game logic
         rewards = {gid: 0.0 for gid in alive}
@@ -237,11 +250,6 @@ class Env:
                     if ghost.dead:
                         continue
                         
-                    # Dense adjacency reward for hunting
-                    dist_to_pac = abs(ghost.row - self.player.row) + abs(ghost.col - self.player.col)
-                    if dist_to_pac == 1 and not self.player.powered and gid in rewards:
-                        rewards[gid] += 1.0
-                        
                     same = (ghost.row == self.player.row
                             and ghost.col == self.player.col)
                     swap = (ghost.row == self.player.prev_row
@@ -258,11 +266,6 @@ class Env:
                             done = True
                             if gid in rewards:
                                 rewards[gid] += 100.0
-                            for o in rewards:
-                                if o != gid:
-                                    status = ghost.known_agents.get(o)
-                                    if status is not None and status != "UNKNOWN":
-                                        rewards[o] += 30.0
                             break
 
             if done:

@@ -25,6 +25,25 @@ _SCIPY_GRAPH_CACHE = {}
 _SCIPY_CACHE_GEN = 0   # monotonic counter
 _SCIPY_GRID_GEN = {}   # id(grid) -> generation_id (for lookup)
 
+def _hash_grid(grid: list) -> str:
+    import numpy as np
+    import hashlib
+    # Treat PELLET (2) as EMPTY (0) for caching, since costs are identical (1.0).
+    # This prevents cache invalidation every time Pacman eats a normal pellet.
+    arr = np.array(grid, dtype=np.int8)
+    arr[arr == 2] = 0
+    return hashlib.md5(arr.tobytes()).hexdigest()
+
+def get_scipy_graph(grid: list):
+    if not _SCIPY_AVAILABLE:
+        return None
+    h = _hash_grid(grid)
+    gen = _SCIPY_GRID_GEN.get(h)
+    if gen is None or gen not in _SCIPY_GRAPH_CACHE:
+        build_scipy_graph(grid)
+        gen = _SCIPY_GRID_GEN.get(h)
+    return _SCIPY_GRAPH_CACHE.get(gen)
+
 def build_scipy_graph(grid: list):
     if not _SCIPY_AVAILABLE:
         return
@@ -60,11 +79,16 @@ def build_scipy_graph(grid: list):
     _SCIPY_CACHE_GEN += 1
     gen = _SCIPY_CACHE_GEN
     _SCIPY_GRAPH_CACHE[gen] = (graph, open_cells, cell_to_idx)
-    _SCIPY_GRID_GEN[id(grid)] = gen
-    # Clean old entries (keep only the latest 4 to handle multiple envs)
-    if len(_SCIPY_GRAPH_CACHE) > 4:
+    grid_hash = _hash_grid(grid)
+    _SCIPY_GRID_GEN[grid_hash] = gen
+    # Clean old entries (keep only the latest 16 to handle multiple envs)
+    if len(_SCIPY_GRAPH_CACHE) > 16:
         oldest = min(_SCIPY_GRAPH_CACHE.keys())
         _SCIPY_GRAPH_CACHE.pop(oldest, None)
+        # Prune grid gen map to prevent memory leak over curriculum progression
+        keys_to_del = [k for k, v in _SCIPY_GRID_GEN.items() if v not in _SCIPY_GRAPH_CACHE]
+        for k in keys_to_del:
+            _SCIPY_GRID_GEN.pop(k, None)
 
 #cell costs for path planning - wall taken to be impassable
 _COST = {EMPTY: 1.0, PELLET: 1.0, POWER: 0.5, UNKNOWN: 3.0, WALL: math.inf}   #unknown territory taken to be passable but 3x more costly than known cells
@@ -129,8 +153,7 @@ def astar(grid: list, start: tuple, goal: tuple) -> list:
 def dijkstra_multi(grid: list, start: tuple, targets: list) -> dict:
     # Try SciPy accelerated path when a precomputed graph for this grid exists
     if _SCIPY_AVAILABLE:
-        gen = _SCIPY_GRID_GEN.get(id(grid))
-        cache = _SCIPY_GRAPH_CACHE.get(gen) if gen is not None else None
+        cache = get_scipy_graph(grid)
         if cache is not None:
             graph, open_cells, cell_to_idx = cache
             # map start and targets to indices

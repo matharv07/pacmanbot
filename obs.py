@@ -19,6 +19,9 @@ MAX_H = 33
 MAX_W = 41
 MAX_GHOSTS   = 7
 SPATIAL_CH   = 16   # number of spatial channels (see channel map below)
+GLOBAL_SPATIAL_CH = 5 # number of channels in the omniscient global state
+VEC_DIM      = 102
+CRITIC_VEC_DIM = MAX_GHOSTS * VEC_DIM + MAX_GHOSTS
 
 # ── Channel map ──────────────────────────────────────────────────────
 #  0  is_wall           4  belief_map       8–13  other ghosts (6 ch)
@@ -86,18 +89,15 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int = None, cols: int = 
             out[7, tr, tc] = 1.0
 
     # 8–13: other ghosts (one channel per slot, skip own gid)
-    ch = 8
     for gid in range(MAX_GHOSTS):
         if gid == ghost.gid:
             continue
+        ch = 8 + (gid if gid < ghost.gid else gid - 1)
         pos = ghost.known_agents.get(gid)
         if pos is not None and pos != "UNKNOWN":
             r, c = pos
             if 0 <= r < rows and 0 <= c < cols:
                 out[ch, r, c] = 1.0
-        ch += 1
-        if ch > 13:
-            break
 
     # 14: staleness (frames since last observation, capped & normalised)
     ls = np.asarray(ghost.last_seen, dtype=np.float32)
@@ -110,15 +110,13 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int = None, cols: int = 
     return out
 
 
-def build_vector(ghost, cbba_tasks: dict) -> np.ndarray:
+def build_vector(ghost) -> np.ndarray:
     """
     Returns flat float32 vector (~100 features).
 
     Parameters
     ----------
     ghost : Ghost
-    cbba_tasks : dict[int, Task | None]
-        Active CBBA task per ghost (gid → Task or None).
     """
     rows = len(ghost.grid)
     cols = len(ghost.grid[0])
@@ -138,6 +136,7 @@ def build_vector(ghost, cbba_tasks: dict) -> np.ndarray:
         f.append(1.0 if st == "UNKNOWN" or st is None else 0.0)
 
     f.append(min(ghost.frame, 2000) / 2000.0)                       # normalised frame
+    f.append(1.0 if getattr(ghost, 'in_fallback_mode', False) else 0.0) # fallback flag
 
     # ── own CBBA bundle (up to 3 tasks, 10 features each) ───────────
     def _enc(t):
@@ -147,7 +146,7 @@ def build_vector(ghost, cbba_tasks: dict) -> np.ndarray:
         v[int(t.task_type)] = 1.0       # one-hot type (0-4)
         v[5] = t.target_pos[0] / rows
         v[6] = t.target_pos[1] / cols
-        v[7] = t.score
+        v[7] = min(max(t.score, -5.0), 5.0) / 5.0
         v[8] = min(ghost.frame - t.created_frame, 200) / 200.0
         v[9] = 1.0                       # valid flag
         return v
@@ -166,7 +165,7 @@ def build_vector(ghost, cbba_tasks: dict) -> np.ndarray:
     for gid in range(MAX_GHOSTS):
         if gid == ghost.gid:
             continue
-        f.extend(_enc(cbba_tasks.get(gid)))
+        f.extend(_enc(ghost.cbba_agent.get_known_task_for(gid)))
 
     return np.asarray(f, dtype=np.float32)
 
@@ -176,7 +175,7 @@ def build_valid_mask(ghost, rows: int = None, cols: int = None) -> np.ndarray:
     if rows is None or cols is None:
         rows, cols = ghost.personal_map.shape
     p = ghost.personal_map
-    mask = (p != WALL) & (p != UNKNOWN)
+    mask = (p != WALL)
     return mask
 
 
@@ -216,7 +215,7 @@ def actions_to_tasks(ghost, scores_map: np.ndarray,
             tt = TaskType.DYNAMIC
 
         tasks.append(Task(task_type=tt, target_pos=(r, c),
-                          score=score, created_frame=frame))
+                          score=score, created_frame=frame, owner=ghost.gid))
     return tasks
 
 def build_global_spatial(env, rows, cols) -> np.ndarray:
