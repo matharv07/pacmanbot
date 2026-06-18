@@ -47,7 +47,6 @@ RIGHT = ( 0,  1)
 DIRS  = [UP, DOWN, LEFT, RIGHT]
 
 AUTO_MODE = False
-USE_HEURISTIC_TASKS = True #set False to let RL completely control the auction
 RL_MODE = True
 TOGGLE_WIDTH, TOGGLE_HEIGHT = 160, 32
 TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH * 2 - 20, ROWS * CELL + 8, TOGGLE_WIDTH, TOGGLE_HEIGHT)
@@ -556,13 +555,8 @@ class Game:
                                 self.recent_nom[gid][r, c] = 1.0
                         tasks = actions_to_tasks(g, scores_map, indices, self.frame_counter)
                         g.cbba_agent._last_auction = self.frame_counter
-                        from allocator import generate_tasks as heuristic_generate_tasks
-                        h_tasks, h_dists = heuristic_generate_tasks(g, self.frame_counter)
-                        if USE_HEURISTIC_TASKS:
-                            all_tasks = h_tasks + tasks
-                        else:
-                            all_tasks = tasks
-                            h_dists = {}
+                        all_tasks = tasks
+                        h_dists = {}
                         g.cbba_agent._task_map.clear()
                         if tasks:
                             all_targets = [t.target_pos for t in tasks]

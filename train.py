@@ -23,7 +23,7 @@ from curriculum import CurriculumScheduler, STAGES
 
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 
-NUM_ENVS        = 8
+NUM_ENVS        = 10
 ROLLOUT_STEPS   = 256
 MINI_BATCH      = 2048  # Increased to saturate GPU throughput
 PPO_EPOCHS      = 12    # Kept at 12 to maximize learning per rollout
@@ -107,7 +107,11 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
     while True:
         cmd, data = conn.recv()
         if cmd == "step":
-            result = env.step(data)
+            if isinstance(data, tuple) and len(data) == 2:
+                a, bc_prob = data
+                result = env.step(a, bc_prob)
+            else:
+                result = env.step(data)
             obs, rew, done, info = result
             if done:
                 obs = env.reset()
@@ -178,16 +182,16 @@ class VecEnv:
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
         return self.current_obs
 
-    def step(self, actions: list[dict]):
+    def step(self, actions: list[dict], bc_prob: float = 0.0):
         if not actions:
             print("vec_env.step() with empty actions")
             for p in self.parent:
-                p.send(("step", {}))
+                p.send(("step", ({}, bc_prob)))
             results = _recv_unordered(self.parent, procs=self.procs)
             print("vec_env.step() returned")
         else:
             for p, a in zip(self.parent, actions):
-                p.send(("step", a))
+                p.send(("step", (a, bc_prob)))
             results = _recv_unordered(self.parent, procs=self.procs)
         obs_list, rew_list, done_list, info_list = [], [], [], []
         for i, (obs, rew, done, info) in enumerate(results):
@@ -296,7 +300,7 @@ def train():
     print("VecEnv initialized. Starting training...")
     t0 = time.time()
 
-    def ppo_worker(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_act, b_olp, b_adv, b_ret, lam_bc, mean_ret, mean_pac, episodes, total_steps, t_rollout, t0_ref):
+    def ppo_worker(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_act, b_olp, b_adv, b_ret, lam_bc, mean_ret, mean_pac, episodes, total_steps, t_rollout, t0_ref, bc_prob, realized_merge_rate):
         t_ppo_start = time.time()
         metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "n_batches": 0}    
         N_total = b_sp.shape[0]
@@ -378,10 +382,13 @@ def train():
                 metrics["n_batches"]  += 1
         t_ppo = time.time() - t_ppo_start
         result_queue.put({"update": update, "metrics": metrics,"mean_ret": mean_ret, "mean_pac": mean_pac,
-        "episodes": episodes,"total_steps": total_steps, "t_rollout": t_rollout, "t_ppo": t_ppo, "lam_bc": lam_bc, "wall_s": round(time.time() - t0_ref, 1)})
+        "episodes": episodes,"total_steps": total_steps, "t_rollout": t_rollout, "t_ppo": t_ppo, "lam_bc": lam_bc, "bc_prob": bc_prob, "realized_merge_rate": realized_merge_rate, "wall_s": round(time.time() - t0_ref, 1)})
     current_returns = [0.0] * NUM_ENVS
     batch_transfer = BatchTransfer(DEVICE)
     for update in range(start_update, 50_001):
+        decay_step_curr = max(0, update - 50)
+        anneal_frac = math.exp(-decay_step_curr / BC_ANNEAL_UPDATES)
+        bc_prob = anneal_frac if anneal_frac >= 0.05 else 0.0
         if update == 51:
             print("Transitioning to moving Pacman (static_pacman = False)...")
             vec_env.set_curriculum(stage.rows, stage.cols, stage.n_ghosts, stage.n_power, static_pacman=False)
@@ -403,6 +410,8 @@ def train():
         buf_gids      = [[] for _ in range(NUM_ENVS)]
         ep_returns       = []
         ep_pacman_scores = []
+        ep_heuristic_merges = 0
+        ep_total_auctions = 0
         for _ in range(ROLLOUT_STEPS):
             step_actions = [{}] * NUM_ENVS
             #collect all alive ghosts across all environments
@@ -503,7 +512,7 @@ def train():
                     v_dict = {gids[i]: float(e_val[i]) for i in range(n_g)}
                     buf_values[e].append(v_dict)
                     offset += n_g
-            obs_list, rew_list, done_list, info_list = vec_env.step(step_actions)
+            obs_list, rew_list, done_list, info_list = vec_env.step(step_actions, bc_prob)
             for e in range(NUM_ENVS):
                 r = rew_list[e]
                 mean_r = sum(r.values()) / max(1, len(r)) if r else 0.0
@@ -514,6 +523,8 @@ def train():
                     episodes += 1
                     ep_returns.append(current_returns[e])
                     ep_pacman_scores.append(info_list[e].get("pacman_score", 0))
+                    ep_heuristic_merges += info_list[e].get("heuristic_merges", 0)
+                    ep_total_auctions += info_list[e].get("total_auctions", 0)
                     current_returns[e] = 0.0
         total_steps += ROLLOUT_STEPS * NUM_ENVS
         boot_sp, boot_gsp_unique, boot_ve, boot_cve, boot_vm = [], [], [], [], []
@@ -619,9 +630,8 @@ def train():
         indices = np.arange(N_total)
         #normalize advantages GLOBALLY across the entire batch, not per-minibatch
         ds_adv = (ds_adv - ds_adv.mean()) / (ds_adv.std() + 1e-8)
-        #BC coefficient: starts at BC_INIT, decays using BC_ANNEAL_UPDATES as the time constant
-        decay_step = max(0, update - 50)
-        lam_bc = max(BC_FLOOR, BC_INIT * math.exp(-decay_step / BC_ANNEAL_UPDATES))
+        lam_bc = max(BC_FLOOR, BC_INIT * anneal_frac)
+        realized_merge_rate = (ep_heuristic_merges / ep_total_auctions) if ep_total_auctions > 0 else 0.0
         t_rollout = time.time() - t_start_rollout
         mean_ret = round(float(np.mean(ep_returns)), 3) if ep_returns else None
         mean_pac = round(float(np.mean(ep_pacman_scores)), 1) if ep_pacman_scores else None
@@ -645,6 +655,8 @@ def train():
                 "bc_loss":    round(m["bc_loss"] / nb, 5),
                 "entropy":    round(m["entropy"] / nb, 5),
                 "bc_coef":    round(res["lam_bc"], 4),
+                "bc_prob":    round(res["bc_prob"], 4),
+                "merge_rate": round(res["realized_merge_rate"], 4),
                 "mean_return": res["mean_ret"],
                 "pacman_score": res["mean_pac"],
                 "curriculum_stage": curriculum.stage_idx,
@@ -652,7 +664,7 @@ def train():
             }
             with open(log_path, "a") as f:
                 f.write(json.dumps(row) + "\n")
-            if res["lam_bc"] <= 0.05:
+            if res["lam_bc"] <= 0.02:
                 curriculum.record_return(res["mean_ret"])
             else:
                 curriculum.record_return(None)
@@ -665,9 +677,7 @@ def train():
                       f"({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts)")
                 print(f"{'='*60}\n")
                 is_static_pacman = (p_up <= 50)
-                vec_env.set_curriculum(stage.rows, stage.cols,
-                                      stage.n_ghosts, stage.n_power,
-                                      static_pacman=is_static_pacman)
+                vec_env.set_curriculum(stage.rows, stage.cols,stage.n_ghosts, stage.n_power, static_pacman=is_static_pacman)
                 current_returns = [0.0] * NUM_ENVS
                 for pg in opt_actor.param_groups:
                     pg['lr'] *= 0.5
@@ -682,7 +692,7 @@ def train():
                 runtime = f"{hrs}h {mins:02d}m {secs:02d}s" if hrs else f"{mins}m {secs:02d}s"
                 if res["lam_bc"] > 0.25:
                     phase = "\033[95mHybrid RL + IL\033[0m"
-                elif res["lam_bc"] > 0.05:
+                elif res["lam_bc"] > 0.02:
                     phase = "\033[93mIL → RL Transition\033[0m"
                 else:
                     phase = "\033[92mReinforcement Learning\033[0m"
@@ -692,7 +702,8 @@ def train():
                 print(f"│  Phase: {phase}   Curriculum: Stage {curriculum.stage_idx} ({stg.rows}×{stg.cols}, {stg.n_ghosts}g)")
                 print(f"│  Episodes: {res['episodes']:<8}  Steps: {res['total_steps']:<10}  LR: {cur_lr:.2e}")
                 print(f"│  BC Coef:   {res['lam_bc']:.4f}    Policy Loss: {row['actor_loss']:>+.5f}")
-                print(f"│  Value Loss: {row['value_loss']:.5f}   BC Loss: {row['bc_loss']:.5f}   Entropy: {row['entropy']:.5f}")
+                print(f"│  BC Prob:   {res['bc_prob']:.4f} ({row['merge_rate']:.1%} merge)    Value Loss: {row['value_loss']:.5f}")
+                print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f}")
                 ret_str = f"{row['mean_return']:.3f}" if row['mean_return'] is not None else "—"
                 pac_str = f"{row['pacman_score']:.1f}" if row['pacman_score'] is not None else "—"
                 print(f"│  Ghost Return: {ret_str:<10}  Pacman Score: {pac_str}")
@@ -713,7 +724,7 @@ def train():
                 print(f"  💾 Checkpoint saved: {path}")
         train_thread = threading.Thread(target=ppo_worker, args=(
             update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_act, ds_olp, ds_adv, ds_ret,
-            lam_bc, mean_ret, mean_pac, episodes, total_steps, t_rollout, t0))
+            lam_bc, mean_ret, mean_pac, episodes, total_steps, t_rollout, t0, bc_prob, realized_merge_rate))
         train_thread.start()
     if train_thread is not None:
         train_thread.join()

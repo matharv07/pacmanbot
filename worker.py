@@ -6,6 +6,7 @@ collects per-ghost rewards, and exposes observations + heuristic BC targets.
 """
 
 import os
+import random
 import numpy as np
 import pacman as _pac
 from pacman import generate_map, Player, WALL, PELLET, POWER, EMPTY
@@ -21,7 +22,6 @@ _pac.AUTO_MODE = True
 
 DECISION_INTERVAL = 6      #frames between RL decisions (= CBBA AUCTION_EVERY)
 NOM_DECAY = 0.8            #exponential decay on recent-nomination map
-USE_HEURISTIC_TASKS = True #set False to let RL completely control the auction
 
 _DEFAULT_ROWS = 33
 _DEFAULT_COLS = 41
@@ -126,7 +126,9 @@ class Env:
                     z((0, R, C)), z((5, R, C)), (R, C))
         return (alive, np.stack(sp), np.stack(ve), np.stack(vm), np.stack(ht), global_sp, (R, C))
 
-    def step(self, action_dict: dict):
+    def step(self, action_dict: dict, bc_prob: float = 0.0):
+        info_heuristic_merges = 0
+        info_total_auctions = 0
         alive = [gid for gid, g in self.ghosts.items() if not g.dead]
         for gid in alive:
             g = self.ghosts[gid]
@@ -159,11 +161,13 @@ class Env:
                 if self.frame % DECISION_INTERVAL == 0:
                     tasks = actions_to_tasks(g, scores_map, indices, self.frame)
                     g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
-                    if USE_HEURISTIC_TASKS:
+                    if random.random() < bc_prob:
                         all_tasks = h_tasks + tasks
+                        info_heuristic_merges += 1
                     else:
                         all_tasks = tasks
                         h_dists = {}
+                    info_total_auctions += 1
                     g.cbba_agent._task_map.clear()
                     #only calculate Dijkstra for RL tasks, h_dists already has heuristic distances
                     if tasks:
@@ -214,4 +218,4 @@ class Env:
             if not g.dead and gid in rewards:
                 rewards[gid] += self.shaper.shaping(g, self.ghosts)
         obs = self.observe() if not done else None
-        return obs, rewards, done, {"pacman_score": getattr(self.player, "score", 0)}
+        return obs, rewards, done, {"pacman_score": getattr(self.player, "score", 0), "heuristic_merges": info_heuristic_merges, "total_auctions": info_total_auctions}
