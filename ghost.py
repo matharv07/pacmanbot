@@ -117,7 +117,6 @@ class Ghost:
         active_task = self.cbba_agent.step(self, self.frame)
         if active_task and self.pacman_powered and active_task.task_type == TaskType.HUNT:
             active_task = None
-            
         moved = False
         if active_task is not None:
             target = active_task.target_pos
@@ -129,7 +128,6 @@ class Ghost:
                     self._committed_target = target
                 else:
                     self._committed_path = []
-                    
             nxt = None
             while hasattr(self, '_committed_path') and self._committed_path:
                 cand = self._committed_path.pop(0)
@@ -146,7 +144,6 @@ class Ghost:
                     else:
                         self._committed_path = []
                     break
-                    
             if (nxt is not None and nxt != (self.row, self.col) and self.grid[nxt[0]][nxt[1]] != WALL):
                 if self.pacman_powered and self.known_pacman is not None and nxt == self.known_pacman:
                     pass
@@ -187,16 +184,12 @@ class Ghost:
         if len(self.pos_history) < OSCILLATION_WINDOW:
             return
         cur = (self.row, self.col)
-        
-        # 1. Clear stale pacman memory
         if self.pos_history.count(cur) >= 2:
             if self.known_pacman is None and self.last_lost_pacman is not None:
                 self.last_lost_pacman = None
                 self.pos_history.clear()
-                
-        # 2. Break physical movement loops
         if self.pos_history.count(cur) >= 3:
-            # Drop current task to force re-evaluation
+            #drop current task to force re-evaluation if found oscillating
             self.cbba_agent.bundle.clear()
             self.cbba_agent.path.clear()
             self.pos_history.clear()
@@ -342,17 +335,14 @@ class Ghost:
                         ghost._send_full_sync(self)
 
     def _send_full_sync(self, target_ghost):
-        # Delta-compressed sync: only send cells changed since last sync to this peer
         last = self._last_synced_map.get(target_ghost.gid)
         if last is not None:
             changed = (self.personal_map != last) & (self.personal_map != UNKNOWN)
             rs, cs = np.nonzero(changed)
         else:
-            # First sync: send all known cells
             mask = self.personal_map != UNKNOWN
             rs, cs = np.nonzero(mask)
         sync_diffs = [("cell", int(r), int(c), int(self.personal_map[r, c])) for r, c in zip(rs, cs)]
-        # Snapshot current state for this peer
         self._last_synced_map[target_ghost.gid] = self.personal_map.copy()
         #iterate through agent positions and liveness
         for gid, pos in self.known_agents.items():

@@ -1,14 +1,13 @@
 """
 Potential-based reward shaping for the MAPPO ghost pursuit pipeline.
 
-Every shaping term is formulated as  r(t) = Φ(s_{t+1}) − Φ(s_t)  so that
-the optimal policy is invariant to the shaping (Ng et al., 1999).
+Every shaping term is formulated as  r(t) = Φ(s_{t+1}) - Φ(s_t), so that
+the optimal policy is invariant to the shaping (Ng et al., 1999)
 """
 
 import math
 import numpy as np
 from pathfinder import dijkstra_multi
-
 
 class RewardShaper:
     """Tracks per-ghost potentials and returns the shaping delta each step."""
@@ -32,8 +31,6 @@ class RewardShaper:
         self.gamma    = gamma
         self._prev: dict[int, float] = {}
 
-    # ── individual potential components ───────────────────────────────
-
     @staticmethod
     def _pac_target(ghost):
         t = ghost.known_pacman
@@ -52,23 +49,19 @@ class RewardShaper:
         target = self._pac_target(ghost)
         if target is None:
             return 0.0
-        # Use cached Dijkstra distance if available (from CBBA auction)
+        #use cached Dijkstra distance if available (from CBBA auction)
         if hasattr(ghost, 'cbba_agent') and target in ghost.cbba_agent._dist_cache:
             d = ghost.cbba_agent._dist_cache[target]
             if math.isinf(d) or math.isnan(d):
                 d = abs(ghost.row - target[0]) + abs(ghost.col - target[1])
         else:
-            # Fallback to Manhattan if cache miss
+            #fallback to manhattan if cache miss
             d = abs(ghost.row - target[0]) + abs(ghost.col - target[1])
-        
         if math.isinf(d) or math.isnan(d):
             d = 999.0
-            
         if getattr(ghost, 'pacman_powered', False):
             return 0.0
-            
         diag = math.hypot(len(ghost.grid), len(ghost.grid[0]))
-
         return -self.alpha * (d / diag)
 
     def _phi_surround(self, ghost, all_ghosts) -> float:
@@ -95,11 +88,11 @@ class RewardShaper:
         return self.beta * (1.0 - R)
 
     def _phi_explore(self, ghost) -> float:
-        # Fraction of open cells known (0-1), NOT raw counts — keeps scale O(1)
+        #fraction of open cells known (0-1), NOT raw counts — keeps scale O(1)
         p = ghost.personal_map
-        # Use total grid size for a monotonic denominator, as dynamically counting non-walls changes during exploration
+        #use total grid size for a monotonic denominator, as dynamically counting non-walls changes during exploration
         total_open = p.shape[0] * p.shape[1]
-        known = np.sum((p != -1) & (p != 1))   # not unknown, not wall
+        known = np.sum((p != -1) & (p != 1))   #not unknown, not wall
         return self.gamma_ex * (known / total_open)
 
     def _phi_belief(self, ghost) -> float:
@@ -112,16 +105,10 @@ class RewardShaper:
         entropy = -float(np.sum(p * np.log(p + 1e-12)))
         return -self.delta * entropy
 
-    # ── combined potential ────────────────────────────────────────────
-
     def potential(self, ghost, all_ghosts) -> float:
-        return (self._phi_hunt(ghost)
-                + self._phi_surround(ghost, all_ghosts)
-                + self._phi_explore(ghost)
-                + self._phi_belief(ghost))
+        return (self._phi_hunt(ghost) + self._phi_surround(ghost, all_ghosts) + self._phi_explore(ghost) + self._phi_belief(ghost))
 
     def shaping(self, ghost, all_ghosts) -> float:
-        """Call once per decision step AFTER the environment has advanced."""
         phi = self.potential(ghost, all_ghosts)
         gid = ghost.gid
         if gid not in self._prev:

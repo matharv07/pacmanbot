@@ -14,14 +14,14 @@ LOS_CERTAINTY      = 0.99   #trust in a direct sighting
 LOST_SPREAD        = 0.60   #how to spread out probability if we lose sight of pacman
 COMPRESS_THRESHOLD = 0.0005 #cells below this are omitted from payload
 
-DANGER_SIGMA       = 6.0    #Gaussian variance cells for ghost danger falloff
+DANGER_SIGMA       = 6.0    #gaussian variance cells for ghost danger falloff
 STALENESS_DECAY    = 40.0   #frames half-life for un-refreshed ghost positions
 UNSEEN_GHOST_PRIOR = 0.30   #PRIOR danger weight for a ghost whose position is unknown
 PRIOR_UNIFORM_WT   = 1.0    #weight of the uniform PRIOR
 MIN_SAFETY         = 1e-6   #minimum safety per cell to avoid divide-by-zero in normalisation and -infinity in logloss calc
 SAFETY_RECOMPUTE_EVERY = 3  #recompute safety map at most every N frames;
 
-HUNT_SIGMA         = 5.0    #Gaussian variance for attraction falloff toward ghosts
+HUNT_SIGMA         = 5.0    #gaussian variance for attraction falloff toward ghosts
 HUNT_CROWD_WEIGHT  = 0.4    #blend factor for crowd scoring vs proximal scoring: 0.0 = pure proximal, 1.0 = pure crowd, 0.4 = blend
 
 class BeliefMap:
@@ -57,7 +57,6 @@ class BeliefMap:
         self.last_known_dir: tuple = (0, 0)
         self.frames_since_sighting: int = 9999
         self._pacman_start: Optional[tuple] = pacman_start
-        
         self._open_cells: list[tuple] = []
         self._neighbours: dict[tuple, list[tuple]] = {}
         DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
@@ -72,7 +71,6 @@ class BeliefMap:
                     if (0 <= nr < self.rows and 0 <= nc < self.cols and self.grid[nr][nc] != WALL):
                         nbrs.append((nr, nc))
                 self._neighbours[(r, c)] = nbrs
-
         self._topology_dirty = True
         self._open_arr = np.empty((0, 2), dtype=np.int32)
         self._open_idx = np.full((self.rows, self.cols), -1, dtype=np.int32)
@@ -86,7 +84,7 @@ class BeliefMap:
         self._last_ghost_snapshot: dict = {}     #store last known ghost positions for bayesian modelling
         self._ghost_last_seen: dict[int, int] = {}
         self._topology_dirty = False
-        self._dirty_cells: set = set()  # accumulate cell changes, rebuild once
+        self._dirty_cells: set = set()
         #throttle tracking - skips recompute if nothing changed
         self._last_safety_frame: int = -999
         self._last_powered: bool = False
@@ -99,7 +97,7 @@ class BeliefMap:
         if self.grid[r][c] == WALL:
             return
         total = float(self._b_flat.sum()) or 1.0
-        # Scale all cells down, then spike the observed cell
+        #scale all cells down, then spike the observed cell
         self._b_flat *= (1.0 - LOS_CERTAINTY)
         idx = int(self._open_idx[r, c])
         if idx >= 0:
@@ -113,16 +111,15 @@ class BeliefMap:
 
     def observe_lost(self, last_pos: tuple):
         self._ensure_initialised()
-        r, c       = last_pos
+        r, c = last_pos
         if self.grid[r][c] == WALL:
             return
-        outgoing   = self._b[r][c] * LOST_SPREAD
-        neighbours = [n for n in self._neighbours.get((r, c), [])
-                      if self.grid[n[0]][n[1]] != WALL]
+        outgoing = self._b[r][c] * LOST_SPREAD
+        neighbours = [n for n in self._neighbours.get((r, c), []) if self.grid[n[0]][n[1]] != WALL]
         if neighbours and self.last_known_dir != (0, 0):
-            dr, dc   = self.last_known_dir
-            weights  = {}
-            total_w  = 0.0
+            dr, dc = self.last_known_dir
+            weights = {}
+            total_w = 0.0
             for nr, nc in neighbours:
                 alignment = (nr - r) * dr + (nc - c) * dc
                 w = max(0.0, alignment + 1.0)
@@ -132,7 +129,7 @@ class BeliefMap:
                 for (nr, nc), w in weights.items():
                     self._b[nr][nc] += outgoing * (w / total_w)
                 self._b[r][c] -= outgoing
-        self.last_known_pos        = last_pos
+        self.last_known_pos = last_pos
         self.frames_since_sighting = 0
         self._normalise()
         self._payload_dirty = True
@@ -141,14 +138,14 @@ class BeliefMap:
         self._ensure_initialised()
         if not visible_cells or self._open_arr.size == 0:
             return
-        vis_arr = np.array(list(visible_cells), dtype=np.int32)  # (K, 2)
-        # Remove pacman's cell from the clear set
+        vis_arr = np.array(list(visible_cells), dtype=np.int32)
+        #remove pacman's cell from the clear set
         if pacman_pos is not None:
             keep = ~((vis_arr[:, 0] == pacman_pos[0]) & (vis_arr[:, 1] == pacman_pos[1]))
             vis_arr = vis_arr[keep]
         if vis_arr.size == 0:
             return
-        # Look up flat indices for each visible cell
+        #look up flat indices for each visible cell
         idxs = self._open_idx[vis_arr[:, 0], vis_arr[:, 1]]
         valid = idxs >= 0
         idxs = idxs[valid]
@@ -159,7 +156,6 @@ class BeliefMap:
         self._normalise()
 
     def diffuse(self, ghost_pos: tuple):
-        # Flush any accumulated topology changes ONCE per frame
         if self._dirty_cells:
             self._rebuild_topology()
             self._dirty_cells.clear()
@@ -180,20 +176,18 @@ class BeliefMap:
         confidence = max(MIN_CONFIDENCE, math.exp(-sender_fss / TAU_RECENCY))
         n = len(self._open_arr)
         s_flat = np.full(n, COMPRESS_THRESHOLD / 2.0, dtype=np.float32)
-
-        # Vectorised payload loading — no Python loop
-        keys   = np.array(list(cells.keys()),   dtype=np.int32)   # (K, 2)
-        vals   = np.array(list(cells.values()), dtype=np.float32) # (K,)
-        idxs   = self._open_idx[keys[:, 0], keys[:, 1]]           # (K,) flat indices
-        valid  = idxs >= 0
+        #vectorised payload loading — no python loop
+        keys = np.array(list(cells.keys()), dtype=np.int32)
+        vals = np.array(list(cells.values()), dtype=np.float32)
+        idxs = self._open_idx[keys[:, 0], keys[:, 1]]
+        valid = idxs >= 0
         s_flat[idxs[valid]] = vals[valid]
-
         s_total = float(s_flat.sum())
         if s_total < 1e-9:
             return
         s_flat /= s_total
         log_prior  = np.log(np.maximum(self._b_flat, 1e-12))
-        log_sender = np.log(np.maximum(s_flat,       1e-12))
+        log_sender = np.log(np.maximum(s_flat, 1e-12))
         self._b_flat = np.exp((1.0 - confidence) * log_prior + confidence * log_sender)
         self._sync_flat_to_b()
         lkp = payload.get("lkp")
@@ -207,21 +201,18 @@ class BeliefMap:
         self._ensure_initialised()
         if not self._payload_dirty and self._payload_cache is not None:
             return self._payload_cache
-        # Vectorized: extract indices and values above threshold in one shot
+        #vectorized: extract indices and values above threshold in one shot
         above = self._b_flat >= COMPRESS_THRESHOLD
         if not above.any():
             cells = {}
         else:
             idxs = np.nonzero(above)[0]
             vals = np.round(self._b_flat[idxs], 5)
-            cells = {
-                self._open_cells[int(i)]: float(v)
-                for i, v in zip(idxs, vals)
-            }
+            cells = { self._open_cells[int(i)]: float(v) for i, v in zip(idxs, vals) }
         self._payload_cache = {"cells": cells, "fss": self.frames_since_sighting, "lkp": self.last_known_pos, "lkd": self.last_known_dir}
         self._payload_dirty = False
         return self._payload_cache
-    
+
     def top_cells(self, n: int = 5) -> list[tuple]:
         self._ensure_initialised()
         if len(self._b_flat) == 0:
@@ -269,41 +260,31 @@ class BeliefMap:
         cutoff_steps = int(3.0 * sigma)
         scores = np.zeros((self.rows, self.cols), dtype=np.float32)
         proximal = np.zeros((self.rows, self.cols), dtype=np.float32)
-        
         rs, cs = np.indices((self.rows, self.cols))
-        
         for gr, gc, weight in known_positions:
             dist = np.abs(rs - gr) + np.abs(cs - gc)
             mask = dist <= cutoff_steps
-            
             contrib = np.zeros_like(scores)
             contrib[mask] = weight * np.exp(-(dist[mask] ** 2) / (2.0 * sigma ** 2))
-            
             scores += contrib
             if powered:
                 proximal = np.maximum(proximal, contrib)
-                
         if not powered:
             prior = PRIOR_UNIFORM_WT / n_open
             flat_unknown = n_unknown * (UNSEEN_GHOST_PRIOR / n_open)
             scores += prior + flat_unknown
-            
             max_score = np.max(scores)
             if max_score < MIN_SAFETY:
                 max_score = MIN_SAFETY
-                
             self._safety = 1.0 - (scores / max_score)
             self._safety[self.grid == WALL] = 0.0
         else:
             max_crowd = np.max(scores)
             if max_crowd < MIN_SAFETY: max_crowd = MIN_SAFETY
-                
             max_prox = np.max(proximal)
             if max_prox < MIN_SAFETY: max_prox = MIN_SAFETY
-            
             c_norm = scores / max_crowd
             p_norm = proximal / max_prox
-            
             if hunt_mode == "proximal":
                 self._safety = p_norm
             elif hunt_mode == "crowd":
@@ -383,7 +364,6 @@ class BeliefMap:
             nbr_key = (nr, nc)
             if nbr_key in self._neighbours and pos in self._neighbours[nbr_key]:
                 self._neighbours[nbr_key].remove(pos)
-        # topology_dirty is now handled via _dirty_cells set
 
     def _add_open_cell(self, pos: tuple):
         r, c = pos
@@ -399,7 +379,6 @@ class BeliefMap:
         for nbr in neighbours:
             if nbr in self._neighbours and pos not in self._neighbours[nbr]:
                 self._neighbours[nbr].append(pos)
-        # topology_dirty is now handled via _dirty_cells set
 
     def _compute_topology(self):
         n = len(self._open_cells)
@@ -409,11 +388,9 @@ class BeliefMap:
             self._nbr_idx = np.full((0, 0), -1, dtype=np.int32)
             self._nbr_count = np.zeros(0, dtype=np.int32)
             return
-            
         self._open_arr = np.array(self._open_cells, dtype=np.int32)
         self._open_idx = np.full((self.rows, self.cols), -1, dtype=np.int32)
         self._open_idx[self._open_arr[:, 0], self._open_arr[:, 1]] = np.arange(n, dtype=np.int32)
-        
         nbr_idx_list = []
         nbr_count_list = []
         for cell in self._open_cells:
@@ -421,7 +398,6 @@ class BeliefMap:
             n_idx = [int(self._open_idx[r, c]) for r, c in nbrs]
             nbr_count_list.append(len(n_idx))
             nbr_idx_list.append(n_idx)
-            
         max_nbrs = max(nbr_count_list, default=0)
         self._nbr_idx = np.full((n, max_nbrs), -1, dtype=np.int32)
         for i, idxs in enumerate(nbr_idx_list):
@@ -469,8 +445,6 @@ class BeliefMap:
         self._ensure_initialised()
         if len(self._open_cells) == 0:
             return
-        # _zero_walls removed: walls are already excluded by the topology
-        # system (_open_cells / _b_flat never include wall indices)
         self._sync_b_to_flat()
         total = float(self._b_flat.sum())
         if total < 1e-12:
@@ -483,21 +457,17 @@ class BeliefMap:
 
     def _uniform_diffuse(self):
         if len(self._open_cells) == 0:
-            return
-            
+            return     
         outflow = self._b_flat * ALPHA_UNIFORM
         counts = self._nbr_count
         share = np.zeros_like(outflow)
         valid_mask = counts > 0
         share[valid_mask] = outflow[valid_mask] / counts[valid_mask]
-        
         self._b_flat -= outflow
-        
         for i in range(self._nbr_idx.shape[1]):
             nbrs = self._nbr_idx[:, i]
             valid_nbrs = nbrs >= 0
             np.add.at(self._b_flat, nbrs[valid_nbrs], share[valid_nbrs])
-            
         self._b_flat = np.maximum(0.0, self._b_flat)
         self._sync_flat_to_b()
 
@@ -508,11 +478,9 @@ class BeliefMap:
         if strength < 1e-4:
             return
         dr, dc = self.last_known_dir
-        
         r = self._open_arr[:, 0]
         c = self._open_arr[:, 1]
         push = self._b_flat * strength
-        
         fwd_mask = np.zeros(self._nbr_idx.shape, dtype=bool)
         for j in range(self._nbr_idx.shape[1]):
             nbr_idx = self._nbr_idx[:, j]
@@ -521,20 +489,15 @@ class BeliefMap:
             nc = self._open_arr[nbr_idx[valid], 1]
             alignment = (nr - r[valid]) * dr + (nc - c[valid]) * dc
             fwd_mask[valid, j] = alignment > 0
-            
         fwd_counts = fwd_mask.sum(axis=1)
         has_fwd = fwd_counts > 0
-        
         share = np.zeros_like(push)
         valid_push = has_fwd & (self._b_flat >= 1e-4)
         share[valid_push] = push[valid_push] / fwd_counts[valid_push]
-        
         self._b_flat[valid_push] -= push[valid_push]
-        
         for j in range(self._nbr_idx.shape[1]):
             valid_receivers = valid_push & fwd_mask[:, j]
             receivers = self._nbr_idx[valid_receivers, j]
             np.add.at(self._b_flat, receivers, share[valid_receivers])
-            
         self._b_flat = np.maximum(0.0, self._b_flat)
         self._sync_flat_to_b()

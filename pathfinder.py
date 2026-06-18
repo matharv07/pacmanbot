@@ -12,7 +12,6 @@ PELLET  =  2
 POWER   =  3
 UNKNOWN = -1
 
-# Optional SciPy accelerated graph cache (populated per-episode by the env)
 _SCIPY_AVAILABLE = False
 try:
     from scipy.sparse.csgraph import dijkstra as scipy_dijkstra
@@ -20,16 +19,14 @@ try:
 except Exception:
     scipy_dijkstra = None
 
-# cache: generation_id -> (csr_matrix, open_cells_list, cell_to_idx)
+#cache: generation_id -> (csr_matrix, open_cells_list, cell_to_idx)
 _SCIPY_GRAPH_CACHE = {}
-_SCIPY_CACHE_GEN = 0   # monotonic counter
-_SCIPY_GRID_GEN = {}   # id(grid) -> generation_id (for lookup)
+_SCIPY_CACHE_GEN = 0   #monotonic counter
+_SCIPY_GRID_GEN = {}   #id(grid) -> generation_id (for lookup)
 
 def _hash_grid(grid: list) -> str:
     import numpy as np
     import hashlib
-    # Treat PELLET (2) as EMPTY (0) for caching, since costs are identical (1.0).
-    # This prevents cache invalidation every time Pacman eats a normal pellet.
     arr = np.array(grid, dtype=np.int8)
     arr[arr == 2] = 0
     return hashlib.md5(arr.tobytes()).hexdigest()
@@ -59,7 +56,6 @@ def build_scipy_graph(grid: list):
                 idx = len(open_cells)
                 open_cells.append((r, c))
                 cell_to_idx[(r, c)] = idx
-    
     n = len(open_cells)
     row_ind = []
     col_ind = []
@@ -73,7 +69,6 @@ def build_scipy_graph(grid: list):
                 row_ind.append(i)
                 col_ind.append(j)
                 data.append(cost)
-    
     graph = csr_matrix((data, (row_ind, col_ind)), shape=(n, n))
     global _SCIPY_CACHE_GEN
     _SCIPY_CACHE_GEN += 1
@@ -81,11 +76,11 @@ def build_scipy_graph(grid: list):
     _SCIPY_GRAPH_CACHE[gen] = (graph, open_cells, cell_to_idx)
     grid_hash = _hash_grid(grid)
     _SCIPY_GRID_GEN[grid_hash] = gen
-    # Clean old entries (keep only the latest 16 to handle multiple envs)
-    if len(_SCIPY_GRAPH_CACHE) > 16:
+    #keep only latest 128 to handle multiple envs
+    if len(_SCIPY_GRAPH_CACHE) > 128:
         oldest = min(_SCIPY_GRAPH_CACHE.keys())
         _SCIPY_GRAPH_CACHE.pop(oldest, None)
-        # Prune grid gen map to prevent memory leak over curriculum progression
+        #prune grid gen map to prevent memory leak over curriculum progression
         keys_to_del = [k for k, v in _SCIPY_GRID_GEN.items() if v not in _SCIPY_GRAPH_CACHE]
         for k in keys_to_del:
             _SCIPY_GRID_GEN.pop(k, None)
@@ -111,7 +106,6 @@ def _reconstruct(came_from: dict, node: tuple) -> list:
         path.append(node)
     path.reverse()
     return path
-
 
 def astar(grid: list, start: tuple, goal: tuple) -> list:
     if start == goal:
@@ -151,16 +145,15 @@ def astar(grid: list, start: tuple, goal: tuple) -> list:
     return []   #if goal is unreachable from start
 
 def dijkstra_multi(grid: list, start: tuple, targets: list) -> dict:
-    # Try SciPy accelerated path when a precomputed graph for this grid exists
     if _SCIPY_AVAILABLE:
         cache = get_scipy_graph(grid)
         if cache is not None:
             graph, open_cells, cell_to_idx = cache
-            # map start and targets to indices
+            #map start and targets to indices
             if start not in cell_to_idx:
                 return {}
             src_idx = cell_to_idx[start]
-            # compute all distances and predecessors from source
+            #compute all distances and predecessors from source
             dist_arr, predecessors = scipy_dijkstra(csgraph=graph, directed=False, indices=src_idx, return_predecessors=True)
             results: dict = {}
             for t in targets:
@@ -171,7 +164,7 @@ def dijkstra_multi(grid: list, start: tuple, targets: list) -> dict:
                 if not math.isfinite(d):
                     results[t] = (math.inf, [])
                     continue
-                # reconstruct path from src_idx -> tidx using predecessors
+                #reconstruct path from src_idx -> tidx using predecessors
                 path_idx = []
                 node = tidx
                 while node != -9999 and node >= 0 and node != src_idx:
@@ -183,45 +176,37 @@ def dijkstra_multi(grid: list, start: tuple, targets: list) -> dict:
                 path = [open_cells[i] for i in path_idx]
                 results[t] = (d, path)
             return results
-
-    # Fallback: original Python implementation
+    #fallback to original python implementation
     if not targets:
         return {}
     rows = len(grid)
     cols = len(grid[0])
-    
     target_set = set()
     for t in targets:
         if _in_bounds(t[0], t[1], rows, cols):
             target_set.add(t)
     results: dict = {t: (math.inf, []) for t in target_set}
     remaining = set(target_set)
-
     if start in target_set:
         results[start] = (0.0, [start])
         remaining.discard(start)
-
     if not remaining:
         return results
-
     dist: dict = {start: 0.0}
     came_from: dict = {}
     open_heap = [(0.0, start)]
     closed: set = set()
-
     while open_heap and remaining:
         d, node = heapq.heappop(open_heap)
         if node in closed:
             continue
         closed.add(node)
-
         if node in remaining:       #found a target, reconstruct path and store result
             path = _reconstruct(came_from, node)
             results[node] = (d, path)
             remaining.discard(node)
             if not remaining:
                 break
-
         r, c = node
         for dr, dc in _DIRS:
             nr, nc = r + dr, c + dc
@@ -238,8 +223,7 @@ def dijkstra_multi(grid: list, start: tuple, targets: list) -> dict:
                 dist[neighbour]      = tentative
                 came_from[neighbour] = node
                 heapq.heappush(open_heap, (tentative, neighbour))
-
-    return results      #return infinite if all goals are unreachable from start
+    return results                                              #return infinite if all goals are unreachable from start
 
 def next_step(grid: list, start: tuple, goal: tuple) -> tuple | None:       #return immediate next step towards goal
     path = astar(grid, start, goal)

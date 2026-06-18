@@ -1,12 +1,19 @@
+import sys
+import os
+if __name__ == "__main__":
+    try:
+        import setup_dependencies
+        setup_dependencies.main()
+    except Exception as e:
+        print(f"Failed to check dependencies: {e}")
 import pygame
 import random
 import math
 import numpy as np
-import sys
-import os
 from collections import deque
 from ghost import Ghost, UNKNOWN
 import pathfinder
+import torch
 
 CELL = 20
 COLS = 41
@@ -40,6 +47,7 @@ RIGHT = ( 0,  1)
 DIRS  = [UP, DOWN, LEFT, RIGHT]
 
 AUTO_MODE = False
+USE_HEURISTIC_TASKS = True #set False to let RL completely control the auction
 RL_MODE = True
 TOGGLE_WIDTH, TOGGLE_HEIGHT = 160, 32
 TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH * 2 - 20, ROWS * CELL + 8, TOGGLE_WIDTH, TOGGLE_HEIGHT)
@@ -207,7 +215,7 @@ class Player:
         g_dists = [g_map[r, c] for g_map in ghost_maps if not math.isinf(g_map[r, c]) and not math.isnan(g_map[r, c])]
         if self.powered:
             if g_dists:
-                return min(g_dists) * 15.0  #hyper-focused pull to execution point
+                return min(g_dists) * 15.0  
             else:
                 p_dist = pellet_map[r, c]
                 if math.isinf(p_dist) or math.isnan(p_dist):
@@ -247,7 +255,6 @@ class Player:
             nr, nc = r + d[0], c + d[1]
             return (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL)
         self.prev_row, self.prev_col = self.row, self.col
-        
         if self.stationary:
             if not self.powered and random.random() < 0.0107:
                 self.powered = True
@@ -349,7 +356,6 @@ class Player:
                             fallback_moves.append((score, (dr, dc)))
                         else:
                             scored_moves.append((score, (dr, dc)))
-                
                 if scored_moves:
                     scored_moves.sort(key=lambda x: x[0], reverse=True)
                     rand_val = random.random()
@@ -458,12 +464,8 @@ class Game:
         self.message_timer = 0
         self.debug_ghost_id = 0
         self.frame_counter = 0
-        
         from obs import MAX_H, MAX_W
-        self.recent_nom = {
-            i: np.zeros((MAX_H, MAX_W), dtype=np.float32) for i in range(len(self.ghosts))
-        }
-
+        self.recent_nom = { i: np.zeros((MAX_H, MAX_W), dtype=np.float32) for i in range(len(self.ghosts)) }
         if RL_MODE:
             load_rl_model()
 
@@ -521,53 +523,46 @@ class Game:
                 elif self.state == "gameover":
                     self.new_game()
             return
-
         self.frame_counter += 1
         if RL_MODE and self.frame_counter % 6 == 0:
             if RL_ACTOR is None:
                 load_rl_model()
             if RL_ACTOR is not None:
                 from obs import build_spatial, build_vector, build_valid_mask, actions_to_tasks
-                import torch
-                
                 alive = [gid for gid, g in self.ghosts.items() if not g.dead]
-                cbba = {gid: g.cbba_agent.get_active_task() for gid, g in self.ghosts.items()}
-                
+                cbba = {gid: g.cbba_agent.get_active_task() for gid, g in self.ghosts.items()}                
                 sp, ve, vm = [], [], []
                 for gid in alive:
                     g = self.ghosts[gid]
                     sp.append(build_spatial(g, self.recent_nom[gid]))
-                    ve.append(build_vector(g, cbba))
+                    ve.append(build_vector(g))
                     vm.append(build_valid_mask(g))
-                    
                 if alive:
                     t_sp = torch.tensor(np.stack(sp), device=RL_DEVICE, dtype=torch.float32)
                     t_ve = torch.tensor(np.stack(ve), device=RL_DEVICE, dtype=torch.float32)
                     t_vm = torch.tensor(np.stack(vm), device=RL_DEVICE, dtype=torch.bool)
-                    
                     with torch.inference_mode():
                         idx, _, scores, _, _ = RL_ACTOR(t_sp, t_ve, t_vm, K=3)
-                    
                     idx_np = idx.cpu().numpy()
                     sc_np  = scores.cpu().numpy()
                     n_cols = len(self.grid[0])
-                    
                     for i, gid in enumerate(alive):
                         g = self.ghosts[gid]
                         indices = [(int(x // n_cols), int(x % n_cols)) for x in idx_np[i]]
                         scores_map = sc_np[i]
-                        
                         self.recent_nom[gid] *= 0.8
                         for r, c in indices:
                             if 0 <= r < len(self.grid) and 0 <= c < len(self.grid[0]):
                                 self.recent_nom[gid][r, c] = 1.0
-                                
                         tasks = actions_to_tasks(g, scores_map, indices, self.frame_counter)
-                        
                         g.cbba_agent._last_auction = self.frame_counter
                         from allocator import generate_tasks as heuristic_generate_tasks
                         h_tasks, h_dists = heuristic_generate_tasks(g, self.frame_counter)
-                        all_tasks = h_tasks + tasks
+                        if USE_HEURISTIC_TASKS:
+                            all_tasks = h_tasks + tasks
+                        else:
+                            all_tasks = tasks
+                            h_dists = {}
                         g.cbba_agent._task_map.clear()
                         if tasks:
                             all_targets = [t.target_pos for t in tasks]
@@ -575,7 +570,6 @@ class Game:
                             dists = dijkstra_multi(g.grid, (g.row, g.col), all_targets)
                             h_dists.update(dists)
                         g.cbba_agent._phase1(g, all_tasks, h_dists)
-
         self.player.update(self.ghosts)
         powered = self.player.powered
         for ghost in self.ghosts.values():
@@ -588,11 +582,9 @@ class Game:
                 swapped = (ghost.row == self.player.prev_row and ghost.col == self.player.prev_col and self.player.row == ghost.prev_row and self.player.col == ghost.prev_col)
                 if (same_cell or swapped):
                     if self.player.powered:
-
                         ghost.kill()
                         self.player.score += 200
                     else:
-
                         self.player.die()
                         self.state = "gameover"
                         self.message_timer = 90 if not AUTO_MODE else 0
@@ -635,7 +627,6 @@ class Game:
         text_btn = self.small.render(lbl_msg, True, WHITE)
         text_rect = text_btn.get_rect(center=TOGGLE_RECT.center)
         self.screen.blit(text_btn, text_rect)
-
         bg_btn_rl = (200, 0, 100) if RL_MODE else GREY
         pygame.draw.rect(self.screen, bg_btn_rl, RL_TOGGLE_RECT, border_radius=4)
         lbl_msg_rl = "RL MODE ON" if RL_MODE else "RL MODE OFF"
@@ -669,7 +660,6 @@ class Game:
                 else:
                     color = (30, 30, 30)
                 pygame.draw.rect(self.screen, color, (x, y, CELL, CELL))
-                
         bm = ghost.belief_map
         if bm._initialised and bm._open_cells:
             probs = [bm._b[r][c] for r, c in bm._open_cells]
@@ -686,7 +676,6 @@ class Game:
                     alpha = int(60 + t * 180)
                     cell_surf.fill((red, green, blue, alpha))
                     self.screen.blit(cell_surf, (WIDTH + c * CELL, r * CELL))
-
         for gid, pos in ghost.known_agents.items():
             if pos == "UNKNOWN":
                 continue
@@ -696,13 +685,11 @@ class Game:
             pygame.draw.circle(self.screen, GHOST_COLORS[gid], (x, y), CELL // 2 - 2)
             label = self.small.render(str(gid), True, WHITE)
             self.screen.blit(label, (WIDTH + gc * CELL + 2, gr * CELL + 2))
-            
         x = WIDTH + ghost.col * CELL + CELL // 2
         y = ghost.row * CELL + CELL // 2
         pygame.draw.circle(self.screen, GHOST_COLORS[self.debug_ghost_id], (x, y), CELL // 2 - 2)
         label = self.small.render(str(self.debug_ghost_id), True, WHITE)
         self.screen.blit(label, (WIDTH + ghost.col * CELL + 2, ghost.row * CELL + 2))
-        
         if ghost.known_pacman:
             pr, pc = ghost.known_pacman
             x = WIDTH + pc * CELL + CELL // 2

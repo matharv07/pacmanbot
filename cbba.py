@@ -3,12 +3,11 @@ import math
 from typing import Optional
 import ast
 from allocator import TaskType, Task, generate_tasks
+from pathfinder import dijkstra_multi, astar
 
 AUCTION_EVERY   = 6      #full auction every 0.6s 
 LT              = 3
 LAMBDA          = 0.99   #time decay factor
-
-from pathfinder import dijkstra_multi, astar
 
 def _task_key(task: Task) -> tuple:
     return (int(task.task_type), task.target_pos, getattr(task, 'owner', -1))
@@ -25,7 +24,7 @@ class CBBA_Agent:
         self.s: dict = {}       #last sync frames
         self._task_map: dict = {}
         self._last_auction: int = -1
-        self._dist_cache: dict = {}   # (pos) -> distance, cached per-auction
+        self._dist_cache: dict = {}   #(pos) -> distance, cached per-auction
 
     def step(self, ghost, frame: int) -> Optional[Task]:
         changed = False
@@ -38,7 +37,6 @@ class CBBA_Agent:
                     changed = True
         if changed:
             self._cascade_release()
-
         if frame - self._last_auction >= AUCTION_EVERY or not self.bundle:
             self._last_auction = frame
             tasks, dists = generate_tasks(ghost, frame)                
@@ -60,7 +58,7 @@ class CBBA_Agent:
             if winner == other_gid:
                 task = self._task_map.get(key)
                 if task is None:
-                    # Reconstruct task from consensus if we didn't evaluate it locally
+                    #reconstruct task from consensus if we didn't evaluate it locally
                     task_type, target_pos, owner = key
                     score = self.y.get(key, 0.0)
                     task = Task(task_type=task_type, target_pos=target_pos, score=score, owner=owner)
@@ -73,10 +71,8 @@ class CBBA_Agent:
         return {"y": dict(self.y), "z": dict(self.z), "s": dict(self.s)}
 
     def receive_consensus(self, sender_gid: int, y_k: dict, z_k: dict, s_k: dict, frame: int) -> bool:
-        
-        # Snapshot before updating to pass into _table1
+        #snapshot before updating to pass into _table1
         s_i_snapshot = dict(self.s)
-        
         self.s[sender_gid] = max(self.s.get(sender_gid, -1), frame)
         for agent_id, ts in s_k.items():
             if isinstance(agent_id, str):
@@ -107,11 +103,8 @@ class CBBA_Agent:
     def _phase1(self, ghost, tasks: list, dists: dict):
         valid_keys = {_task_key(t) for t in tasks}
         self._task_map.update({_task_key(t): t for t in tasks})
-
-        # Use the dijkstra distances already computed during task generation
         self._dist_cache = {pos: d for pos, (d, _) in dists.items()}
         self._astar_cache = {}
-
         #pruning bundle & path: keeping only tasks we still own in the new task set
         new_bundle = []
         for k in self.bundle:
@@ -149,18 +142,15 @@ class CBBA_Agent:
         task = self._task_map.get(key)
         if task is None:
             return 0.0, 0
-
         s_old = self._path_score(self.path, ghost)
         best_gain = -math.inf
         best_n = 0
-
         for n in range(len(self.path) + 1):
             new_path = self.path[:n] + [key] + self.path[n:]
             gain = self._path_score(new_path, ghost) - s_old
             if gain > best_gain:
                 best_gain = gain
                 best_n = n
-
         return max(best_gain, 0.0), best_n
 
     def _path_score(self, path: list, ghost) -> float:
@@ -175,10 +165,8 @@ class CBBA_Agent:
                 continue
             tgt = task.target_pos
             if prev_pos == (ghost.row, ghost.col):
-                # First segment: use cached Dijkstra distance
                 d = self._dist_cache.get(tgt, math.inf)
             else:
-                # Subsequent segments: True distance via A* (fixes oscillation)
                 pair = (prev_pos, tgt)
                 if pair not in getattr(self, '_astar_cache', {}):
                     path_to_tgt = astar(ghost.grid, prev_pos, tgt)
