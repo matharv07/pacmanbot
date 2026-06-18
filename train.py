@@ -39,7 +39,7 @@ BC_FLOOR        = 0.02
 K_NOMINATIONS   = 3
 LOG_DIR         = os.path.join(os.path.dirname(__file__), "logs")
 CKPT_DIR        = os.path.join(os.path.dirname(__file__), "checkpoints")
-BC_ANNEAL_UPDATES = 2000
+BC_ANNEAL_UPDATES = 150
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class BatchTransfer:
@@ -348,7 +348,7 @@ def train():
                 s1 = ratio * mb_adv
                 s2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * mb_adv
                 a_loss = -torch.min(s1, s2).mean()
-                v_loss = F.mse_loss(v_pred, mb_ret)
+                v_loss = F.smooth_l1_loss(v_pred, mb_ret)
                 mb_ht_masked = mb_ht * mb_vm.float()
                 ht_flat     = mb_ht_masked.view(mb_ht_masked.shape[0], -1)
                 ht_row_sums = ht_flat.sum(dim=1)
