@@ -120,8 +120,8 @@ def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
 def _score_explore(ghost, frame: int) -> List[Task]:
     p = ghost.personal_map
     rows, cols = p.shape
-    interior = p[1:rows-1, 1:cols-1]
-    ls = ghost.last_seen[1:rows-1, 1:cols-1]
+    interior = p
+    ls = ghost.last_seen
     wall_mask = (interior == WALL)
     unknown_mask = (interior == UNKNOWN)
     ages = np.zeros_like(interior, dtype=np.float64)
@@ -137,13 +137,13 @@ def _score_explore(ghost, frame: int) -> List[Task]:
     top_flat = np.argpartition(flat_ages, -k)[-k:]
     top_flat = top_flat[np.argsort(flat_ages[top_flat])[::-1]]
     tasks: list = []
-    interior_cols = cols - 2
+    interior_cols = cols
     for idx in top_flat:
         age = flat_ages[idx]
         if age < 0:
             continue
-        r = int(idx // interior_cols) + 1
-        c = int(idx % interior_cols) + 1
+        r = int(idx // interior_cols)
+        c = int(idx % interior_cols)
         pos = (r, c)
         score = 1.0 - math.exp(-age / RECENCY_SCALE)
         score *= _dist_score(abs(pos[0] - ghost.row) + abs(pos[1] - ghost.col), EXPLORE_SCALE)

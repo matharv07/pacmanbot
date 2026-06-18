@@ -49,7 +49,6 @@ class Env:
             rows=self.grid_rows, cols=self.grid_cols, n_power=self.n_power)
         pathfinder.build_scipy_graph(self.grid)
         self.player = Player(self.grid, self._player_start)
-        import random
         if self.static_pacman:
             self.player.stationary = True
         open_cells = np.argwhere(self.grid != WALL)

@@ -87,7 +87,7 @@ def _pad_spatial(arr, target_h=MAX_H, target_w=MAX_W):
         return np.pad(arr, ((0, pad_h), (0, pad_w)), constant_values=0)
     elif arr.ndim == 4:
         out = np.pad(arr, ((0, 0), (0, 0), (0, pad_h), (0, pad_w)), constant_values=0)
-        if out.shape[1] in (SPATIAL_CH, 5):
+        if out.shape[1] in (SPATIAL_CH, 11):
             out[:, 0, h:, :] = 1.0
             out[:, 0, :, w:] = 1.0
         return out
@@ -413,7 +413,7 @@ def train():
         ep_heuristic_merges = 0
         ep_total_auctions = 0
         for _ in range(ROLLOUT_STEPS):
-            step_actions = [{}] * NUM_ENVS
+            step_actions = [{} for _ in range(NUM_ENVS)]
             #collect all alive ghosts across all environments
             batch_sp, batch_ve, batch_cve, batch_vm = [], [], [], []
             batch_gsp_unique = [] #one per active env
@@ -430,7 +430,7 @@ def train():
                     buf_values[e].append({})
                     buf_gids[e].append([])
                     buf_spatial[e].append(np.empty((0, SPATIAL_CH, MAX_H, MAX_W), dtype=np.float32))
-                    buf_gsp[e].append(np.empty((0, 5, MAX_H, MAX_W), dtype=np.float32))
+                    buf_gsp[e].append(np.empty((0, 11, MAX_H, MAX_W), dtype=np.float32))
                     buf_gsp_ids[e].append([])
                     buf_vector[e].append(np.empty((0, VEC_DIM), dtype=np.float32))
                     buf_cve[e].append(np.empty((0, CRITIC_VEC_DIM), dtype=np.float32))
@@ -554,7 +554,7 @@ def train():
                 boot_cve.append(np.array(cve_batch, dtype=np.float32))
                 boot_vm.append(vm_padded)
                 boot_gids_list.append(gids)
-        all_last_v = [{}] * NUM_ENVS
+        all_last_v = [{} for _ in range(NUM_ENVS)]
         if boot_sp:
             cat_sp = np.concatenate(boot_sp, axis=0)
             cat_gsp_unique = np.concatenate(boot_gsp_unique, axis=0)

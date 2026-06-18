@@ -156,6 +156,8 @@ class Ghost:
                     moved = True
         self.in_fallback_mode = not moved
         if not moved:
+            if hasattr(self, '_committed_path'):
+                self._committed_path = []
             rows = len(self.grid)
             cols = len(self.grid[0])
             pac_cell = self.known_pacman if (self.pacman_powered and self.known_pacman) else None

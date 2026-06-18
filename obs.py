@@ -16,7 +16,7 @@ MAX_H = 33
 MAX_W = 41
 MAX_GHOSTS   = 7
 SPATIAL_CH   = 16       #number of spatial channels (see channel map below)
-GLOBAL_SPATIAL_CH = 5   #number of channels in the omniscient global state
+GLOBAL_SPATIAL_CH = 11   #number of channels in the omniscient global state
 VEC_DIM      = 102
 CRITIC_VEC_DIM = MAX_GHOSTS * VEC_DIM + MAX_GHOSTS
 
@@ -162,7 +162,7 @@ def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int) -
 
 def build_global_spatial(env, rows, cols) -> np.ndarray:
     #build the omniscient global state for the critic
-    out = np.zeros((5, rows, cols), dtype=np.float32)
+    out = np.zeros((11, rows, cols), dtype=np.float32)
     out[0] = (env.grid == 1)
     out[1] = (env.grid == 2)
     out[2] = (env.grid == 3)
@@ -170,5 +170,5 @@ def build_global_spatial(env, rows, cols) -> np.ndarray:
         out[3, env.player.row, env.player.col] = 1.0
     for g in env.ghosts.values():
         if not g.dead:
-            out[4, g.row, g.col] = 1.0
+            out[4 + g.gid, g.row, g.col] = 1.0
     return out

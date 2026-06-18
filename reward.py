@@ -90,8 +90,8 @@ class RewardShaper:
     def _phi_explore(self, ghost) -> float:
         #fraction of open cells known (0-1), NOT raw counts — keeps scale O(1)
         p = ghost.personal_map
-        #use total grid size for a monotonic denominator, as dynamically counting non-walls changes during exploration
-        total_open = p.shape[0] * p.shape[1]
+        open_cells = np.sum(p != 1)   #exclude walls from denominator
+        total_open = max(open_cells, 1)
         known = np.sum((p != -1) & (p != 1))   #not unknown, not wall
         return self.gamma_ex * (known / total_open)
 
