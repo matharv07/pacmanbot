@@ -41,7 +41,7 @@ LOG_DIR         = os.path.join(os.path.dirname(__file__), "logs")
 CKPT_DIR        = os.path.join(os.path.dirname(__file__), "checkpoints")
 BC_ANNEAL_UPDATES = 150
 BC_ADVANCE_GATE = 0.10
-CURRICULUM_START_STAGE = 1
+CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -719,7 +719,7 @@ def train():
                 print(f"│  Ghost Return: {ret_str:<10}  Pacman Score: {pac_str}")
                 print(f"│  Timings: Rollout {res['t_rollout']:.1f}s | PPO {res['t_ppo']:.1f}s")
                 print(f"└{'─'*64}")
-            if p_up % 200 == 0:
+            if p_up % 100 == 0:
                 path = os.path.join(CKPT_DIR, f"ckpt_{p_up}.pt")
                 torch.save({"actor": actor.state_dict(),
                              "critic": critic.state_dict(),

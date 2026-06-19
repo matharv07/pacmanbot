@@ -47,7 +47,7 @@ class Env:
 
     def reset(self):
         self.grid, self._player_start = generate_map(
-            rows=self.grid_rows, cols=self.grid_cols, n_power=self.n_power)
+            rows=self.grid_rows, cols=self.grid_cols, n_power=self.n_power, random_spawn=self.static_pacman)
         pathfinder.build_scipy_graph(self.grid)
         self.player = Player(self.grid, self._player_start)
         if self.static_pacman:

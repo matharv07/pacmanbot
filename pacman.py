@@ -83,7 +83,7 @@ def load_rl_model():
         RL_MODE = False
         return False
 
-def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = 28):
+def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = 28, random_spawn: bool = False):
     grid = np.full((rows, cols), WALL, dtype=np.int8)
     def in_bounds(r, c):
         return 0 < r < rows - 1 and 0 < c < cols - 1
@@ -121,8 +121,11 @@ def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = 28):
         grid[cr, cc] = EMPTY
         open_cells = [(cr, cc)]
     centre = (rows // 2, cols // 2)
-    open_cells.sort(key=lambda p: abs(p[0] - centre[0]) + abs(p[1] - centre[1]))
-    player_start = open_cells[0]
+    if random_spawn:
+        player_start = random.choice(open_cells)
+    else:
+        open_cells.sort(key=lambda p: abs(p[0] - centre[0]) + abs(p[1] - centre[1]))
+        player_start = open_cells[0]
     for r, c in open_cells:
         if abs(r - player_start[0]) + abs(c - player_start[1]) > 2:
             grid[r, c] = PELLET
