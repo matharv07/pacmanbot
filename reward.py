@@ -59,9 +59,9 @@ class RewardShaper:
             d = abs(ghost.row - target[0]) + abs(ghost.col - target[1])
         if math.isinf(d) or math.isnan(d):
             d = 999.0
+        diag = len(ghost.grid) + len(ghost.grid[0])
         if getattr(ghost, 'pacman_powered', False):
             return 0.0
-        diag = math.hypot(len(ghost.grid), len(ghost.grid[0]))
         return -self.alpha * (d / diag)
 
     def _phi_surround(self, ghost, all_ghosts) -> float:
@@ -81,7 +81,7 @@ class RewardShaper:
             angles.append(math.atan2(dy, dx))
         if len(angles) < 2:
             return 0.0
-        # Circular variance  =  1 − ‖ mean unit-vector ‖
+        # circular variance = 1 - || mean unit-vector ||
         N = len(angles)
         R = math.hypot(sum(math.cos(a) for a in angles) / N,
                        sum(math.sin(a) for a in angles) / N)
@@ -105,8 +105,32 @@ class RewardShaper:
         entropy = -float(np.sum(p * np.log(p + 1e-12)))
         return -self.delta * entropy
 
+    def _phi_dispersion(self, ghost, all_ghosts) -> float:
+        """Repulsive potential to prevent ghosts from clumping up during search."""
+        if len(all_ghosts) <= 1:
+            return 0.0
+        
+        min_dist = 999.0
+        for gid, g in all_ghosts.items():
+            if gid == ghost.gid or g.dead:
+                continue
+            dist = abs(ghost.row - g.row) + abs(ghost.col - g.col)
+            if dist < min_dist:
+                min_dist = dist
+                
+        # Only penalize if they are within a tight cluster (e.g. 3 cells)
+        repulsion_radius = 4.0
+        if min_dist < repulsion_radius:
+            # Potential is heavily negative when distance is 0, fading to 0 at radius
+            return -self.gamma_ex * ((repulsion_radius - min_dist) / repulsion_radius)
+        return 0.0
+
     def potential(self, ghost, all_ghosts) -> float:
-        return (self._phi_hunt(ghost) + self._phi_surround(ghost, all_ghosts) + self._phi_explore(ghost) + self._phi_belief(ghost))
+        return (self._phi_hunt(ghost) + 
+                self._phi_surround(ghost, all_ghosts) + 
+                self._phi_explore(ghost) + 
+                self._phi_belief(ghost) +
+                self._phi_dispersion(ghost, all_ghosts))
 
     def shaping(self, ghost, all_ghosts) -> float:
         phi = self.potential(ghost, all_ghosts)

@@ -171,4 +171,3 @@ class GhostCritic(nn.Module):
     def forward(self, spatial, vector):
         pool = self.encode_spatial(spatial)
         return self.forward_from_pool(pool, vector)
-

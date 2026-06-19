@@ -25,13 +25,13 @@ POWER   = 3
 UNKNOWN = -1
 
 #Setup decay constants for CBBA
-HUNT_SCALE    = 10.0
+HUNT_SCALE    = 14.0
 CONVERT_SCALE = 8.0
 SAFE_RADIUS   = 8       #min safe power pacman distance
 SAFE_SCALE    = 8.0
 RECENCY_SCALE = 20.0    #sets up quantity to prioritize revisiting older mapped locations
 EXPLORE_SCALE = 6.0
-UNKNOWN_BONUS = 100     #5x reward(?) of looking for new locations over updating old ones
+UNKNOWN_BONUS = 40      #5x reward(?) of looking for new locations over updating old ones
 EXPLORE_TOP_K = 3       #number of top explore candidates passed to CBBA
 
 class TaskType(IntEnum):
@@ -53,20 +53,32 @@ class Task:
 def _dist_score(d: float, scale: float) -> float:   #normalize the distances received from dijkstra
     return math.exp(-d/scale) if d != math.inf and d >= 0 else 0.0
 
-def _score_hunt(ghost, dists: dict) -> Optional[Task]:
+def _score_hunt(ghost, dists: dict) -> list[Task]:
     if ghost.pacman_powered:
-        return None
-    target = ghost.known_pacman or ghost.last_lost_pacman  #fallback to last known location
+        return []
+    target = ghost.known_pacman or ghost.last_lost_pacman
     if target is None:
-        return None
+        return []
+    pr, pc = target
     info = dists.get(target)
     if info is None:
-        return None
+        return []
     dist, _ = info
     if dist == math.inf:
-        return None
+        return []    
+    tasks = []
     score = _dist_score(dist, HUNT_SCALE)
-    return Task(task_type=TaskType.HUNT, target_pos=target, score=score, owner=ghost.gid)
+    tasks.append(Task(task_type=TaskType.HUNT, target_pos=target,
+                      score=score, owner=ghost.gid))
+    rows, cols = ghost.personal_map.shape
+    for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+        cr, cc = pr + dr*4, pc + dc*4
+        if 0 <= cr < rows and 0 <= cc < cols and ghost.personal_map[cr, cc] != WALL:
+            cutoff_info = dists.get((cr, cc))
+            if cutoff_info and cutoff_info[0] != math.inf:
+                cutoff_score = _dist_score(cutoff_info[0], HUNT_SCALE) * 0.85
+                tasks.append(Task(task_type=TaskType.DYNAMIC, target_pos=(cr, cc), score=cutoff_score, owner=ghost.gid))
+    return tasks
 
 def _score_convert(ghost, dists: dict) -> List[Task]:
     tasks: list[Task] = []
@@ -161,6 +173,11 @@ def generate_tasks(ghost, frame: int) -> tuple[List[Task], dict]:
     pac_pos = ghost.known_pacman or ghost.last_lost_pacman
     if pac_pos is not None:
         targets.add(pac_pos)
+        pr, pc = pac_pos
+        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+            cr, cc = pr + dr*4, pc + dc*4
+            if 0 <= cr < rows and 0 <= cc < cols and ghost.personal_map[cr, cc] != WALL:
+                targets.add((cr, cc))
     power_cells = np.argwhere(ghost.personal_map == POWER)
     for r, c in power_cells:
         targets.add((int(r), int(c)))
@@ -181,9 +198,7 @@ def generate_tasks(ghost, frame: int) -> tuple[List[Task], dict]:
             tasks.append(evade_track)
         tasks.extend(explore_tasks)
     else:
-        hunt = _score_hunt(ghost, dists)
-        if hunt is not None:
-            tasks.append(hunt)
+        tasks.extend(_score_hunt(ghost, dists))
         tasks.extend(_score_convert(ghost, dists))
         tasks.extend(explore_tasks)
     for t in tasks:

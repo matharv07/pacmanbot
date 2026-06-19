@@ -35,11 +35,14 @@ VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 3e-4
 BC_INIT         = 0.5     # user requested reduction to prevent flattening actor loss
-BC_FLOOR        = 0.02
+BC_FLOOR        = 0.002
 K_NOMINATIONS   = 3
 LOG_DIR         = os.path.join(os.path.dirname(__file__), "logs")
 CKPT_DIR        = os.path.join(os.path.dirname(__file__), "checkpoints")
 BC_ANNEAL_UPDATES = 150
+BC_ADVANCE_GATE = 0.10
+CURRICULUM_START_STAGE = 1
+critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class BatchTransfer:
@@ -247,11 +250,11 @@ def train():
     result_queue = queue.Queue()
     os.makedirs(CKPT_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, "metrics.jsonl")
-    curriculum = CurriculumScheduler(start_stage=0)
+    curriculum = CurriculumScheduler(start_stage=CURRICULUM_START_STAGE)
     stage = curriculum.stage
     print(f"Curriculum: starting at Stage {curriculum.stage_idx}\n({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts)")
     print("Initializing VecEnv (spawn before CUDA to prevent hang)...")
-    vec_env = VecEnv(NUM_ENVS, rows=stage.rows, cols=stage.cols, n_ghosts=stage.n_ghosts, n_power=stage.n_power, static_pacman=True)
+    vec_env = VecEnv(NUM_ENVS, rows=stage.rows, cols=stage.cols, n_ghosts=stage.n_ghosts, n_power=stage.n_power, static_pacman=(CURRICULUM_START_STAGE == 0))
     print("Initializing networks...")
     actor  = GhostActor().to(DEVICE)
     critic = GhostCritic().to(DEVICE)
@@ -293,7 +296,7 @@ def train():
             total_steps  = ckpt.get("total_steps", ckpt["update"] * ROLLOUT_STEPS * NUM_ENVS)
             #restore curriculum stage in VecEnv
             stage = curriculum.stage
-            vec_env.set_curriculum(stage.rows, stage.cols,stage.n_ghosts, stage.n_power, static_pacman=(start_update <= 50))
+            vec_env.set_curriculum(stage.rows, stage.cols,stage.n_ghosts, stage.n_power, static_pacman=(start_update <= 50 and CURRICULUM_START_STAGE == 0))
             print(f"Resumed at update {start_update}, stage {curriculum.stage_idx} ({stage.rows}×{stage.cols}, {stage.n_ghosts}g)")
         else:
             print("No checkpoints found, starting from scratch.")
@@ -310,6 +313,7 @@ def train():
         for i in range(N_total):
             uid_to_indices[b_gsp_ids_np[i]].append(i)
         unique_uids = list(uid_to_indices.keys())
+        global critic_warmup_remaining
         for epoch_i in range(PPO_EPOCHS):
             np.random.shuffle(unique_uids)
             uid_batches = []
@@ -359,28 +363,36 @@ def train():
                     fl_bc     = flat_logits[valid_bc].clamp(min=-1e4)
                     log_pi    = F.log_softmax(fl_bc, dim=-1)
                     bc        = -(ht_prob * log_pi).sum(dim=-1).mean()
+                    bc        = bc * valid_bc.float().mean()
                 else:
                     bc = torch.tensor(0.0, device=DEVICE)
                 loss_actor = a_loss - ENT_COEF * ent.mean() + lam_bc * bc
                 loss_critic = VF_COEF * v_loss
-                opt_actor.zero_grad()
-                loss_actor.backward()
                 opt_critic.zero_grad()
                 loss_critic.backward()
-                grad_norm_a = nn.utils.clip_grad_norm_(actor.parameters(), MAX_GRAD_NORM)
-                grad_norm_c = nn.utils.clip_grad_norm_(critic.parameters(), MAX_GRAD_NORM)
-                if torch.isfinite(grad_norm_a) and torch.isfinite(grad_norm_c):
-                    opt_actor.step()
-                    opt_critic.step()
-                else:
+                if critic_warmup_remaining <= 0:
                     opt_actor.zero_grad()
+                    loss_actor.backward()
+                    grad_norm_a = nn.utils.clip_grad_norm_(actor.parameters(), MAX_GRAD_NORM)
+                else:
+                    grad_norm_a = torch.tensor(0.0)
+                grad_norm_c = nn.utils.clip_grad_norm_(critic.parameters(), MAX_GRAD_NORM)
+                if torch.isfinite(grad_norm_c) and (critic_warmup_remaining > 0 or torch.isfinite(grad_norm_a)):
+                    opt_critic.step()
+                    if critic_warmup_remaining <= 0:
+                        opt_actor.step()
+                else:
                     opt_critic.zero_grad()
+                    if critic_warmup_remaining <= 0:
+                        opt_actor.zero_grad()
                 metrics["actor_loss"] += a_loss.item()
                 metrics["value_loss"] += v_loss.item()
                 metrics["bc_loss"]    += bc.item()
                 metrics["entropy"]    += ent.mean().item()
                 metrics["n_batches"]  += 1
         t_ppo = time.time() - t_ppo_start
+        if critic_warmup_remaining > 0:
+            critic_warmup_remaining -= 1
         result_queue.put({"update": update, "metrics": metrics,"mean_ret": mean_ret, "mean_pac": mean_pac,
         "episodes": episodes,"total_steps": total_steps, "t_rollout": t_rollout, "t_ppo": t_ppo, "lam_bc": lam_bc, "bc_prob": bc_prob, "realized_merge_rate": realized_merge_rate, "wall_s": round(time.time() - t0_ref, 1)})
     current_returns = [0.0] * NUM_ENVS
@@ -389,7 +401,7 @@ def train():
         decay_step_curr = max(0, update - 50)
         anneal_frac = math.exp(-decay_step_curr / BC_ANNEAL_UPDATES)
         bc_prob = anneal_frac if anneal_frac >= 0.05 else 0.0
-        if update == 51:
+        if update == 51 and CURRICULUM_START_STAGE == 0:
             print("Transitioning to moving Pacman (static_pacman = False)...")
             vec_env.set_curriculum(stage.rows, stage.cols, stage.n_ghosts, stage.n_power, static_pacman=False)
         t_start_rollout = time.time()
@@ -664,11 +676,7 @@ def train():
             }
             with open(log_path, "a") as f:
                 f.write(json.dumps(row) + "\n")
-            if res["lam_bc"] <= 0.02:
-                curriculum.record_return(res["mean_ret"])
-            else:
-                curriculum.record_return(None)
-                curriculum._return_history.clear()
+            curriculum.record_return(res["mean_ret"] if res["lam_bc"] <= BC_ADVANCE_GATE else None)
             if curriculum.should_advance():
                 curriculum.advance()
                 stage = curriculum.stage
@@ -683,6 +691,8 @@ def train():
                     pg['lr'] *= 0.5
                 for pg in opt_critic.param_groups:
                     pg['lr'] *= 0.5
+                global critic_warmup_remaining
+                critic_warmup_remaining = 20
                 with open(log_path, "a") as f:
                     f.write(json.dumps({"curriculum_advance": curriculum.stage_idx, "update": p_up, "new_grid": f"{stage.rows}x{stage.cols}", "new_lr": opt_actor.param_groups[0]['lr']}) + "\n")
             if p_up % 10 == 0:

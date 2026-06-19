@@ -24,7 +24,7 @@ class Stage:
     advance_return: float
 
 STAGES = [Stage(rows=7,  cols=9,  n_ghosts=2, n_power=2,  advance_return=42.0),
-    Stage(rows=13, cols=17, n_ghosts=3, n_power=6,  advance_return=32.0),
+    Stage(rows=13, cols=17, n_ghosts=3, n_power=6,  advance_return=12.0),
     Stage(rows=21, cols=27, n_ghosts=5, n_power=14, advance_return=18.0),
     Stage(rows=33, cols=41, n_ghosts=7, n_power=28, advance_return=float('inf'))]
 
@@ -50,7 +50,9 @@ class CurriculumScheduler:
     def should_advance(self) -> bool:
         if self.is_final:
             return False
-        if len(self._return_history) < ADVANCE_WINDOW:
+        if self._updates_in_stage < ADVANCE_WINDOW:
+            return False
+        if len(self._return_history) < ADVANCE_WINDOW // 2:
             return False
         avg = sum(self._return_history) / len(self._return_history)
         return avg >= self.stage.advance_return

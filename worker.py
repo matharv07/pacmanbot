@@ -7,6 +7,7 @@ collects per-ghost rewards, and exposes observations + heuristic BC targets.
 
 import os
 import random
+import math
 import numpy as np
 import pacman as _pac
 from pacman import generate_map, Player, WALL, PELLET, POWER, EMPTY
@@ -185,7 +186,7 @@ class Env:
                 new_cells, stale_refresh = ghost.update((self.player.row, self.player.col), powered, self.ghosts)
                 if gid in rewards:
                     explore_r = (new_cells * 0.01) + (stale_refresh * 0.005)
-                    rewards[gid] += min(explore_r, 0.04)  #caps exploration reward per frame to keep it below 0.05 step cost
+                    rewards[gid] += min(explore_r, 0.75)  #caps exploration reward per frame
             if not self.player.dead:
                 for gid, ghost in list(self.ghosts.items()):
                     if ghost.dead:
@@ -197,12 +198,17 @@ class Env:
                         if self.player.powered:
                             ghost.kill()
                             if gid in rewards:
-                                rewards[gid] -= 60.0
+                                rewards[gid] -= 30.0
                         else:
                             self.player.die()
                             done = True
                             if gid in rewards:
                                 rewards[gid] += 100.0
+                            # ADD: shared team reward for all other living ghosts
+                            TEAM_KILL_SHARE = 0.15   # 15% of kill reward shared
+                            for other_gid, other_ghost in self.ghosts.items():
+                                if other_gid != gid and not other_ghost.dead and other_gid in rewards:
+                                    rewards[other_gid] += 100.0 * TEAM_KILL_SHARE
                             break
             if done:
                 break
@@ -211,8 +217,22 @@ class Env:
                 for o in rewards:
                     rewards[o] -= 20.0
                 break
+            if not done and not self.player.dead:
+                for gid_prox, ghost_prox in self.ghosts.items():
+                    if ghost_prox.dead or gid_prox not in rewards:
+                        continue
+                    if not self.player.powered:
+                        pr, pc = self.player.row, self.player.col
+                        dist = abs(ghost_prox.row - pr) + abs(ghost_prox.col - pc)
+                        # reward peaks at 0.04 when adjacent, decays to ~0 beyond 8 cells
+                        prox = 0.04 * math.exp(-dist / 3.0)
+                        rewards[gid_prox] += prox
+
+            grid_area = self.grid_rows * self.grid_cols
+            base_area = 33 * 41   # full grid area
+            step_cost = 0.05 * (grid_area / base_area)   # 0.009 on 7x9, scales to 0.05 on 33x41
             for gid in rewards:
-                rewards[gid] -= 0.05    #per-frame step cost
+                rewards[gid] -= step_cost    #per-frame step cost
         for gid, g in self.ghosts.items():
             if not g.dead and gid in rewards:
                 rewards[gid] += self.shaper.shaping(g, self.ghosts)
