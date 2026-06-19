@@ -64,6 +64,26 @@ class RewardShaper:
             return 0.0
         return -self.alpha * (d / diag)
 
+    def _phi_flee(self, ghost) -> float:
+        if not getattr(ghost, 'pacman_powered', False):
+            return 0.0
+        target = self._pac_target(ghost)
+        if target is None:
+            return 0.0
+        #use cached Dijkstra distance if available (from CBBA auction)
+        if hasattr(ghost, 'cbba_agent') and target in ghost.cbba_agent._dist_cache:
+            d = ghost.cbba_agent._dist_cache[target]
+            if math.isinf(d) or math.isnan(d):
+                d = abs(ghost.row - target[0]) + abs(ghost.col - target[1])
+        else:
+            #fallback to manhattan if cache miss
+            d = abs(ghost.row - target[0]) + abs(ghost.col - target[1])
+        if math.isinf(d) or math.isnan(d):
+            d = 999.0
+        diag = len(ghost.grid) + len(ghost.grid[0])
+        # positive potential for distance when powered -> encourages fleeing
+        return self.alpha * (d / diag)
+
     def _phi_surround(self, ghost, all_ghosts) -> float:
         if getattr(ghost, 'pacman_powered', False):
             return 0.0
@@ -79,7 +99,7 @@ class RewardShaper:
             if dy == 0 and dx == 0:
                 continue
             angles.append(math.atan2(dy, dx))
-        if len(angles) < 2:
+        if len(angles) < 3:
             return 0.0
         # circular variance = 1 - || mean unit-vector ||
         N = len(angles)
@@ -107,7 +127,7 @@ class RewardShaper:
 
     def _phi_dispersion(self, ghost, all_ghosts) -> float:
         """Repulsive potential to prevent ghosts from clumping up during search."""
-        if len(all_ghosts) <= 1:
+        if len(all_ghosts) < 3:
             return 0.0
         
         min_dist = 999.0
@@ -117,11 +137,10 @@ class RewardShaper:
             dist = abs(ghost.row - g.row) + abs(ghost.col - g.col)
             if dist < min_dist:
                 min_dist = dist
-                
-        # Only penalize if they are within a tight cluster (e.g. 3 cells)
-        repulsion_radius = 4.0
+        rows = len(ghost.grid)
+        cols = len(ghost.grid[0])
+        repulsion_radius = max(2.0, min(rows, cols) * 0.15)        
         if min_dist < repulsion_radius:
-            # Potential is heavily negative when distance is 0, fading to 0 at radius
             return -self.gamma_ex * ((repulsion_radius - min_dist) / repulsion_radius)
         return 0.0
 
@@ -130,7 +149,8 @@ class RewardShaper:
                 self._phi_surround(ghost, all_ghosts) + 
                 self._phi_explore(ghost) + 
                 self._phi_belief(ghost) +
-                self._phi_dispersion(ghost, all_ghosts))
+                self._phi_dispersion(ghost, all_ghosts) +
+                self._phi_flee(ghost))
 
     def shaping(self, ghost, all_ghosts) -> float:
         phi = self.potential(ghost, all_ghosts)

@@ -72,7 +72,7 @@ def load_rl_model():
         latest = max(ckpts, key=os.path.getctime)
         print(f"Loading checkpoint: {latest}")
         RL_ACTOR = GhostActor().to(RL_DEVICE)
-        checkpoint = torch.load(latest, map_location=RL_DEVICE)
+        checkpoint = torch.load(latest, map_location=RL_DEVICE, weights_only=False)
         RL_ACTOR.load_state_dict(checkpoint["actor"])
         RL_ACTOR.eval()
         print("RL Model loaded successfully.")

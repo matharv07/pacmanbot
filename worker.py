@@ -13,7 +13,7 @@ import pacman as _pac
 from pacman import generate_map, Player, WALL, PELLET, POWER, EMPTY
 from ghost  import Ghost, GHOST_COLORS
 import pathfinder
-from obs import (build_spatial, build_global_spatial, build_vector, build_valid_mask, actions_to_tasks, MAX_H, MAX_W, MAX_GHOSTS, UNKNOWN, SPATIAL_CH, VEC_DIM)
+from obs import (build_spatial, build_global_spatial, build_vector, build_valid_mask, actions_to_tasks, MAX_H, MAX_W, MAX_GHOSTS, UNKNOWN, SPATIAL_CH, GLOBAL_SPATIAL_CH, VEC_DIM)
 from reward import RewardShaper
 from allocator import generate_tasks as heuristic_generate_tasks
 
@@ -123,7 +123,7 @@ class Env:
             z = lambda s: np.zeros(s, dtype=np.float32)
             return ([], z((0, SPATIAL_CH, R, C)), z((0, VEC_DIM)),
                     np.zeros((0, R, C), dtype=bool),
-                    z((0, R, C)), z((5, R, C)), (R, C))
+                    z((0, R, C)), z((GLOBAL_SPATIAL_CH, R, C)), (R, C))
         return (alive, np.stack(sp), np.stack(ve), np.stack(vm), np.stack(ht), global_sp, (R, C))
 
     def step(self, action_dict: dict, bc_prob: float = 0.0):
@@ -183,10 +183,9 @@ class Env:
             self.player.update(self.ghosts)
             powered = self.player.powered
             for gid, ghost in list(self.ghosts.items()):
-                new_cells, stale_refresh = ghost.update((self.player.row, self.player.col), powered, self.ghosts)
-                if gid in rewards:
-                    explore_r = (new_cells * 0.01) + (stale_refresh * 0.005)
-                    rewards[gid] += min(explore_r, 0.75)  #caps exploration reward per frame
+                if ghost.dead:
+                    continue
+                ghost.update((self.player.row, self.player.col), powered, self.ghosts)
             if not self.player.dead:
                 for gid, ghost in list(self.ghosts.items()):
                     if ghost.dead:
@@ -198,18 +197,21 @@ class Env:
                         if self.player.powered:
                             ghost.kill()
                             if gid in rewards:
-                                rewards[gid] -= 30.0
+                                rewards[gid] -= 40.0
                         else:
                             self.player.die()
                             done = True
                             if gid in rewards:
                                 rewards[gid] += 100.0
-                            # ADD: shared team reward for all other living ghosts
-                            TEAM_KILL_SHARE = 0.15   # 15% of kill reward shared
+                            TEAM_KILL_SHARE = 0.60   #60% of kill reward shared
                             for other_gid, other_ghost in self.ghosts.items():
                                 if other_gid != gid and not other_ghost.dead and other_gid in rewards:
-                                    rewards[other_gid] += 100.0 * TEAM_KILL_SHARE
+                                    dist = abs(other_ghost.row - self.player.row) + abs(other_ghost.col - self.player.col)
+                                    proximity_scale = math.exp(-dist / 5.0)
+                                    rewards[other_gid] += 100.0 * TEAM_KILL_SHARE * proximity_scale
                             break
+                if not any(not g.dead for g in self.ghosts.values()):
+                    done = True
             if done:
                 break
             if int(np.sum(np.isin(self.grid, (PELLET, POWER)))) == 0:
@@ -232,6 +234,8 @@ class Env:
             base_area = 33 * 41   # full grid area
             step_cost = 0.05 * (grid_area / base_area)   # 0.009 on 7x9, scales to 0.05 on 33x41
             for gid in rewards:
+                if self.ghosts[gid].dead:
+                    continue
                 rewards[gid] -= step_cost    #per-frame step cost
         for gid, g in self.ghosts.items():
             if not g.dead and gid in rewards:

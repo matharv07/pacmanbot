@@ -184,25 +184,21 @@ class CBBA_Agent:
         i = self.gid
         def sk(a): return s_k.get(a, s_k.get(str(a), -1))  #k's timestamp for agent a
         def si(a): return s_i.get(a, s_i.get(str(a), -1))  #i's timestamp for agent a
-
         if z_kj == k:           #sender claims self as winner
             if z_ij == i: return "update" if y_kj > y_ij else "leave"
             elif z_ij == k: return "update" if sk(k) > si(k) else "leave"
             elif z_ij is None: return "update"
             else: return "update" if y_kj > y_ij else "leave"  #z_ij == m
-
         elif z_kj == i:         #sender claims receiver as winner
             if z_ij == i: return "leave"
             elif z_ij == k: return "reset"
             elif z_ij is None: return "update"
             else: return "update" if sk(i) > si(i) else "leave"  #z_ij == m
-
         elif z_kj is None:      #sender says unassigned
             if z_ij == i: return "leave"
             elif z_ij == k: return "update" if sk(k) > si(k) else "leave"
             elif z_ij is None: return "leave"
             else: return "update" if sk(z_ij) > si(z_ij) else "leave"  #z_ij == m
-
         else:                   #sender claims third agent m as winner
             m = z_kj
             if z_ij == i: return "update" if sk(m) > si(m) else "leave"

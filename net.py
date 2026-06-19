@@ -87,13 +87,15 @@ class GhostActor(nn.Module):
         #independent sigmoid scores for CBBA
         scores = torch.sigmoid(logits)
         B = spatial.shape[0]
+        base_invalid = ~mask.reshape(B, -1)
         flat = logits.view(B, -1).clone()
         flat = torch.nan_to_num(flat, nan=float('-inf'))
         sel_idx, sel_lp = [], []
         for _ in range(K):
             inf_mask = torch.isinf(flat) & (flat < 0)
             all_inf = inf_mask.all(dim=1, keepdim=True)
-            flat = torch.where(all_inf, 0.0, flat)
+            fallback = torch.where(base_invalid, torch.full_like(flat, float('-inf')), torch.zeros_like(flat))
+            flat = torch.where(all_inf, fallback, flat)
             dist = torch.distributions.Categorical(logits=flat)
             idx  = dist.sample()
             sel_idx.append(idx)
@@ -120,18 +122,22 @@ class GhostActor(nn.Module):
         """
         feats, pool, vec = self.encode(spatial, vector)
         logits = self.logits_from_features(feats, mask)
+        B = spatial.shape[0]
+        base_invalid = ~mask.reshape(B, -1)
         flat_clean = torch.nan_to_num(
-            logits.view(logits.shape[0], -1), nan=float('-inf'))
+            logits.view(B, -1), nan=float('-inf'))
         inf_mask_clean = torch.isinf(flat_clean) & (flat_clean < 0)
         all_inf_clean = inf_mask_clean.all(dim=1, keepdim=True)
-        flat_clean = torch.where(all_inf_clean, 0.0, flat_clean)
+        fallback_clean = torch.where(base_invalid, torch.full_like(flat_clean, float('-inf')), torch.zeros_like(flat_clean))
+        flat_clean = torch.where(all_inf_clean, fallback_clean, flat_clean)
         flat = flat_clean.clone()
         lp_list, ent_list = [], []
         K = actions.shape[1]
         for k in range(K):
             inf_mask = torch.isinf(flat) & (flat < 0)
             all_inf = inf_mask.all(dim=1, keepdim=True)
-            flat = torch.where(all_inf, 0.0, flat)
+            fallback = torch.where(base_invalid, torch.full_like(flat, float('-inf')), torch.zeros_like(flat))
+            flat = torch.where(all_inf, fallback, flat)
             dist = torch.distributions.Categorical(logits=flat)
             lp_list.append(dist.log_prob(actions[:, k]))
             ent_list.append(dist.entropy())

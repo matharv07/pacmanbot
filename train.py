@@ -45,6 +45,35 @@ CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+class RunningMeanStd(nn.Module):
+    def __init__(self, epsilon=1e-4, shape=()):
+        super().__init__()
+        self.register_buffer("mean", torch.zeros(shape, dtype=torch.float64))
+        self.register_buffer("var", torch.ones(shape, dtype=torch.float64))
+        self.register_buffer("count", torch.tensor(epsilon, dtype=torch.float64))
+
+    def update(self, x):
+        batch_mean = x.mean(dim=0).double()
+        batch_var = x.var(dim=0, unbiased=False).double()
+        batch_count = x.shape[0]
+
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + (delta ** 2) * self.count * batch_count / total_count
+        new_var = M2 / total_count
+        self.mean.copy_(new_mean)
+        self.var.copy_(new_var)
+        self.count.copy_(total_count)
+
+    def forward(self, x, unnorm=False):
+        if unnorm:
+            return x * torch.sqrt(self.var.float()) + self.mean.float()
+        return (x - self.mean.float()) / torch.sqrt(self.var.float() + 1e-8)
+
 class BatchTransfer:
     def __init__(self, device):
         self.host_buf = None
@@ -264,17 +293,20 @@ def train():
     critic_rollout.load_state_dict(critic.state_dict())
     actor_rollout.eval()
     critic_rollout.eval()
+    ret_rms = RunningMeanStd(shape=()).to(DEVICE)
     opt_actor  = torch.optim.Adam(actor.parameters(), lr=LR)
     opt_critic = torch.optim.Adam(critic.parameters(), lr=LR*2)
     start_update = 1
     episodes     = 0
     total_steps  = 0
+    ema_return   = 0.0
+    bc_decay_step = 0
     if "--resume" in sys.argv:
         ckpts = sorted(glob.glob(os.path.join(CKPT_DIR, "ckpt_*.pt")), key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[1]))
         if ckpts:
             ckpt_path = ckpts[-1]
             print(f"Resuming from {ckpt_path} ...")
-            ckpt = torch.load(ckpt_path, map_location=DEVICE)
+            ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
             actor.load_state_dict(ckpt["actor"])
             try:
                 critic_sd = ckpt["critic"]
@@ -290,11 +322,22 @@ def train():
             except Exception as e:
                 print(f"Warning: Could not fully restore critic weights: {e}")
             opt_actor.load_state_dict(ckpt["opt_actor"])
+            if "ret_rms" in ckpt:
+                ret_rms.load_state_dict(ckpt["ret_rms"])
             curriculum.load_state_dict(ckpt["curriculum"])
             start_update = ckpt["update"] + 1
             episodes     = ckpt.get("episodes", 0)
             total_steps  = ckpt.get("total_steps", ckpt["update"] * ROLLOUT_STEPS * NUM_ENVS)
-            #restore curriculum stage in VecEnv
+            ema_return   = ckpt.get("ema_return", 0.0)
+            bc_decay_step = ckpt.get("bc_decay_step", 0)
+            global critic_warmup_remaining
+            critic_warmup_remaining = ckpt.get("critic_warmup_remaining", 0)
+            if "rng_state" in ckpt:
+                torch.set_rng_state(ckpt["rng_state"].cpu())
+            if "np_rng_state" in ckpt:
+                np.random.set_state(ckpt["np_rng_state"])
+            actor_rollout.load_state_dict(actor.state_dict())
+            critic_rollout.load_state_dict(critic.state_dict())
             stage = curriculum.stage
             vec_env.set_curriculum(stage.rows, stage.cols,stage.n_ghosts, stage.n_power, static_pacman=(start_update <= 50 and CURRICULUM_START_STAGE == 0))
             print(f"Resumed at update {start_update}, stage {curriculum.stage_idx} ({stage.rows}×{stage.cols}, {stage.n_ghosts}g)")
@@ -303,9 +346,9 @@ def train():
     print("VecEnv initialized. Starting training...")
     t0 = time.time()
 
-    def ppo_worker(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_act, b_olp, b_adv, b_ret, lam_bc, mean_ret, mean_pac, episodes, total_steps, t_rollout, t0_ref, bc_prob, realized_merge_rate):
+    def ppo_worker(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_act, b_olp, b_adv, b_ret, lam_bc, anneal_frac, mean_ret, mean_pac, episodes, total_steps, t_rollout, t0_ref, bc_prob, realized_merge_rate, ret_rms):
         t_ppo_start = time.time()
-        metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "n_batches": 0}    
+        metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "approx_kl": 0, "clip_fraction": 0, "n_batches": 0}    
         N_total = b_sp.shape[0]
         from collections import defaultdict
         uid_to_indices = defaultdict(list)
@@ -349,10 +392,13 @@ def train():
                 mb_c_pool = critic.encode_spatial(mb_gsp_unique)
                 v_pred = critic.forward_from_pool(mb_c_pool[inv_idx], mb_cve).squeeze(-1)
                 ratio = torch.exp(new_lp - mb_olp)
+                with torch.no_grad():
+                    approx_kl = 0.5 * (new_lp - mb_olp).pow(2).mean()
+                    clip_fraction = (torch.abs(ratio - 1.0) > CLIP_EPS).float().mean()
                 s1 = ratio * mb_adv
                 s2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * mb_adv
                 a_loss = -torch.min(s1, s2).mean()
-                v_loss = F.smooth_l1_loss(v_pred, mb_ret)
+                v_loss = F.smooth_l1_loss(v_pred, ret_rms(mb_ret))
                 mb_ht_masked = mb_ht * mb_vm.float()
                 ht_flat     = mb_ht_masked.view(mb_ht_masked.shape[0], -1)
                 ht_row_sums = ht_flat.sum(dim=1)
@@ -389,6 +435,8 @@ def train():
                 metrics["value_loss"] += v_loss.item()
                 metrics["bc_loss"]    += bc.item()
                 metrics["entropy"]    += ent.mean().item()
+                metrics["approx_kl"]  += approx_kl.item()
+                metrics["clip_fraction"] += clip_fraction.item()
                 metrics["n_batches"]  += 1
         t_ppo = time.time() - t_ppo_start
         if critic_warmup_remaining > 0:
@@ -398,8 +446,7 @@ def train():
     current_returns = [0.0] * NUM_ENVS
     batch_transfer = BatchTransfer(DEVICE)
     for update in range(start_update, 50_001):
-        decay_step_curr = max(0, update - 50)
-        anneal_frac = math.exp(-decay_step_curr / BC_ANNEAL_UPDATES)
+        anneal_frac = math.exp(-bc_decay_step / BC_ANNEAL_UPDATES)
         bc_prob = anneal_frac if anneal_frac >= 0.05 else 0.0
         if update == 51 and CURRICULUM_START_STAGE == 0:
             print("Transitioning to moving Pacman (static_pacman = False)...")
@@ -498,6 +545,7 @@ def train():
                     idx, lp, scores, pool, vec = actor_rollout(
                         t_sp, t_ve, t_vm, K=K_NOMINATIONS)
                     val = _critic_value(critic_rollout, t_gsp_unique, t_cve, active_n_ghosts)
+                    val = ret_rms(val, unnorm=True)
                 idx_np = idx.cpu().numpy()
                 sc_np  = scores.cpu().numpy()
                 lp_np  = lp.cpu().numpy()
@@ -577,6 +625,7 @@ def train():
             with torch.inference_mode():
                 _, _, _, pool, vec = actor_rollout(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
                 val = _critic_value(critic_rollout, t_gsp_unique, t_cve, boot_n_ghosts)
+                val = ret_rms(val, unnorm=True)
             v_np = val.cpu().numpy()
             offset = 0
             gids_iter = iter(boot_gids_list)
@@ -647,6 +696,13 @@ def train():
         t_rollout = time.time() - t_start_rollout
         mean_ret = round(float(np.mean(ep_returns)), 3) if ep_returns else None
         mean_pac = round(float(np.mean(ep_pacman_scores)), 1) if ep_pacman_scores else None
+        if update > 50 and mean_ret is not None:
+            if ema_return == 0.0:
+                ema_return = mean_ret
+            else:
+                ema_return = 0.95 * ema_return + 0.05 * mean_ret
+            if mean_ret >= 0.95 * ema_return:
+                bc_decay_step += 1
         if train_thread is not None:
             train_thread.join()
             train_thread = None
@@ -666,6 +722,8 @@ def train():
                 "value_loss": round(m["value_loss"] / nb, 5),
                 "bc_loss":    round(m["bc_loss"] / nb, 5),
                 "entropy":    round(m["entropy"] / nb, 5),
+                "approx_kl":  round(m["approx_kl"] / nb, 5),
+                "clip_frac":  round(m["clip_fraction"] / nb, 4),
                 "bc_coef":    round(res["lam_bc"], 4),
                 "bc_prob":    round(res["bc_prob"], 4),
                 "merge_rate": round(res["realized_merge_rate"], 4),
@@ -691,7 +749,6 @@ def train():
                     pg['lr'] *= 0.5
                 for pg in opt_critic.param_groups:
                     pg['lr'] *= 0.5
-                global critic_warmup_remaining
                 critic_warmup_remaining = 20
                 with open(log_path, "a") as f:
                     f.write(json.dumps({"curriculum_advance": curriculum.stage_idx, "update": p_up, "new_grid": f"{stage.rows}x{stage.cols}", "new_lr": opt_actor.param_groups[0]['lr']}) + "\n")
@@ -713,7 +770,7 @@ def train():
                 print(f"│  Episodes: {res['episodes']:<8}  Steps: {res['total_steps']:<10}  LR: {cur_lr:.2e}")
                 print(f"│  BC Coef:   {res['lam_bc']:.4f}    Policy Loss: {row['actor_loss']:>+.5f}")
                 print(f"│  BC Prob:   {res['bc_prob']:.4f} ({row['merge_rate']:.1%} merge)    Value Loss: {row['value_loss']:.5f}")
-                print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f}")
+                print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f} (KL: {row['approx_kl']:.4f}, Clip: {row['clip_frac']:.1%})")
                 ret_str = f"{row['mean_return']:.3f}" if row['mean_return'] is not None else "—"
                 pac_str = f"{row['pacman_score']:.1f}" if row['pacman_score'] is not None else "—"
                 print(f"│  Ghost Return: {ret_str:<10}  Pacman Score: {pac_str}")
@@ -725,16 +782,24 @@ def train():
                              "critic": critic.state_dict(),
                              "opt_actor": opt_actor.state_dict(),
                              "opt_critic": opt_critic.state_dict(),
+                             "ret_rms": ret_rms.state_dict(),
                              "update": p_up,
                              "episodes": res['episodes'],
                              "total_steps": res['total_steps'],
-                             "curriculum": curriculum.state_dict()}, path)
+                             "curriculum": curriculum.state_dict(),
+                             "critic_warmup_remaining": critic_warmup_remaining,
+                             "ema_return": ema_return,
+                             "bc_decay_step": bc_decay_step,
+                             "rng_state": torch.get_rng_state(),
+                             "np_rng_state": np.random.get_state()}, path)
                 with open(log_path, "a") as f:
                     f.write(json.dumps({"checkpoint": path, "update": p_up}) + "\n")
                 print(f"  💾 Checkpoint saved: {path}")
+        
+        ret_rms.update(ds_ret)
         train_thread = threading.Thread(target=ppo_worker, args=(
             update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_act, ds_olp, ds_adv, ds_ret,
-            lam_bc, mean_ret, mean_pac, episodes, total_steps, t_rollout, t0, bc_prob, realized_merge_rate))
+            lam_bc, anneal_frac, mean_ret, mean_pac, episodes, total_steps, t_rollout, t0, bc_prob, realized_merge_rate, ret_rms))
         train_thread.start()
     if train_thread is not None:
         train_thread.join()
