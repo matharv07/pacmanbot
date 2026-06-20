@@ -14,10 +14,26 @@ from collections import deque
 from ghost import Ghost, UNKNOWN
 import pathfinder
 import torch
+import argparse
+from curriculum import STAGES
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--stage", type=int, default=-1, help="Curriculum stage index to visualize")
+args, _ = parser.parse_known_args()
+
+STAGE = STAGES[args.stage] if args.stage != -1 and 0 <= args.stage < len(STAGES) else None
+if STAGE:
+    ROWS = STAGE.rows
+    COLS = STAGE.cols
+    N_POWER = STAGE.n_power
+    N_GHOSTS = STAGE.n_ghosts
+else:
+    COLS = 41
+    ROWS = 33
+    N_POWER = 28
+    N_GHOSTS = 7
 
 CELL = 20
-COLS = 41
-ROWS = 33
 WIDTH = COLS * CELL
 HEIGHT = ROWS * CELL + 48
 FPS = 10
@@ -54,6 +70,7 @@ RL_TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH - 10, ROWS * CELL + 8, TOGGLE_
 RL_ACTOR = None
 RL_DEVICE = None
 
+
 def load_rl_model():
     global RL_ACTOR, RL_DEVICE, RL_MODE
     if RL_ACTOR is not None:
@@ -83,7 +100,7 @@ def load_rl_model():
         RL_MODE = False
         return False
 
-def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = 28, random_spawn: bool = False):
+def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = N_POWER, random_spawn: bool = False):
     grid = np.full((rows, cols), WALL, dtype=np.int8)
     def in_bounds(r, c):
         return 0 < r < rows - 1 and 0 < c < cols - 1
@@ -452,7 +469,7 @@ class Game:
         first_idx = np.argmax(dist_pac)
         ghost_starts = [tuple(open_cells[first_idx])]
         available[first_idx] = False
-        for _ in range(6):
+        for _ in range(N_GHOSTS - 1):
             last_placed = np.array(ghost_starts[-1])
             dist_to_last = np.sum(np.abs(open_cells - last_placed), axis=1)
             min_dist_to_ghosts = np.minimum(min_dist_to_ghosts, dist_to_last)
@@ -461,7 +478,7 @@ class Game:
             best_idx = np.argmax(scores)
             ghost_starts.append(tuple(open_cells[best_idx]))
             available[best_idx] = False
-        self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i], self.player_start) for i, pos in enumerate(ghost_starts)}
+        self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i % len(GHOST_COLORS)], self.player_start) for i, pos in enumerate(ghost_starts)}
         self.state = "playing"
         self.message_timer = 0
         self.debug_ghost_id = 0

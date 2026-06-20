@@ -107,7 +107,7 @@ def _reconstruct(came_from: dict, node: tuple) -> list:
     path.reverse()
     return path
 
-def astar(grid: list, start: tuple, goal: tuple) -> list:
+def _astar_python(grid: list, start: tuple, goal: tuple) -> list:
     if start == goal:
         return [start]
     rows = len(grid)
@@ -143,6 +143,30 @@ def astar(grid: list, start: tuple, goal: tuple) -> list:
                 f_new = tentative_g + _manhattan(neighbour, goal)
                 heapq.heappush(open_heap, (f_new, tentative_g, neighbour))
     return []   #if goal is unreachable from start
+
+def astar(grid: list, start: tuple, goal: tuple) -> list:
+    if start == goal:
+        return [start]
+    if _SCIPY_AVAILABLE:
+        cache = get_scipy_graph(grid)
+        if cache is not None:
+            graph, open_cells, cell_to_idx = cache
+            if start in cell_to_idx and goal in cell_to_idx:
+                src_idx = cell_to_idx[start]
+                tidx = cell_to_idx[goal]
+                dist_arr, predecessors = scipy_dijkstra(csgraph=graph, directed=False, indices=src_idx, return_predecessors=True)
+                d = float(dist_arr[tidx])
+                if math.isfinite(d):
+                    path_idx = []
+                    node = tidx
+                    while node != -9999 and node >= 0 and node != src_idx:
+                        path_idx.append(node)
+                        node = int(predecessors[node])
+                    if node == src_idx:
+                        path_idx.append(src_idx)
+                    path_idx.reverse()
+                    return [open_cells[i] for i in path_idx]
+    return _astar_python(grid, start, goal)
 
 def dijkstra_multi(grid: list, start: tuple, targets: list) -> dict:
     if _SCIPY_AVAILABLE:

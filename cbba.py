@@ -25,6 +25,11 @@ class CBBA_Agent:
         self._task_map: dict = {}
         self._last_auction: int = -1
         self._dist_cache: dict = {}   #(pos) -> distance, cached per-auction
+        self._astar_cache: dict = {}  #persists across auctions
+
+    def reset_caches(self):
+        self._dist_cache.clear()
+        self._astar_cache.clear()
 
     def step(self, ghost, frame: int) -> Optional[Task]:
         changed = False
@@ -104,7 +109,6 @@ class CBBA_Agent:
         valid_keys = {_task_key(t) for t in tasks}
         self._task_map.update({_task_key(t): t for t in tasks})
         self._dist_cache = {pos: d for pos, (d, _) in dists.items()}
-        self._astar_cache = {}
         #pruning bundle & path: keeping only tasks we still own in the new task set
         new_bundle = []
         for k in self.bundle:

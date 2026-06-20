@@ -26,26 +26,10 @@ import queue
 from collections import defaultdict
 import requests
 
-def push_to_discord(metrics_row):
-    WEBHOOK_URL = "https://discord.com/api/webhooks/1517789818925355038/bQViFgk0J4zcvDYg9av8s8mv6gtlLvAC-342n2P2dS-5pcDIwlf3-5gAfgaSCxfFZAml"
-    elapsed = metrics_row.get('wall_s', 0)
-    mins, secs = divmod(int(elapsed), 60)
-    hrs, mins = divmod(mins, 60)
-    runtime = f"{hrs}h {mins:02d}m {secs:02d}s" if hrs else f"{mins}m {secs:02d}s"
-    msg = (f"**Update {metrics_row['update']}** (Stage {metrics_row['curriculum_stage']} | {metrics_row['grid_size']} | Runtime: {runtime})\n"
-        f"> **Mean Return:** `{metrics_row['mean_return']}`\n"
-        f"> **Pacman Score:** `{metrics_row['pacman_score']}`\n"
-        f"> **Policy Loss:** `{metrics_row['actor_loss']}`\n"
-        f"> **Value Loss:** `{metrics_row['value_loss']}`\n"
-        f"> **Entropy:** `{metrics_row['entropy']}`")
-    try:
-        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=3)
-    except:
-        pass
-
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
+torch.set_num_threads(1)
 
-NUM_ENVS        = 10
+NUM_ENVS        = 8
 ROLLOUT_STEPS   = 256
 MINI_BATCH      = 2048  
 PPO_EPOCHS      = 12    
@@ -68,6 +52,94 @@ CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+STOP_TRAINING = False
+
+def get_discord_webhook():
+    env_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if env_url:
+        return env_url
+    if os.path.exists("discord_webhook.txt"):
+        try:
+            with open("discord_webhook.txt", "r") as f:
+                url = f.read().strip()
+                if url:
+                    return url
+        except:
+            pass
+    return None
+
+def check_stop_trigger():
+    global STOP_TRAINING
+    if os.path.exists("stop_training") or os.path.exists("stop.txt"):
+        STOP_TRAINING = True
+        print("\n🛑 Stop signal detected via local file!")
+        return True
+    discord_token = os.environ.get("DISCORD_BOT_TOKEN")
+    if discord_token:
+        try:
+            WEBHOOK_URL = get_discord_webhook()
+            if not WEBHOOK_URL:
+                return False
+            webhook_info = requests.get(WEBHOOK_URL, timeout=3).json()
+            channel_id = webhook_info.get("channel_id")
+            if channel_id:
+                headers = {"Authorization": f"Bot {discord_token}"}
+                messages_url = f"https://discord.com/api/v10/channels/{channel_id}/messages?limit=5"
+                r = requests.get(messages_url, headers=headers, timeout=3)
+                if r.status_code == 200:
+                    for msg in r.json():
+                        content = msg.get("content", "").strip().lower()
+                        if content == "!stop":
+                            STOP_TRAINING = True
+                            print("\n🛑 Stop signal detected via Discord chat command '!stop'!")
+                            requests.post(WEBHOOK_URL, json={"content": "🛑 **Stop signal received from Discord! Saving checkpoint and shutting down training loop...**"}, timeout=3)
+                            return True
+        except:
+            pass
+    return False
+
+def push_to_discord(metrics_row):
+    WEBHOOK_URL = get_discord_webhook()
+    if not WEBHOOK_URL:
+        return
+    elapsed = metrics_row.get('wall_s', 0)
+    mins, secs = divmod(int(elapsed), 60)
+    hrs, mins = divmod(mins, 60)
+    runtime = f"{hrs}h {mins:02d}m {secs:02d}s" if hrs else f"{mins}m {secs:02d}s"
+    bc_coef = metrics_row.get('bc_coef', 0.0)
+    if bc_coef > 0.25:
+        phase = "Hybrid RL + IL"
+    elif bc_coef > 0.06:
+        phase = "IL -> RL Transition"
+    else:
+        phase = "Pure RL"
+    ret_str = f"{metrics_row['mean_return']:.3f}" if metrics_row['mean_return'] is not None else "—"
+    pac_str = f"{metrics_row['pacman_score']:.1f}" if metrics_row['pacman_score'] is not None else "—"
+    msg = (f"**Update {metrics_row['update']}** | Stage {metrics_row['curriculum_stage']} ({metrics_row['grid_size']}) | Runtime: {runtime}\n"
+        f"```ml\n"
+        f"Phase:            {phase}\n"
+        f"Learning Rate:    {metrics_row.get('lr', 0.0):.2e}\n"
+        f"Episodes / Steps: {metrics_row['episodes']} / {metrics_row['steps']}\n"
+        f"-----------------------------------------\n"
+        f"Mean Return:      {ret_str}\n"
+        f"Pacman Score:     {pac_str}\n"
+        f"-----------------------------------------\n"
+        f"Policy Loss:      {metrics_row['actor_loss']:+.5f}\n"
+        f"Value Loss:       {metrics_row['value_loss']:.5f}\n"
+        f"BC Loss:          {metrics_row['bc_loss']:.5f}\n"
+        f"Entropy:          {metrics_row['entropy']:.5f}\n"
+        f"Approx KL:        {metrics_row['approx_kl']:.5f}\n"
+        f"Clip Fraction:    {metrics_row['clip_frac']:.1%}\n"
+        f"-----------------------------------------\n"
+        f"BC Coef / Prob:   {bc_coef:.4f} / {metrics_row.get('bc_prob', 0.0):.4f}\n"
+        f"Merge Rate:       {metrics_row.get('merge_rate', 0.0):.1%}\n"
+        f"Timings:          Rollout {metrics_row.get('t_rollout', 0.0)}s | PPO {metrics_row.get('t_ppo', 0.0)}s\n"
+        f"```")
+    try:
+        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=3)
+    except:
+        pass
+
 class RunningMeanStd(nn.Module):
     def __init__(self, epsilon=1e-4, shape=()):
         super().__init__()
@@ -79,10 +151,8 @@ class RunningMeanStd(nn.Module):
         batch_mean = x.mean(dim=0).double()
         batch_var = x.var(dim=0, unbiased=False).double()
         batch_count = x.shape[0]
-
         delta = batch_mean - self.mean
         total_count = self.count + batch_count
-
         new_mean = self.mean + delta * batch_count / total_count
         m_a = self.var * self.count
         m_b = batch_var * batch_count
@@ -737,8 +807,7 @@ def train():
             p_up = res["update"]
             m = res["metrics"]
             nb = max(1, m["n_batches"])
-            row = {
-                "update":     p_up,
+            row = {"update":     p_up,
                 "episodes":   res["episodes"],
                 "steps":      res["total_steps"],
                 "wall_s":     res["wall_s"],
@@ -755,7 +824,9 @@ def train():
                 "pacman_score": res["mean_pac"],
                 "curriculum_stage": curriculum.stage_idx,
                 "grid_size": f"{curriculum.stage.rows}x{curriculum.stage.cols}",
-            }
+                "lr":         opt_actor.param_groups[0]['lr'],
+                "t_rollout":  round(res["t_rollout"], 1),
+                "t_ppo":      round(res["t_ppo"], 1)}
             with open(log_path, "a") as f:
                 f.write(json.dumps(row) + "\n")
             curriculum.record_return(res["mean_ret"] if res["lam_bc"] <= BC_ADVANCE_GATE else None)
@@ -821,7 +892,28 @@ def train():
                 with open(log_path, "a") as f:
                     f.write(json.dumps({"checkpoint": path, "update": p_up}) + "\n")
                 print(f"  💾 Checkpoint saved: {path}")
-        
+            if check_stop_trigger():
+                path = os.path.join(CKPT_DIR, f"ckpt_stop_{p_up}.pt")
+                torch.save({"actor": actor.state_dict(),
+                             "critic": critic.state_dict(),
+                             "opt_actor": opt_actor.state_dict(),
+                             "opt_critic": opt_critic.state_dict(),
+                             "ret_rms": ret_rms.state_dict(),
+                             "update": p_up,
+                             "episodes": res['episodes'],
+                             "total_steps": res['total_steps'],
+                             "curriculum": curriculum.state_dict(),
+                             "critic_warmup_remaining": critic_warmup_remaining,
+                             "ema_return": ema_return,
+                             "bc_decay_step": bc_decay_step,
+                             "rng_state": torch.get_rng_state(),
+                             "np_rng_state": np.random.get_state()}, path)
+                print(f"  💾 Emergency Checkpoint saved: {path}")
+                for tf in ["stop_training", "stop.txt"]:
+                    if os.path.exists(tf):
+                        try: os.remove(tf)
+                        except: pass
+                break
         ret_rms.update(ds_ret)
         train_thread = threading.Thread(target=ppo_worker, args=(
             update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_act, ds_olp, ds_adv, ds_ret,
