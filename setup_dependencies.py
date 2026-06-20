@@ -2,7 +2,7 @@ import sys
 import subprocess
 import importlib.util
 
-REQUIRED_PACKAGES = {"torch": "torch", "numpy": "numpy", "pygame": "pygame", "scipy": "scipy"}
+REQUIRED_PACKAGES = {"torch": "torch", "numpy": "numpy", "pygame": "pygame", "scipy": "scipy", "requests": "requests"}
 
 def is_installed(module_name: str) -> bool:
     return importlib.util.find_spec(module_name) is not None

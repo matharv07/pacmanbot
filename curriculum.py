@@ -22,11 +22,12 @@ class Stage:
     n_ghosts: int
     n_power: int           
     advance_return: float
+    min_updates: int
 
-STAGES = [Stage(rows=7,  cols=9,  n_ghosts=2, n_power=2,  advance_return=42.0),
-    Stage(rows=13, cols=17, n_ghosts=3, n_power=6,  advance_return=32.0),
-    Stage(rows=21, cols=27, n_ghosts=5, n_power=14, advance_return=24.0),
-    Stage(rows=33, cols=41, n_ghosts=7, n_power=28, advance_return=float('inf'))]
+STAGES = [Stage(rows=7,  cols=9,  n_ghosts=2, n_power=2,  advance_return=42.0, min_updates=150),
+    Stage(rows=13, cols=17, n_ghosts=3, n_power=6,  advance_return=40.0, min_updates=350),
+    Stage(rows=21, cols=27, n_ghosts=5, n_power=14, advance_return=28.0, min_updates=500),
+    Stage(rows=33, cols=41, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0)]
 
 ADVANCE_WINDOW = 150   #minimum updates required per stage
 
@@ -50,7 +51,7 @@ class CurriculumScheduler:
     def should_advance(self) -> bool:
         if self.is_final:
             return False
-        if self._updates_in_stage < ADVANCE_WINDOW:
+        if self._updates_in_stage < self.stage.min_updates:
             return False
         if len(self._return_history) < ADVANCE_WINDOW // 2:
             return False

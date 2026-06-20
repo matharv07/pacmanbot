@@ -20,13 +20,35 @@ from net    import GhostActor, GhostCritic
 from worker import Env
 from obs    import MAX_H, MAX_W, MAX_GHOSTS, SPATIAL_CH, VEC_DIM, CRITIC_VEC_DIM
 from curriculum import CurriculumScheduler, STAGES
+import traceback
+import threading
+import queue
+from collections import defaultdict
+import requests
+
+def push_to_discord(metrics_row):
+    WEBHOOK_URL = "https://discord.com/api/webhooks/1517789818925355038/bQViFgk0J4zcvDYg9av8s8mv6gtlLvAC-342n2P2dS-5pcDIwlf3-5gAfgaSCxfFZAml"
+    elapsed = metrics_row.get('wall_s', 0)
+    mins, secs = divmod(int(elapsed), 60)
+    hrs, mins = divmod(mins, 60)
+    runtime = f"{hrs}h {mins:02d}m {secs:02d}s" if hrs else f"{mins}m {secs:02d}s"
+    msg = (f"**Update {metrics_row['update']}** (Stage {metrics_row['curriculum_stage']} | {metrics_row['grid_size']} | Runtime: {runtime})\n"
+        f"> **Mean Return:** `{metrics_row['mean_return']}`\n"
+        f"> **Pacman Score:** `{metrics_row['pacman_score']}`\n"
+        f"> **Policy Loss:** `{metrics_row['actor_loss']}`\n"
+        f"> **Value Loss:** `{metrics_row['value_loss']}`\n"
+        f"> **Entropy:** `{metrics_row['entropy']}`")
+    try:
+        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=3)
+    except:
+        pass
 
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 
 NUM_ENVS        = 10
 ROLLOUT_STEPS   = 256
-MINI_BATCH      = 2048  # Increased to saturate GPU throughput
-PPO_EPOCHS      = 12    # Kept at 12 to maximize learning per rollout
+MINI_BATCH      = 2048  
+PPO_EPOCHS      = 12    
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
 CLIP_EPS        = 0.2
@@ -34,7 +56,7 @@ ENT_COEF        = 0.002
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 3e-4
-BC_INIT         = 0.5     # user requested reduction to prevent flattening actor loss
+BC_INIT         = 0.5
 BC_FLOOR        = 0.05
 K_NOMINATIONS   = 3
 LOG_DIR         = os.path.join(os.path.dirname(__file__), "logs")
@@ -87,7 +109,7 @@ class BatchTransfer:
         total_bytes = sum(padded_sizes)
         if self.host_buf is None or self.host_buf.numel() < total_bytes:
             new_size = max(total_bytes, self.host_buf.numel() * 2 if self.host_buf is not None else total_bytes)
-            self.host_buf = torch.empty(new_size, dtype=torch.uint8, pin_memory=True)
+            self.host_buf = torch.empty(new_size, dtype=torch.uint8, pin_memory=(self.device.type == "cuda"))
             self.dev_buf = torch.empty(new_size, dtype=torch.uint8, device=self.device)
         offset = 0
         for arr, p_size in zip(numpy_arrays, padded_sizes):
@@ -133,7 +155,6 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
         obs = env.reset()
         conn.send(obs)           #send initial observation
     except Exception as e:
-        import traceback
         traceback.print_exc()
         conn.send(e)
         return
@@ -274,8 +295,6 @@ def _critic_value(critic, spatial_unique, vector, env_n_ghosts):
 
 def train():
     os.makedirs(LOG_DIR, exist_ok=True)
-    import threading
-    import queue
     train_thread = None
     result_queue = queue.Queue()
     os.makedirs(CKPT_DIR, exist_ok=True)
@@ -351,7 +370,6 @@ def train():
         t_ppo_start = time.time()
         metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "approx_kl": 0, "clip_fraction": 0, "n_batches": 0}    
         N_total = b_sp.shape[0]
-        from collections import defaultdict
         uid_to_indices = defaultdict(list)
         b_gsp_ids_np = b_gsp_ids.cpu().numpy()
         for i in range(N_total):
@@ -449,7 +467,8 @@ def train():
         result_queue.put({"update": update, "metrics": metrics,"mean_ret": mean_ret, "mean_pac": mean_pac,
         "episodes": episodes,"total_steps": total_steps, "t_rollout": t_rollout, "t_ppo": t_ppo, "lam_bc": lam_bc, "bc_prob": bc_prob, "realized_merge_rate": realized_merge_rate, "wall_s": round(time.time() - t0_ref, 1)})
     current_returns = [0.0] * NUM_ENVS
-    batch_transfer = BatchTransfer(DEVICE)
+    rollout_transfer = BatchTransfer(DEVICE)
+    train_transfer   = BatchTransfer(DEVICE)
     for update in range(start_update, 50_001):
         anneal_frac = math.exp(-bc_decay_step / BC_ANNEAL_UPDATES)
         bc_prob = anneal_frac if anneal_frac >= 0.05 else 0.0
@@ -545,7 +564,7 @@ def train():
                 all_ve = np.concatenate(batch_ve, axis=0)
                 all_cve = np.concatenate(batch_cve, axis=0)
                 all_vm = np.concatenate(batch_vm, axis=0)
-                t_sp, t_gsp_unique, t_ve, t_cve, t_vm = batch_transfer.transfer(all_sp, all_gsp_unique, all_ve, all_cve, all_vm)
+                t_sp, t_gsp_unique, t_ve, t_cve, t_vm = rollout_transfer.transfer(all_sp, all_gsp_unique, all_ve, all_cve, all_vm)
                 with torch.inference_mode():
                     idx, lp, scores, pool, vec = actor_rollout(
                         t_sp, t_ve, t_vm, K=K_NOMINATIONS)
@@ -626,7 +645,7 @@ def train():
             cat_ve = np.concatenate(boot_ve, axis=0)
             cat_cve = np.concatenate(boot_cve, axis=0)
             cat_vm = np.concatenate(boot_vm, axis=0)
-            t_sp, t_gsp_unique, t_ve, t_cve, t_vm = batch_transfer.transfer(cat_sp, cat_gsp_unique, cat_ve, cat_cve, cat_vm)
+            t_sp, t_gsp_unique, t_ve, t_cve, t_vm = rollout_transfer.transfer(cat_sp, cat_gsp_unique, cat_ve, cat_cve, cat_vm)
             with torch.inference_mode():
                 _, _, _, pool, vec = actor_rollout(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
                 val = _critic_value(critic_rollout, t_gsp_unique, t_cve, boot_n_ghosts)
@@ -690,7 +709,7 @@ def train():
         arr_olp = np.array(all_lp, dtype=np.float32)
         arr_adv = np.array(all_adv, dtype=np.float32)
         arr_ret = np.array(all_ret, dtype=np.float32)
-        ds_sp, ds_gsp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_act, ds_olp, ds_adv, ds_ret = batch_transfer.transfer(
+        ds_sp, ds_gsp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_act, ds_olp, ds_adv, ds_ret = train_transfer.transfer(
             arr_sp, arr_gsp, arr_gsp_unique, arr_gsp_ids, arr_ve, arr_cve, arr_vm, arr_ht, arr_act, arr_olp, arr_adv, arr_ret)
         N_total = ds_sp.shape[0]
         indices = np.arange(N_total)
@@ -749,6 +768,7 @@ def train():
                 print(f"{'='*60}\n")
                 is_static_pacman = (p_up <= 50)
                 vec_env.set_curriculum(stage.rows, stage.cols,stage.n_ghosts, stage.n_power, static_pacman=is_static_pacman)
+                torch.cuda.empty_cache()
                 current_returns = [0.0] * NUM_ENVS
                 for pg in opt_actor.param_groups:
                     pg['lr'] *= 0.5
@@ -758,6 +778,7 @@ def train():
                 with open(log_path, "a") as f:
                     f.write(json.dumps({"curriculum_advance": curriculum.stage_idx, "update": p_up, "new_grid": f"{stage.rows}x{stage.cols}", "new_lr": opt_actor.param_groups[0]['lr']}) + "\n")
             if p_up % 10 == 0:
+                threading.Thread(target=push_to_discord, args=(row,), daemon=True).start()
                 elapsed = res["wall_s"]
                 mins, secs = divmod(int(elapsed), 60)
                 hrs, mins = divmod(mins, 60)
