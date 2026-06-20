@@ -20,13 +20,18 @@ from net    import GhostActor, GhostCritic
 from worker import Env
 from obs    import MAX_H, MAX_W, MAX_GHOSTS, SPATIAL_CH, VEC_DIM, CRITIC_VEC_DIM
 from curriculum import CurriculumScheduler, STAGES
+import traceback
+import threading
+import queue
+from collections import defaultdict
+import requests
 
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 
-NUM_ENVS        = 10
+NUM_ENVS        = 14    #10 for laptop, 14 for pc
 ROLLOUT_STEPS   = 256
-MINI_BATCH      = 2048  # Increased to saturate GPU throughput
-PPO_EPOCHS      = 12    # Kept at 12 to maximize learning per rollout
+MINI_BATCH      = 2048  
+PPO_EPOCHS      = 12    
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
 CLIP_EPS        = 0.2
@@ -34,7 +39,7 @@ ENT_COEF        = 0.002
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 3e-4
-BC_INIT         = 0.5     # user requested reduction to prevent flattening actor loss
+BC_INIT         = 0.5
 BC_FLOOR        = 0.05
 K_NOMINATIONS   = 3
 LOG_DIR         = os.path.join(os.path.dirname(__file__), "logs")
@@ -45,6 +50,23 @@ TARGET_KL       = 0.02
 CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def push_to_discord(metrics_row):
+    WEBHOOK_URL = "https://discord.com/api/webhooks/1517789818925355038/bQViFgk0J4zcvDYg9av8s8mv6gtlLvAC-342n2P2dS-5pcDIwlf3-5gAfgaSCxfFZAml"
+    elapsed = metrics_row.get('wall_s', 0)
+    mins, secs = divmod(int(elapsed), 60)
+    hrs, mins = divmod(mins, 60)
+    runtime = f"{hrs}h {mins:02d}m {secs:02d}s" if hrs else f"{mins}m {secs:02d}s"
+    msg = (f"**Update {metrics_row['update']}** (Stage {metrics_row['curriculum_stage']} | {metrics_row['grid_size']} | Runtime: {runtime})\n"
+        f"> **Mean Return:** `{metrics_row['mean_return']}`\n"
+        f"> **Pacman Score:** `{metrics_row['pacman_score']}`\n"
+        f"> **Policy Loss:** `{metrics_row['actor_loss']}`\n"
+        f"> **Value Loss:** `{metrics_row['value_loss']}`\n"
+        f"> **Entropy:** `{metrics_row['entropy']}`")
+    try:
+        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=3)
+    except:
+        pass
 
 class RunningMeanStd(nn.Module):
     def __init__(self, epsilon=1e-4, shape=()):
@@ -133,7 +155,6 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
         obs = env.reset()
         conn.send(obs)           #send initial observation
     except Exception as e:
-        import traceback
         traceback.print_exc()
         conn.send(e)
         return
@@ -274,8 +295,6 @@ def _critic_value(critic, spatial_unique, vector, env_n_ghosts):
 
 def train():
     os.makedirs(LOG_DIR, exist_ok=True)
-    import threading
-    import queue
     train_thread = None
     result_queue = queue.Queue()
     os.makedirs(CKPT_DIR, exist_ok=True)
@@ -351,7 +370,6 @@ def train():
         t_ppo_start = time.time()
         metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "approx_kl": 0, "clip_fraction": 0, "n_batches": 0}    
         N_total = b_sp.shape[0]
-        from collections import defaultdict
         uid_to_indices = defaultdict(list)
         b_gsp_ids_np = b_gsp_ids.cpu().numpy()
         for i in range(N_total):
@@ -758,6 +776,7 @@ def train():
                 with open(log_path, "a") as f:
                     f.write(json.dumps({"curriculum_advance": curriculum.stage_idx, "update": p_up, "new_grid": f"{stage.rows}x{stage.cols}", "new_lr": opt_actor.param_groups[0]['lr']}) + "\n")
             if p_up % 10 == 0:
+                threading.Thread(target=push_to_discord, args=(row,), daemon=True).start()
                 elapsed = res["wall_s"]
                 mins, secs = divmod(int(elapsed), 60)
                 hrs, mins = divmod(mins, 60)
