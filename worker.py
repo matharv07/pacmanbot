@@ -226,8 +226,8 @@ class Env:
                     if not self.player.powered:
                         pr, pc = self.player.row, self.player.col
                         dist = abs(ghost_prox.row - pr) + abs(ghost_prox.col - pc)
-                        # reward peaks at 0.04 when adjacent, decays to ~0 beyond 8 cells
-                        prox = 0.04 * math.exp(-dist / 3.0)
+                        # reward peaks at 0.20 when adjacent, decays to ~0 beyond 8 cells
+                        prox = 0.20 * math.exp(-dist / 3.0)
                         rewards[gid_prox] += prox
 
             grid_area = self.grid_rows * self.grid_cols

@@ -24,8 +24,8 @@ class Stage:
     advance_return: float
 
 STAGES = [Stage(rows=7,  cols=9,  n_ghosts=2, n_power=2,  advance_return=42.0),
-    Stage(rows=13, cols=17, n_ghosts=3, n_power=6,  advance_return=12.0),
-    Stage(rows=21, cols=27, n_ghosts=5, n_power=14, advance_return=18.0),
+    Stage(rows=13, cols=17, n_ghosts=3, n_power=6,  advance_return=32.0),
+    Stage(rows=21, cols=27, n_ghosts=5, n_power=14, advance_return=24.0),
     Stage(rows=33, cols=41, n_ghosts=7, n_power=28, advance_return=float('inf'))]
 
 ADVANCE_WINDOW = 150   #minimum updates required per stage

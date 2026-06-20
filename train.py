@@ -35,12 +35,13 @@ VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 3e-4
 BC_INIT         = 0.5     # user requested reduction to prevent flattening actor loss
-BC_FLOOR        = 0.002
+BC_FLOOR        = 0.05
 K_NOMINATIONS   = 3
 LOG_DIR         = os.path.join(os.path.dirname(__file__), "logs")
 CKPT_DIR        = os.path.join(os.path.dirname(__file__), "checkpoints")
 BC_ANNEAL_UPDATES = 150
 BC_ADVANCE_GATE = 0.10
+TARGET_KL       = 0.02
 CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -358,6 +359,7 @@ def train():
         unique_uids = list(uid_to_indices.keys())
         global critic_warmup_remaining
         for epoch_i in range(PPO_EPOCHS):
+            epoch_kls = []
             np.random.shuffle(unique_uids)
             uid_batches = []
             cur_batch = []
@@ -438,6 +440,9 @@ def train():
                 metrics["approx_kl"]  += approx_kl.item()
                 metrics["clip_fraction"] += clip_fraction.item()
                 metrics["n_batches"]  += 1
+                epoch_kls.append(approx_kl.item())
+            if np.mean(epoch_kls) > 1.5 * TARGET_KL:
+                break
         t_ppo = time.time() - t_ppo_start
         if critic_warmup_remaining > 0:
             critic_warmup_remaining -= 1
@@ -759,7 +764,7 @@ def train():
                 runtime = f"{hrs}h {mins:02d}m {secs:02d}s" if hrs else f"{mins}m {secs:02d}s"
                 if res["lam_bc"] > 0.25:
                     phase = "\033[95mHybrid RL + IL\033[0m"
-                elif res["lam_bc"] > 0.02:
+                elif res["lam_bc"] > 0.06:
                     phase = "\033[93mIL → RL Transition\033[0m"
                 else:
                     phase = "\033[92mReinforcement Learning\033[0m"
