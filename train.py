@@ -28,7 +28,7 @@ import requests
 
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 
-NUM_ENVS        = 14    #10 for laptop, 14 for pc
+NUM_ENVS        = 16
 ROLLOUT_STEPS   = 256
 MINI_BATCH      = 2048  
 PPO_EPOCHS      = 12    
@@ -109,7 +109,7 @@ class BatchTransfer:
         total_bytes = sum(padded_sizes)
         if self.host_buf is None or self.host_buf.numel() < total_bytes:
             new_size = max(total_bytes, self.host_buf.numel() * 2 if self.host_buf is not None else total_bytes)
-            self.host_buf = torch.empty(new_size, dtype=torch.uint8, pin_memory=True)
+            self.host_buf = torch.empty(new_size, dtype=torch.uint8, pin_memory=(self.device.type == "cuda"))
             self.dev_buf = torch.empty(new_size, dtype=torch.uint8, device=self.device)
         offset = 0
         for arr, p_size in zip(numpy_arrays, padded_sizes):
@@ -467,7 +467,8 @@ def train():
         result_queue.put({"update": update, "metrics": metrics,"mean_ret": mean_ret, "mean_pac": mean_pac,
         "episodes": episodes,"total_steps": total_steps, "t_rollout": t_rollout, "t_ppo": t_ppo, "lam_bc": lam_bc, "bc_prob": bc_prob, "realized_merge_rate": realized_merge_rate, "wall_s": round(time.time() - t0_ref, 1)})
     current_returns = [0.0] * NUM_ENVS
-    batch_transfer = BatchTransfer(DEVICE)
+    rollout_transfer = BatchTransfer(DEVICE)
+    train_transfer   = BatchTransfer(DEVICE)
     for update in range(start_update, 50_001):
         anneal_frac = math.exp(-bc_decay_step / BC_ANNEAL_UPDATES)
         bc_prob = anneal_frac if anneal_frac >= 0.05 else 0.0
@@ -563,7 +564,7 @@ def train():
                 all_ve = np.concatenate(batch_ve, axis=0)
                 all_cve = np.concatenate(batch_cve, axis=0)
                 all_vm = np.concatenate(batch_vm, axis=0)
-                t_sp, t_gsp_unique, t_ve, t_cve, t_vm = batch_transfer.transfer(all_sp, all_gsp_unique, all_ve, all_cve, all_vm)
+                t_sp, t_gsp_unique, t_ve, t_cve, t_vm = rollout_transfer.transfer(all_sp, all_gsp_unique, all_ve, all_cve, all_vm)
                 with torch.inference_mode():
                     idx, lp, scores, pool, vec = actor_rollout(
                         t_sp, t_ve, t_vm, K=K_NOMINATIONS)
@@ -644,7 +645,7 @@ def train():
             cat_ve = np.concatenate(boot_ve, axis=0)
             cat_cve = np.concatenate(boot_cve, axis=0)
             cat_vm = np.concatenate(boot_vm, axis=0)
-            t_sp, t_gsp_unique, t_ve, t_cve, t_vm = batch_transfer.transfer(cat_sp, cat_gsp_unique, cat_ve, cat_cve, cat_vm)
+            t_sp, t_gsp_unique, t_ve, t_cve, t_vm = rollout_transfer.transfer(cat_sp, cat_gsp_unique, cat_ve, cat_cve, cat_vm)
             with torch.inference_mode():
                 _, _, _, pool, vec = actor_rollout(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
                 val = _critic_value(critic_rollout, t_gsp_unique, t_cve, boot_n_ghosts)
@@ -708,7 +709,7 @@ def train():
         arr_olp = np.array(all_lp, dtype=np.float32)
         arr_adv = np.array(all_adv, dtype=np.float32)
         arr_ret = np.array(all_ret, dtype=np.float32)
-        ds_sp, ds_gsp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_act, ds_olp, ds_adv, ds_ret = batch_transfer.transfer(
+        ds_sp, ds_gsp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_act, ds_olp, ds_adv, ds_ret = train_transfer.transfer(
             arr_sp, arr_gsp, arr_gsp_unique, arr_gsp_ids, arr_ve, arr_cve, arr_vm, arr_ht, arr_act, arr_olp, arr_adv, arr_ret)
         N_total = ds_sp.shape[0]
         indices = np.arange(N_total)
@@ -767,6 +768,7 @@ def train():
                 print(f"{'='*60}\n")
                 is_static_pacman = (p_up <= 50)
                 vec_env.set_curriculum(stage.rows, stage.cols,stage.n_ghosts, stage.n_power, static_pacman=is_static_pacman)
+                torch.cuda.empty_cache()
                 current_returns = [0.0] * NUM_ENVS
                 for pg in opt_actor.param_groups:
                     pg['lr'] *= 0.5
