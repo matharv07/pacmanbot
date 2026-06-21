@@ -1,7 +1,5 @@
 Consensus Based Decentralized Auctions for Robust Task Allocation.pdf
 .venv
 __pycache__
-
-# Secrets and local configurations
 discord_webhook.txt
 .env
