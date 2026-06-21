@@ -134,7 +134,8 @@ class Env:
         alive = [gid for gid, g in self.ghosts.items() if not g.dead]
         for gid in alive:
             g = self.ghosts[gid]
-            need_h_tasks = (self.frame % DECISION_INTERVAL == 0) or (gid not in self._cached_ht)
+            HEURISTIC_EVERY = DECISION_INTERVAL * 2
+            need_h_tasks = (self.frame % HEURISTIC_EVERY == 0) or (gid not in self._cached_ht)
             h_tasks = None
             if need_h_tasks:
                 h_tasks, h_dists = heuristic_generate_tasks(g, self.frame)
