@@ -92,6 +92,8 @@ class Env:
                             if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols and self.grid[nr][nc] != 1:
                                 target[nr, nc] += t.score * 0.25
                 self._cached_ht[gid] = target
+        for gid in self.ghosts:
+            self.ghosts[gid].cbba_agent.reset_caches()
         return self.observe()
 
     def observe(self):

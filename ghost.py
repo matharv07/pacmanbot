@@ -39,7 +39,7 @@ RIGHT = ( 0,  1)
 DIRS  = [UP, DOWN, LEFT, RIGHT]
 
 RADIUS            = 12
-RAY_COUNT         = 360
+RAY_COUNT         = 90
 MAX_RAY_DIST      = 10
 UNKNOWN           = -1
 MEMORY_FRAMES     = 10
@@ -117,6 +117,11 @@ class Ghost:
         active_task = self.cbba_agent.step(self, self.frame)
         if active_task and self.pacman_powered and active_task.task_type == TaskType.HUNT:
             active_task = None
+        if active_task is not None and (self.row, self.col) == active_task.target_pos:
+            key = (int(active_task.task_type), active_task.target_pos, getattr(active_task, 'owner', -1))
+            if key in self.cbba_agent.path: self.cbba_agent.path.remove(key)
+            if key in self.cbba_agent.bundle: self.cbba_agent.bundle.remove(key)
+            active_task = None
         moved = False
         if active_task is not None:
             target = active_task.target_pos
@@ -162,10 +167,15 @@ class Ghost:
             cols = len(self.grid[0])
             pac_cell = self.known_pacman if (self.pacman_powered and self.known_pacman) else None
             options = []
-            for dr, dc in DIRS:
-                nr, nc = self.row + dr, self.col + dc
-                if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL and (nr, nc) != pac_cell):
-                    options.append((dr, dc))
+            if not self.pacman_powered and self.known_pacman:
+                pr, pc = self.known_pacman
+                if abs(self.row - pr) + abs(self.col - pc) == 1:
+                    options = [(pr - self.row, pc - self.col)]
+            if not options:
+                for dr, dc in DIRS:
+                    nr, nc = self.row + dr, self.col + dc
+                    if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL and (nr, nc) != pac_cell):
+                        options.append((dr, dc))
             if options:
                 if self.last_dir in options and random.random() < 0.70:
                     options = [self.last_dir]
