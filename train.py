@@ -31,7 +31,7 @@ torch.set_num_threads(1)
 
 NUM_ENVS        = 16
 ROLLOUT_STEPS   = 256
-MINI_BATCH      = 2048/2 
+MINI_BATCH      = 2048/4
 PPO_EPOCHS      = 12    
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
