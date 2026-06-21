@@ -12,6 +12,7 @@ TAU_RECENCY        = 60     #lower value adds trust to older messages
 MIN_CONFIDENCE     = 0.02   #minimum trust in any received message
 LOS_CERTAINTY      = 0.99   #trust in a direct sighting
 LOST_SPREAD        = 0.60   #how to spread out probability if we lose sight of pacman
+COMPRESS_THRESHOLD = 0.0005 #cells below this are omitted from payload
 
 DANGER_SIGMA       = 6.0    #gaussian variance cells for ghost danger falloff
 STALENESS_DECAY    = 40.0   #frames half-life for un-refreshed ghost positions
@@ -174,8 +175,7 @@ class BeliefMap:
             return
         confidence = max(MIN_CONFIDENCE, math.exp(-sender_fss / TAU_RECENCY))
         n = len(self._open_arr)
-        dynamic_threshold = 1.5 / max(1, n)
-        s_flat = np.full(n, dynamic_threshold / 2.0, dtype=np.float32)
+        s_flat = np.full(n, COMPRESS_THRESHOLD / 2.0, dtype=np.float32)
         #vectorised payload loading — no python loop
         keys = np.array(list(cells.keys()), dtype=np.int32)
         vals = np.array(list(cells.values()), dtype=np.float32)
@@ -202,8 +202,7 @@ class BeliefMap:
         if not self._payload_dirty and self._payload_cache is not None:
             return self._payload_cache
         #vectorized: extract indices and values above threshold in one shot
-        dynamic_threshold = 1.5 / max(1, len(self._open_cells))
-        above = self._b_flat >= dynamic_threshold
+        above = self._b_flat >= COMPRESS_THRESHOLD
         if not above.any():
             cells = {}
         else:

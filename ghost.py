@@ -39,7 +39,7 @@ RIGHT = ( 0,  1)
 DIRS  = [UP, DOWN, LEFT, RIGHT]
 
 RADIUS            = 12
-RAY_COUNT         = 90
+RAY_COUNT         = 360
 MAX_RAY_DIST      = 10
 UNKNOWN           = -1
 MEMORY_FRAMES     = 10
@@ -123,7 +123,21 @@ class Ghost:
             if key in self.cbba_agent.bundle: self.cbba_agent.bundle.remove(key)
             active_task = None
         moved = False
-        if active_task is not None:
+        #adjacent capture override
+        if not self.pacman_powered and self.known_pacman:
+            pr, pc = self.known_pacman
+            if abs(self.row - pr) + abs(self.col - pc) == 1:
+                self.prev_row, self.prev_col = self.row, self.col
+                self.row, self.col = pr, pc
+                self.last_dir = (self.row - self.prev_row, self.col - self.prev_col)
+                if self.grid[self.row][self.col] == POWER:
+                    self.grid[self.row][self.col] = PELLET
+                moved = True
+                self.cbba_agent.bundle.clear()
+                self.cbba_agent.path.clear()
+                active_task = None
+        #normal task execution
+        if not moved and active_task is not None:
             target = active_task.target_pos
             if getattr(self, '_committed_target', None) != target or not getattr(self, '_committed_path', []):
                 from pathfinder import astar
@@ -160,6 +174,7 @@ class Ghost:
                         self.grid[self.row][self.col] = PELLET
                     moved = True
         self.in_fallback_mode = not moved
+        #fallback
         if not moved:
             if hasattr(self, '_committed_path'):
                 self._committed_path = []
@@ -167,15 +182,10 @@ class Ghost:
             cols = len(self.grid[0])
             pac_cell = self.known_pacman if (self.pacman_powered and self.known_pacman) else None
             options = []
-            if not self.pacman_powered and self.known_pacman:
-                pr, pc = self.known_pacman
-                if abs(self.row - pr) + abs(self.col - pc) == 1:
-                    options = [(pr - self.row, pc - self.col)]
-            if not options:
-                for dr, dc in DIRS:
-                    nr, nc = self.row + dr, self.col + dc
-                    if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL and (nr, nc) != pac_cell):
-                        options.append((dr, dc))
+            for dr, dc in DIRS:
+                nr, nc = self.row + dr, self.col + dc
+                if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL and (nr, nc) != pac_cell):
+                    options.append((dr, dc))
             if options:
                 if self.last_dir in options and random.random() < 0.70:
                     options = [self.last_dir]

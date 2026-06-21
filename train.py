@@ -29,7 +29,7 @@ import requests
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 torch.set_num_threads(1)
 
-NUM_ENVS        = 8
+NUM_ENVS        = 16
 ROLLOUT_STEPS   = 256
 MINI_BATCH      = 2048  
 PPO_EPOCHS      = 12    
@@ -52,8 +52,6 @@ CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-STOP_TRAINING = False
-
 def get_discord_webhook():
     env_url = os.environ.get("DISCORD_WEBHOOK_URL")
     if env_url:
@@ -67,36 +65,6 @@ def get_discord_webhook():
         except:
             pass
     return None
-
-def check_stop_trigger():
-    global STOP_TRAINING
-    if os.path.exists("stop_training") or os.path.exists("stop.txt"):
-        STOP_TRAINING = True
-        print("\n🛑 Stop signal detected via local file!")
-        return True
-    discord_token = os.environ.get("DISCORD_BOT_TOKEN")
-    if discord_token:
-        try:
-            WEBHOOK_URL = get_discord_webhook()
-            if not WEBHOOK_URL:
-                return False
-            webhook_info = requests.get(WEBHOOK_URL, timeout=3).json()
-            channel_id = webhook_info.get("channel_id")
-            if channel_id:
-                headers = {"Authorization": f"Bot {discord_token}"}
-                messages_url = f"https://discord.com/api/v10/channels/{channel_id}/messages?limit=5"
-                r = requests.get(messages_url, headers=headers, timeout=3)
-                if r.status_code == 200:
-                    for msg in r.json():
-                        content = msg.get("content", "").strip().lower()
-                        if content == "!stop":
-                            STOP_TRAINING = True
-                            print("\n🛑 Stop signal detected via Discord chat command '!stop'!")
-                            requests.post(WEBHOOK_URL, json={"content": "🛑 **Stop signal received from Discord! Saving checkpoint and shutting down training loop...**"}, timeout=3)
-                            return True
-        except:
-            pass
-    return False
 
 def push_to_discord(metrics_row):
     WEBHOOK_URL = get_discord_webhook()
@@ -892,28 +860,6 @@ def train():
                 with open(log_path, "a") as f:
                     f.write(json.dumps({"checkpoint": path, "update": p_up}) + "\n")
                 print(f"  💾 Checkpoint saved: {path}")
-            if check_stop_trigger():
-                path = os.path.join(CKPT_DIR, f"ckpt_stop_{p_up}.pt")
-                torch.save({"actor": actor.state_dict(),
-                             "critic": critic.state_dict(),
-                             "opt_actor": opt_actor.state_dict(),
-                             "opt_critic": opt_critic.state_dict(),
-                             "ret_rms": ret_rms.state_dict(),
-                             "update": p_up,
-                             "episodes": res['episodes'],
-                             "total_steps": res['total_steps'],
-                             "curriculum": curriculum.state_dict(),
-                             "critic_warmup_remaining": critic_warmup_remaining,
-                             "ema_return": ema_return,
-                             "bc_decay_step": bc_decay_step,
-                             "rng_state": torch.get_rng_state(),
-                             "np_rng_state": np.random.get_state()}, path)
-                print(f"  💾 Emergency Checkpoint saved: {path}")
-                for tf in ["stop_training", "stop.txt"]:
-                    if os.path.exists(tf):
-                        try: os.remove(tf)
-                        except: pass
-                break
         ret_rms.update(ds_ret)
         train_thread = threading.Thread(target=ppo_worker, args=(
             update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_act, ds_olp, ds_adv, ds_ret,
