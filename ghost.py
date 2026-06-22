@@ -88,6 +88,7 @@ class Ghost:
         self._proximity_channel_frame = -1
         self._proximity_channel_target = None
         self._last_synced_map: dict[int, np.ndarray] = {}   # per-peer snapshot for delta sync
+        self._tail_pacman_remaining = 0         #post-pop number of ghosts that will be tailing
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False):
         self.frame += 1
@@ -136,6 +137,76 @@ class Ghost:
                 self.cbba_agent.bundle.clear()
                 self.cbba_agent.path.clear()
                 active_task = None
+                #activate tailing if few ghosts nearby (not herding)
+                nearby_ghosts = 1  #count self
+                for _gid, pos in self.known_agents.items():
+                    if pos != "UNKNOWN":
+                        if abs(pos[0] - self.row) + abs(pos[1] - self.col) <= 6:
+                            nearby_ghosts += 1
+                self._tail_pacman_remaining = 2 if nearby_ghosts <= 2 else 0
+        #adjacent power pellet override (up to 2 cells)
+        if not moved:
+            dist_to_pac = abs(self.row - self.known_pacman[0]) + abs(self.col - self.known_pacman[1]) if self.known_pacman else 999
+            if dist_to_pac > 3 or self.pacman_powered:
+                #BFS to find closest power pellet within 2 steps
+                from collections import deque
+                queue = deque([(self.row, self.col, 0, [])])
+                visited = {(self.row, self.col)}
+                target_power_step = None
+                while queue:
+                    r, c, d, path = queue.popleft()
+                    if self.grid[r][c] == POWER and d > 0:
+                        #if distance is 2, the 'cost' to pause is higher, so we require a safer distance from Pacman
+                        if d == 1 or (d == 2 and (dist_to_pac > 6 or self.pacman_powered)):
+                            target_power_step = path[0]
+                            break
+                    if d < 2:
+                        for dr, dc in DIRS:
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < len(self.grid) and 0 <= nc < len(self.grid[0]):
+                                if self.grid[nr][nc] != WALL and (nr, nc) not in visited:
+                                    visited.add((nr, nc))
+                                    queue.append((nr, nc, d + 1, path + [(dr, dc)])) 
+                if target_power_step is not None:
+                    dr, dc = target_power_step
+                    self.prev_row, self.prev_col = self.row, self.col
+                    self.row += dr
+                    self.col += dc
+                    self.last_dir = (dr, dc)
+                    if self.grid[self.row][self.col] == POWER:
+                        self.grid[self.row][self.col] = PELLET
+                    moved = True
+                    if hasattr(self, '_committed_path'):
+                        self._committed_path = []
+        #post-capture tailing: chase Pacman for up to 2 more cells if solo/duo
+        if not moved and self._tail_pacman_remaining > 0:
+            if self.known_pacman and not self.pacman_powered:
+                pr, pc = self.known_pacman
+                best_dir = None
+                best_dist = abs(self.row - pr) + abs(self.col - pc)
+                for dr, dc in DIRS:
+                    nr, nc = self.row + dr, self.col + dc
+                    if 0 <= nr < len(self.grid) and 0 <= nc < len(self.grid[0]) and self.grid[nr][nc] != WALL:
+                        d = abs(nr - pr) + abs(nc - pc)
+                        if d < best_dist:
+                            best_dist = d
+                            best_dir = (dr, dc)
+                if best_dir is not None:
+                    dr, dc = best_dir
+                    self.prev_row, self.prev_col = self.row, self.col
+                    self.row += dr
+                    self.col += dc
+                    self.last_dir = (dr, dc)
+                    if self.grid[self.row][self.col] == POWER:
+                        self.grid[self.row][self.col] = PELLET
+                    moved = True
+                    self._tail_pacman_remaining -= 1
+                    if hasattr(self, '_committed_path'):
+                        self._committed_path = []
+                else:
+                    self._tail_pacman_remaining = 0
+            else:
+                self._tail_pacman_remaining = 0  #lost sight or powered, cancel
         #normal task execution
         if not moved and active_task is not None:
             target = active_task.target_pos

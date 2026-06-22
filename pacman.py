@@ -16,11 +16,16 @@ import pathfinder
 import torch
 import argparse
 from curriculum import STAGES
+import torch
+import glob
+from net import GhostActor
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--stage", type=int, default=-1, help="Curriculum stage index to visualize")
+parser.add_argument("--stage", type=int, default=3, help="Curriculum stage index to visualize")
+parser.add_argument("--checkpoint", type=int, default=-1, help="Checkpoint to load")
 args, _ = parser.parse_known_args()
 
+check = args.checkpoint
 STAGE = STAGES[args.stage] if args.stage != -1 and 0 <= args.stage < len(STAGES) else None
 if STAGE:
     ROWS = STAGE.rows
@@ -28,10 +33,10 @@ if STAGE:
     N_POWER = STAGE.n_power
     N_GHOSTS = STAGE.n_ghosts
 else:
-    COLS = 41
-    ROWS = 33
+    COLS = 28
+    ROWS = 31
     N_POWER = 28
-    N_GHOSTS = 7
+    N_GHOSTS = 4
 
 CELL = 20
 WIDTH = COLS * CELL
@@ -70,23 +75,21 @@ RL_TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH - 10, ROWS * CELL + 8, TOGGLE_
 RL_ACTOR = None
 RL_DEVICE = None
 
-
 def load_rl_model():
     global RL_ACTOR, RL_DEVICE, RL_MODE
     if RL_ACTOR is not None:
         return True
     print("Loading RL Model...")
     try:
-        import torch
-        import glob
-        from net import GhostActor
         RL_DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         ckpts = glob.glob("checkpoints/ckpt_*.pt")
         if not ckpts:
             print("No checkpoints found. RL Mode disabled.")
             RL_MODE = False
-            return False
+            return False            
         latest = max(ckpts, key=os.path.getctime)
+        if check != -1 and glob.glob(f"checkpoints/ckpt_{check}.pt"):
+            latest = f"checkpoints/ckpt_{check}.pt"
         print(f"Loading checkpoint: {latest}")
         RL_ACTOR = GhostActor().to(RL_DEVICE)
         checkpoint = torch.load(latest, map_location=RL_DEVICE, weights_only=False)
