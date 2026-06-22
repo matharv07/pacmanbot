@@ -136,7 +136,8 @@ class Env:
             g = self.ghosts[gid]
             HEURISTIC_EVERY = DECISION_INTERVAL * 2
             need_h_tasks = (self.frame % HEURISTIC_EVERY == 0) or (gid not in self._cached_ht)
-            h_tasks = None
+            h_tasks = []
+            h_dists = {}
             if need_h_tasks:
                 h_tasks, h_dists = heuristic_generate_tasks(g, self.frame)
                 target = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
@@ -164,7 +165,7 @@ class Env:
                 if self.frame % DECISION_INTERVAL == 0:
                     tasks = actions_to_tasks(g, scores_map, indices, self.frame)
                     g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
-                    if random.random() < bc_prob:
+                    if random.random() < bc_prob and h_tasks:
                         all_tasks = h_tasks + tasks
                         info_heuristic_merges += 1
                     else:

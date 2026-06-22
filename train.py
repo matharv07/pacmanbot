@@ -485,6 +485,13 @@ def train():
                             mb_olp = b_olp[chunk_idx]
                             mb_adv = b_adv[chunk_idx]
                             mb_ret = b_ret[chunk_idx]
+                            #safety clamp: actions must be in [0, H*W-1]
+                            #guards against any grid/padding mismatch between rollout and PPO
+                            _hw = mb_sp.shape[-2] * mb_sp.shape[-1]
+                            if mb_act.max().item() >= _hw:
+                                print(f"  ⚠️  Action index OOB: max={mb_act.max().item()} >= H*W={_hw}, clamping")
+                                push_discord_warning(f"⚠️ Action OOB at update {update}: max_act={mb_act.max().item()}, H*W={_hw}, sp={tuple(mb_sp.shape)}")
+                                mb_act = mb_act.clamp(max=_hw - 1)
                             new_lp, ent, pool, vec, flat_logits = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act)
                             unique_ids, inv_idx = torch.unique(mb_gsp_ids, return_inverse=True)
                             mb_gsp_unique = b_gsp_unique[unique_ids]
@@ -575,7 +582,6 @@ def train():
         t_start_rollout = time.time()
         #per-env, per-step storage (lists of length ROLLOUT_STEPS)
         buf_spatial   = [[] for _ in range(NUM_ENVS)]
-        buf_gsp       = [[] for _ in range(NUM_ENVS)]
         buf_gsp_ids   = [[] for _ in range(NUM_ENVS)]
         all_gsp_unique_list = []
         buf_vector    = [[] for _ in range(NUM_ENVS)]
@@ -610,7 +616,6 @@ def train():
                     buf_values[e].append({})
                     buf_gids[e].append([])
                     buf_spatial[e].append(np.empty((0, SPATIAL_CH, MAX_H, MAX_W), dtype=np.float32))
-                    buf_gsp[e].append(np.empty((0, 11, MAX_H, MAX_W), dtype=np.float32))
                     buf_gsp_ids[e].append([])
                     buf_vector[e].append(np.empty((0, VEC_DIM), dtype=np.float32))
                     buf_cve[e].append(np.empty((0, CRITIC_VEC_DIM), dtype=np.float32))
@@ -624,7 +629,6 @@ def train():
                 vm_padded = _pad_spatial(vm, target_h=stage.rows, target_w=stage.cols)
                 ht_padded = _pad_spatial(ht, target_h=stage.rows, target_w=stage.cols)
                 gsp_padded = _pad_spatial(global_sp, target_h=stage.rows, target_w=stage.cols)
-                gsp_padded_batch = np.repeat(gsp_padded[np.newaxis, ...], n_g, axis=0)
                 all_gsp_unique_list.append(gsp_padded)
                 uid = len(all_gsp_unique_list) - 1
                 joint_ve = np.zeros((MAX_GHOSTS, VEC_DIM), dtype=np.float32)
@@ -647,7 +651,6 @@ def train():
                 batch_gids.extend(gids)
                 #stprepadded obs for PPO buffer
                 buf_spatial[e].append(sp_padded)
-                buf_gsp[e].append(gsp_padded_batch)
                 buf_gsp_ids[e].append([uid] * n_g)
                 buf_vector[e].append(ve)
                 buf_cve[e].append(cve_batch)
@@ -784,7 +787,7 @@ def train():
                 all_last_v[e] = {gids[i]: float(v_np[offset + i]) for i in range(n_g)}
                 offset += n_g
         #flatten per-env rollouts into a single batch 
-        all_sp, all_gsp, all_ve, all_vm, all_ht = [], [], [], [], []
+        all_sp, all_ve, all_vm, all_ht = [], [], [], []
         all_cve, all_gsp_ids = [], []
         all_act, all_lp, all_adv, all_ret = [], [], [], []
         for e in range(NUM_ENVS):
@@ -797,13 +800,11 @@ def train():
                 if len(buf_spatial[e]) <= t:
                     continue
                 sp_t  = buf_spatial[e][t]     #(N, C, H, W)
-                gsp_t = buf_gsp[e][t]
                 gids_t = buf_gids[e][t]
                 n_g   = len(gids_t)
                 for i in range(n_g):
                     gid = gids_t[i]
                     all_sp.append(sp_t[i])
-                    all_gsp.append(gsp_t[i])
                     all_gsp_ids.append(buf_gsp_ids[e][t][i])
                     all_ve.append(buf_vector[e][t][i])
                     all_cve.append(buf_cve[e][t][i])
@@ -817,7 +818,6 @@ def train():
             continue
         #build dataset
         arr_sp  = np.array(all_sp, dtype=np.float32)
-        arr_gsp = np.array(all_gsp, dtype=np.float32)
         arr_gsp_unique = np.array(all_gsp_unique_list, dtype=np.float32)
         arr_gsp_ids = np.array(all_gsp_ids, dtype=np.int64)
         arr_ve  = np.array(all_ve, dtype=np.float32)
@@ -828,9 +828,19 @@ def train():
         arr_olp = np.array(all_lp, dtype=np.float32)
         arr_adv = np.array(all_adv, dtype=np.float32)
         arr_ret = np.array(all_ret, dtype=np.float32)
-        ds_sp, ds_gsp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_act, ds_olp, ds_adv, ds_ret = train_transfer.transfer(
-            arr_sp, arr_gsp, arr_gsp_unique, arr_gsp_ids, arr_ve, arr_cve, arr_vm, arr_ht, arr_act, arr_olp, arr_adv, arr_ret)
+        ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_act, ds_olp, ds_adv, ds_ret = train_transfer.transfer(
+            arr_sp, arr_gsp_unique, arr_gsp_ids, arr_ve, arr_cve, arr_vm, arr_ht, arr_act, arr_olp, arr_adv, arr_ret)
         N_total = ds_sp.shape[0]
+        # verify action indices are within spatial bounds
+        _sp_hw = ds_sp.shape[-2] * ds_sp.shape[-1]
+        if int(ds_act.max().item()) >= _sp_hw:
+            print(f"  ⚠️  Action OOB in buffer: max={ds_act.max().item()} >= H*W={_sp_hw}")
+            push_discord_warning(f"⚠️ Buffer action OOB: max={ds_act.max().item()}, H*W={_sp_hw}")
+        _gsp_max_id = int(ds_gsp_ids.max().item())
+        _gsp_n = ds_gsp_unique.shape[0]
+        if _gsp_max_id >= _gsp_n:
+            print(f"  ⚠️  GSP ID OOB: max_id={_gsp_max_id} >= unique_n={_gsp_n}")
+
         indices = np.arange(N_total)
         #normalize advantages GLOBALLY across the entire batch, not per-minibatch
         ds_adv = (ds_adv - ds_adv.mean()) / (ds_adv.std() + 1e-8)
