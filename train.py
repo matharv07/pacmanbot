@@ -29,9 +29,14 @@ import requests
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 torch.set_num_threads(1)
 
-NUM_ENVS        = 10
+NUM_ENVS        = 16
 ROLLOUT_STEPS   = 256
-MINI_BATCH      = 640
+MINI_BATCH      = 2048
+MICRO_BATCH     = 512      #gradient accumulation chunk size (MINI_BATCH / 4)
+ROLLOUT_INFER_CHUNK = 64   #max ghosts per rollout inference forward pass
+#adaptive OOM-safe chunk sizes — halved automatically on cuda OOM, never grow back
+_eff_infer_chunk = ROLLOUT_INFER_CHUNK
+_eff_micro_batch = MICRO_BATCH
 PPO_EPOCHS      = 12    
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
@@ -47,7 +52,7 @@ LOG_DIR         = os.path.join(os.path.dirname(__file__), "logs")
 CKPT_DIR        = os.path.join(os.path.dirname(__file__), "checkpoints")
 BC_ANNEAL_UPDATES = 150
 BC_ADVANCE_GATE = 0.10
-TARGET_KL       = 0.02
+TARGET_KL       = 0.05
 CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -65,6 +70,15 @@ def get_discord_webhook():
         except:
             pass
     return None
+
+def push_discord_warning(msg: str):
+    WEBHOOK_URL = get_discord_webhook()
+    if not WEBHOOK_URL:
+        return
+    try:
+        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=5)
+    except:
+        pass
 
 def push_to_discord(metrics_row):
     WEBHOOK_URL = get_discord_webhook()
@@ -434,68 +448,93 @@ def train():
                 for uid in batch_uids:
                     idx.extend(uid_to_indices[uid])
                 idx = np.array(idx)
-                opt_critic.zero_grad()
-                if critic_warmup_remaining <= 0:
-                    opt_actor.zero_grad()
-                mb_a_loss = 0.0
-                mb_v_loss = 0.0
-                mb_bc_loss = 0.0
-                mb_ent = 0.0
-                mb_approx_kl = 0.0
-                mb_clip_fraction = 0.0
-                MICRO_BATCH = 160
                 n_idx = len(idx)
-                for start_i in range(0, n_idx, MICRO_BATCH):
-                    end_i = min(start_i + MICRO_BATCH, n_idx)
-                    chunk_idx = idx[start_i:end_i]
-                    weight = len(chunk_idx) / n_idx
-                    mb_sp  = b_sp[chunk_idx]
-                    mb_ve  = b_ve[chunk_idx]
-                    mb_cve = b_cve[chunk_idx]
-                    mb_gsp_ids = b_gsp_ids[chunk_idx]
-                    mb_vm  = b_vm[chunk_idx]
-                    mb_ht  = b_ht[chunk_idx]
-                    mb_act = b_act[chunk_idx]
-                    mb_olp = b_olp[chunk_idx]
-                    mb_adv = b_adv[chunk_idx]
-                    mb_ret = b_ret[chunk_idx]
-                    new_lp, ent, pool, vec, flat_logits = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act)
-                    unique_ids, inv_idx = torch.unique(mb_gsp_ids, return_inverse=True)
-                    mb_gsp_unique = b_gsp_unique[unique_ids]
-                    mb_c_pool = critic.encode_spatial(mb_gsp_unique)
-                    v_pred = critic.forward_from_pool(mb_c_pool[inv_idx], mb_cve).squeeze(-1)
-                    ratio = torch.exp(new_lp - mb_olp)
-                    with torch.no_grad():
-                        approx_kl = 0.5 * (new_lp - mb_olp).pow(2).mean()
-                        clip_fraction = (torch.abs(ratio - 1.0) > CLIP_EPS).float().mean()
-                    s1 = ratio * mb_adv
-                    s2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * mb_adv
-                    a_loss = -torch.min(s1, s2).mean()
-                    v_loss = F.smooth_l1_loss(v_pred, ret_rms(mb_ret))
-                    mb_ht_masked = mb_ht * mb_vm.float()
-                    ht_flat     = mb_ht_masked.view(mb_ht_masked.shape[0], -1)
-                    ht_row_sums = ht_flat.sum(dim=1)
-                    valid_bc    = ht_row_sums > 1e-6
-                    if valid_bc.any():
-                        ht_valid  = ht_flat[valid_bc]
-                        ht_prob   = (ht_valid / ht_valid.sum(dim=1, keepdim=True)).detach()
-                        fl_bc     = flat_logits[valid_bc].clamp(min=-1e4)
-                        log_pi    = F.log_softmax(fl_bc, dim=-1)
-                        bc        = -(ht_prob * log_pi).sum(dim=-1).mean()
-                        bc        = bc * valid_bc.float().mean()
-                    else:
-                        bc = torch.tensor(0.0, device=DEVICE)
-                    loss_actor = a_loss - ENT_COEF * ent.mean() + lam_bc * bc
-                    loss_critic = VF_COEF * v_loss
-                    (loss_critic * weight).backward()
+                #pre-compute valid_bc fraction across the FULL mini-batch
+                full_ht  = b_ht[idx]
+                full_vm  = b_vm[idx]
+                full_ht_masked = full_ht * full_vm.float()
+                full_ht_sums   = full_ht_masked.view(n_idx, -1).sum(dim=1)
+                bc_valid_frac  = (full_ht_sums > 1e-6).float().mean().item()
+                del full_ht, full_vm, full_ht_masked, full_ht_sums
+                #OOM-adaptive micro-batch loop: halves chunk size on crash and retries
+                global _eff_micro_batch
+                oom_retry = True
+                while oom_retry:
+                    oom_retry = False
+                    opt_critic.zero_grad()
                     if critic_warmup_remaining <= 0:
-                        (loss_actor * weight).backward()
-                    mb_a_loss += a_loss.item() * weight
-                    mb_v_loss += v_loss.item() * weight
-                    mb_bc_loss += bc.item() * weight
-                    mb_ent += ent.mean().item() * weight
-                    mb_approx_kl += approx_kl.item() * weight
-                    mb_clip_fraction += clip_fraction.item() * weight
+                        opt_actor.zero_grad()
+                    mb_a_loss = 0.0
+                    mb_v_loss = 0.0
+                    mb_bc_loss = 0.0
+                    mb_ent = 0.0
+                    mb_approx_kl = 0.0
+                    mb_clip_fraction = 0.0
+                    try:
+                        for start_i in range(0, n_idx, _eff_micro_batch):
+                            end_i = min(start_i + _eff_micro_batch, n_idx)
+                            chunk_idx = idx[start_i:end_i]
+                            weight = len(chunk_idx) / n_idx
+                            mb_sp  = b_sp[chunk_idx]
+                            mb_ve  = b_ve[chunk_idx]
+                            mb_cve = b_cve[chunk_idx]
+                            mb_gsp_ids = b_gsp_ids[chunk_idx]
+                            mb_vm  = b_vm[chunk_idx]
+                            mb_ht  = b_ht[chunk_idx]
+                            mb_act = b_act[chunk_idx]
+                            mb_olp = b_olp[chunk_idx]
+                            mb_adv = b_adv[chunk_idx]
+                            mb_ret = b_ret[chunk_idx]
+                            new_lp, ent, pool, vec, flat_logits = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act)
+                            unique_ids, inv_idx = torch.unique(mb_gsp_ids, return_inverse=True)
+                            mb_gsp_unique = b_gsp_unique[unique_ids]
+                            mb_c_pool = critic.encode_spatial(mb_gsp_unique)
+                            v_pred = critic.forward_from_pool(mb_c_pool[inv_idx], mb_cve).squeeze(-1)
+                            ratio = torch.exp(new_lp - mb_olp)
+                            with torch.no_grad():
+                                approx_kl = 0.5 * (new_lp - mb_olp).pow(2).mean()
+                                clip_fraction = (torch.abs(ratio - 1.0) > CLIP_EPS).float().mean()
+                            s1 = ratio * mb_adv
+                            s2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * mb_adv
+                            a_loss = -torch.min(s1, s2).mean()
+                            v_loss = F.smooth_l1_loss(v_pred, ret_rms(mb_ret))
+                            mb_ht_masked = mb_ht * mb_vm.float()
+                            ht_flat     = mb_ht_masked.view(mb_ht_masked.shape[0], -1)
+                            ht_row_sums = ht_flat.sum(dim=1)
+                            valid_bc    = ht_row_sums > 1e-6
+                            if valid_bc.any():
+                                ht_valid  = ht_flat[valid_bc]
+                                ht_prob   = (ht_valid / ht_valid.sum(dim=1, keepdim=True)).detach()
+                                fl_bc     = flat_logits[valid_bc].clamp(min=-1e4)
+                                log_pi    = F.log_softmax(fl_bc, dim=-1)
+                                bc        = -(ht_prob * log_pi).sum(dim=-1).mean()
+                                bc        = bc * bc_valid_frac
+                            else:
+                                bc = torch.tensor(0.0, device=DEVICE)
+                            loss_actor = a_loss - ENT_COEF * ent.mean() + lam_bc * bc
+                            loss_critic = VF_COEF * v_loss
+                            (loss_critic * weight).backward()
+                            if critic_warmup_remaining <= 0:
+                                (loss_actor * weight).backward()
+                            mb_a_loss += a_loss.item() * weight
+                            mb_v_loss += v_loss.item() * weight
+                            mb_bc_loss += bc.item() * weight
+                            mb_ent += ent.mean().item() * weight
+                            mb_approx_kl += approx_kl.item() * weight
+                            mb_clip_fraction += clip_fraction.item() * weight
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        new_mb = max(_eff_micro_batch // 2, 32)
+                        msg = f"  ⚠️  PPO OOM — reducing micro-batch {_eff_micro_batch}→{new_mb}"
+                        print(msg)
+                        push_discord_warning(msg)
+                        _eff_micro_batch = new_mb
+                        oom_retry = True
+                        if _eff_micro_batch <= 32 and new_mb == 32:
+                            oom_retry = False  #already at minimum, skip this mini-batch
+                            msg = "  ⚠️  PPO OOM at minimum micro-batch — skipping mini-batch"
+                            print(msg)
+                            push_discord_warning(msg)
                 if critic_warmup_remaining <= 0:
                     grad_norm_a = nn.utils.clip_grad_norm_(actor.parameters(), MAX_GRAD_NORM)
                 else:
@@ -623,15 +662,36 @@ def train():
                 all_cve = np.concatenate(batch_cve, axis=0)
                 all_vm = np.concatenate(batch_vm, axis=0)
                 t_sp, t_gsp_unique, t_ve, t_cve, t_vm = rollout_transfer.transfer(all_sp, all_gsp_unique, all_ve, all_cve, all_vm)
-                with torch.inference_mode():
-                    idx, lp, scores, pool, vec = actor_rollout(
-                        t_sp, t_ve, t_vm, K=K_NOMINATIONS)
-                    val = _critic_value(critic_rollout, t_gsp_unique, t_cve, active_n_ghosts)
-                    val = ret_rms(val, unnorm=True)
-                idx_np = idx.cpu().numpy()
-                sc_np  = scores.cpu().numpy()
-                lp_np  = lp.cpu().numpy()
-                val_np = val.cpu().numpy()
+                #chunk rollout inference — OOM-adaptive: halves chunk on crash, never recovers
+                global _eff_infer_chunk
+                n_total = t_sp.shape[0]
+                while True:
+                    try:
+                        idx_chunks, lp_chunks, sc_chunks = [], [], []
+                        with torch.inference_mode():
+                            for ci in range(0, n_total, _eff_infer_chunk):
+                                ce = min(ci + _eff_infer_chunk, n_total)
+                                c_idx, c_lp, c_scores, _, _ = actor_rollout(
+                                    t_sp[ci:ce], t_ve[ci:ce], t_vm[ci:ce], K=K_NOMINATIONS)
+                                idx_chunks.append(c_idx)
+                                lp_chunks.append(c_lp)
+                                sc_chunks.append(c_scores)
+                            val_all = _critic_value(critic_rollout, t_gsp_unique, t_cve, active_n_ghosts)
+                            val_all = ret_rms(val_all, unnorm=True)
+                        break  #success
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        new_chunk = max(_eff_infer_chunk // 2, 8)
+                        msg = f"  ⚠️  Rollout OOM — reducing infer chunk {_eff_infer_chunk}→{new_chunk}"
+                        print(msg)
+                        push_discord_warning(msg)
+                        _eff_infer_chunk = new_chunk
+                        if _eff_infer_chunk <= 8:
+                            raise  #can't go lower, something else is wrong
+                idx_t = torch.cat(idx_chunks, dim=0)
+                lp_t  = torch.cat(lp_chunks, dim=0)
+                sc_t  = torch.cat(sc_chunks, dim=0)
+
                 offset = 0
                 for e in range(NUM_ENVS):
                     n_g = env_n_ghosts[e]
@@ -639,10 +699,10 @@ def train():
                         continue
                     obs = vec_env.current_obs[e]
                     gids = obs[0]
-                    e_idx = idx_np[offset:offset + n_g]
-                    e_sc  = sc_np[offset:offset + n_g]
-                    e_lp  = lp_np[offset:offset + n_g]
-                    e_val = val_np[offset:offset + n_g]
+                    e_idx = idx_t[offset:offset + n_g].cpu().numpy()
+                    e_sc  = sc_t[offset:offset + n_g].cpu().numpy()
+                    e_lp  = lp_t[offset:offset + n_g].cpu().numpy()
+                    e_val = val_all[offset:offset + n_g].cpu().numpy()
                     env_act = {}
                     for i, gid in enumerate(gids):
                         pairs = [(int(x // stage.cols), int(x % stage.cols))
@@ -654,6 +714,7 @@ def train():
                     v_dict = {gids[i]: float(e_val[i]) for i in range(n_g)}
                     buf_values[e].append(v_dict)
                     offset += n_g
+
             obs_list, rew_list, done_list, info_list = vec_env.step(step_actions, bc_prob)
             for e in range(NUM_ENVS):
                 r = rew_list[e]
@@ -705,7 +766,7 @@ def train():
             cat_vm = np.concatenate(boot_vm, axis=0)
             t_sp, t_gsp_unique, t_ve, t_cve, t_vm = rollout_transfer.transfer(cat_sp, cat_gsp_unique, cat_ve, cat_cve, cat_vm)
             with torch.inference_mode():
-                _, _, _, pool, vec = actor_rollout(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
+                #only the critic value is needed for bootstrap — actor call here was wasteful
                 val = _critic_value(critic_rollout, t_gsp_unique, t_cve, boot_n_ghosts)
                 val = ret_rms(val, unnorm=True)
             v_np = val.cpu().numpy()

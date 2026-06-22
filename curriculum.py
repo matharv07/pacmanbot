@@ -20,7 +20,7 @@ class Stage:
     rows: int
     cols: int
     n_ghosts: int
-    n_power: int           
+    n_power: int
     advance_return: float
     min_updates: int
 
