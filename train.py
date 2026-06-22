@@ -29,9 +29,9 @@ import requests
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 torch.set_num_threads(1)
 
-NUM_ENVS        = 16
+NUM_ENVS        = 10
 ROLLOUT_STEPS   = 256
-MINI_BATCH      = 2048/4
+MINI_BATCH      = 640
 PPO_EPOCHS      = 12    
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
@@ -434,49 +434,69 @@ def train():
                 for uid in batch_uids:
                     idx.extend(uid_to_indices[uid])
                 idx = np.array(idx)
-                mb_sp  = b_sp[idx]
-                mb_ve  = b_ve[idx]
-                mb_cve = b_cve[idx]
-                mb_gsp_ids = b_gsp_ids[idx]
-                mb_vm  = b_vm[idx]
-                mb_ht  = b_ht[idx]
-                mb_act = b_act[idx]
-                mb_olp = b_olp[idx]
-                mb_adv = b_adv[idx]
-                mb_ret = b_ret[idx]
-                new_lp, ent, pool, vec, flat_logits = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act)
-                unique_ids, inv_idx = torch.unique(mb_gsp_ids, return_inverse=True)
-                mb_gsp_unique = b_gsp_unique[unique_ids]
-                mb_c_pool = critic.encode_spatial(mb_gsp_unique)
-                v_pred = critic.forward_from_pool(mb_c_pool[inv_idx], mb_cve).squeeze(-1)
-                ratio = torch.exp(new_lp - mb_olp)
-                with torch.no_grad():
-                    approx_kl = 0.5 * (new_lp - mb_olp).pow(2).mean()
-                    clip_fraction = (torch.abs(ratio - 1.0) > CLIP_EPS).float().mean()
-                s1 = ratio * mb_adv
-                s2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * mb_adv
-                a_loss = -torch.min(s1, s2).mean()
-                v_loss = F.smooth_l1_loss(v_pred, ret_rms(mb_ret))
-                mb_ht_masked = mb_ht * mb_vm.float()
-                ht_flat     = mb_ht_masked.view(mb_ht_masked.shape[0], -1)
-                ht_row_sums = ht_flat.sum(dim=1)
-                valid_bc    = ht_row_sums > 1e-6
-                if valid_bc.any():
-                    ht_valid  = ht_flat[valid_bc]
-                    ht_prob   = (ht_valid / ht_valid.sum(dim=1, keepdim=True)).detach()
-                    fl_bc     = flat_logits[valid_bc].clamp(min=-1e4)
-                    log_pi    = F.log_softmax(fl_bc, dim=-1)
-                    bc        = -(ht_prob * log_pi).sum(dim=-1).mean()
-                    bc        = bc * valid_bc.float().mean()
-                else:
-                    bc = torch.tensor(0.0, device=DEVICE)
-                loss_actor = a_loss - ENT_COEF * ent.mean() + lam_bc * bc
-                loss_critic = VF_COEF * v_loss
                 opt_critic.zero_grad()
-                loss_critic.backward()
                 if critic_warmup_remaining <= 0:
                     opt_actor.zero_grad()
-                    loss_actor.backward()
+                mb_a_loss = 0.0
+                mb_v_loss = 0.0
+                mb_bc_loss = 0.0
+                mb_ent = 0.0
+                mb_approx_kl = 0.0
+                mb_clip_fraction = 0.0
+                MICRO_BATCH = 160
+                n_idx = len(idx)
+                for start_i in range(0, n_idx, MICRO_BATCH):
+                    end_i = min(start_i + MICRO_BATCH, n_idx)
+                    chunk_idx = idx[start_i:end_i]
+                    weight = len(chunk_idx) / n_idx
+                    mb_sp  = b_sp[chunk_idx]
+                    mb_ve  = b_ve[chunk_idx]
+                    mb_cve = b_cve[chunk_idx]
+                    mb_gsp_ids = b_gsp_ids[chunk_idx]
+                    mb_vm  = b_vm[chunk_idx]
+                    mb_ht  = b_ht[chunk_idx]
+                    mb_act = b_act[chunk_idx]
+                    mb_olp = b_olp[chunk_idx]
+                    mb_adv = b_adv[chunk_idx]
+                    mb_ret = b_ret[chunk_idx]
+                    new_lp, ent, pool, vec, flat_logits = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act)
+                    unique_ids, inv_idx = torch.unique(mb_gsp_ids, return_inverse=True)
+                    mb_gsp_unique = b_gsp_unique[unique_ids]
+                    mb_c_pool = critic.encode_spatial(mb_gsp_unique)
+                    v_pred = critic.forward_from_pool(mb_c_pool[inv_idx], mb_cve).squeeze(-1)
+                    ratio = torch.exp(new_lp - mb_olp)
+                    with torch.no_grad():
+                        approx_kl = 0.5 * (new_lp - mb_olp).pow(2).mean()
+                        clip_fraction = (torch.abs(ratio - 1.0) > CLIP_EPS).float().mean()
+                    s1 = ratio * mb_adv
+                    s2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * mb_adv
+                    a_loss = -torch.min(s1, s2).mean()
+                    v_loss = F.smooth_l1_loss(v_pred, ret_rms(mb_ret))
+                    mb_ht_masked = mb_ht * mb_vm.float()
+                    ht_flat     = mb_ht_masked.view(mb_ht_masked.shape[0], -1)
+                    ht_row_sums = ht_flat.sum(dim=1)
+                    valid_bc    = ht_row_sums > 1e-6
+                    if valid_bc.any():
+                        ht_valid  = ht_flat[valid_bc]
+                        ht_prob   = (ht_valid / ht_valid.sum(dim=1, keepdim=True)).detach()
+                        fl_bc     = flat_logits[valid_bc].clamp(min=-1e4)
+                        log_pi    = F.log_softmax(fl_bc, dim=-1)
+                        bc        = -(ht_prob * log_pi).sum(dim=-1).mean()
+                        bc        = bc * valid_bc.float().mean()
+                    else:
+                        bc = torch.tensor(0.0, device=DEVICE)
+                    loss_actor = a_loss - ENT_COEF * ent.mean() + lam_bc * bc
+                    loss_critic = VF_COEF * v_loss
+                    (loss_critic * weight).backward()
+                    if critic_warmup_remaining <= 0:
+                        (loss_actor * weight).backward()
+                    mb_a_loss += a_loss.item() * weight
+                    mb_v_loss += v_loss.item() * weight
+                    mb_bc_loss += bc.item() * weight
+                    mb_ent += ent.mean().item() * weight
+                    mb_approx_kl += approx_kl.item() * weight
+                    mb_clip_fraction += clip_fraction.item() * weight
+                if critic_warmup_remaining <= 0:
                     grad_norm_a = nn.utils.clip_grad_norm_(actor.parameters(), MAX_GRAD_NORM)
                 else:
                     grad_norm_a = torch.tensor(0.0)
@@ -489,14 +509,14 @@ def train():
                     opt_critic.zero_grad()
                     if critic_warmup_remaining <= 0:
                         opt_actor.zero_grad()
-                metrics["actor_loss"] += a_loss.item()
-                metrics["value_loss"] += v_loss.item()
-                metrics["bc_loss"]    += bc.item()
-                metrics["entropy"]    += ent.mean().item()
-                metrics["approx_kl"]  += approx_kl.item()
-                metrics["clip_fraction"] += clip_fraction.item()
+                metrics["actor_loss"] += mb_a_loss
+                metrics["value_loss"] += mb_v_loss
+                metrics["bc_loss"]    += mb_bc_loss
+                metrics["entropy"]    += mb_ent
+                metrics["approx_kl"]  += mb_approx_kl
+                metrics["clip_fraction"] += mb_clip_fraction
                 metrics["n_batches"]  += 1
-                epoch_kls.append(approx_kl.item())
+                epoch_kls.append(mb_approx_kl)
             if np.mean(epoch_kls) > 1.5 * TARGET_KL:
                 break
         t_ppo = time.time() - t_ppo_start
