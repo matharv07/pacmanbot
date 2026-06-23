@@ -230,13 +230,13 @@ class Env:
                     if not self.player.powered:
                         pr, pc = self.player.row, self.player.col
                         dist = abs(ghost_prox.row - pr) + abs(ghost_prox.col - pc)
-                        # reward peaks at 0.20 when adjacent, decays to ~0 beyond 8 cells
+                        #reward peaks at 0.20 when adjacent, decays to about 0 beyond 8 cells
                         prox = 0.20 * math.exp(-dist / 3.0)
                         rewards[gid_prox] += prox
 
             grid_area = self.grid_rows * self.grid_cols
-            base_area = 33 * 41   # full grid area
-            step_cost = 0.05 * (grid_area / base_area)   # 0.009 on 7x9, scales to 0.05 on 33x41
+            base_area = 33 * 41
+            step_cost = 0.05 * (grid_area / base_area)   #0.009 on 7x9, scales to 0.05 on 33x41
             for gid in rewards:
                 if self.ghosts[gid].dead:
                     continue

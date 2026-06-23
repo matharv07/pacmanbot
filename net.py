@@ -62,7 +62,7 @@ class GhostActor(nn.Module):
         x = self.res3(x)
         vec = self.vec_mlp(vector)
         x = self.film(x, vec)
-        pool = F.adaptive_avg_pool2d(x, 1).flatten(1)   # (B, 128)
+        pool = F.adaptive_avg_pool2d(x, 1).flatten(1)   #(B, 128)
         return x, pool, vec
 
     def logits_from_features(self, feats, mask):
@@ -144,8 +144,8 @@ class GhostActor(nn.Module):
             mask_k = torch.zeros_like(flat, dtype=torch.bool)
             mask_k.scatter_(1, actions[:, k].unsqueeze(1), True)
             flat = torch.where(mask_k, float('-inf'), flat)
-        logprobs = torch.stack(lp_list, 1).sum(1)    # (B,)
-        entropy  = torch.stack(ent_list, 1).sum(1)   # (B,)
+        logprobs = torch.stack(lp_list, 1).sum(1)    #(B,)
+        entropy  = torch.stack(ent_list, 1).sum(1)   #(B,)
         return logprobs, entropy, pool, vec, flat_clean
 
 class GhostCritic(nn.Module):

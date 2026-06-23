@@ -27,9 +27,10 @@ class Stage:
 STAGES = [Stage(rows=7,  cols=9,  n_ghosts=2, n_power=2,  advance_return=42.0, min_updates=150),
     Stage(rows=13, cols=17, n_ghosts=3, n_power=6,  advance_return=40.0, min_updates=350),
     Stage(rows=21, cols=27, n_ghosts=5, n_power=14, advance_return=28.0, min_updates=360),
+    Stage(rows=27, cols=33, n_ghosts=6, n_power=24, advance_return=22.0, min_updates=400),
     Stage(rows=33, cols=41, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0)]
 
-ADVANCE_WINDOW = 150   #minimum updates required per stage
+ADVANCE_WINDOW = 150   #minimum consequent updates achieving return threshold required to clear a stage
 
 class CurriculumScheduler:
     def __init__(self, start_stage: int = 0):

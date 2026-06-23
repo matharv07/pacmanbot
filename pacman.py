@@ -21,7 +21,7 @@ import glob
 from net import GhostActor
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--stage", type=int, default=3, help="Curriculum stage index to visualize")
+parser.add_argument("--stage", type=int, default=4, help="Curriculum stage index to visualize")
 parser.add_argument("--checkpoint", type=int, default=-1, help="Checkpoint to load")
 args, _ = parser.parse_known_args()
 
@@ -182,7 +182,7 @@ class Player:
         self.eps = 1e-8
         self.macro_routing_active = False  #flag to indicate if we're currently in macro routing mode => following pellet gradients directly - adam gets confused and jittery otherwise
         self._bfs_cache = {}               #cache BFS maps per start position
-        self.stationary = False            # if True, skips movement logic
+        self.stationary = False            #if True, ghost skips movement logic
 
     def set_dir(self, d):
         self.next_dir = d
@@ -410,7 +410,7 @@ class Player:
             self.m_row, self.m_col = 0.0, 0.0
             self.v_row, self.v_col = 0.0, 0.0
             self.t = 0
-            self._bfs_cache.clear()  # grid changed, invalidate BFS cache
+            self._bfs_cache.clear()  #grid changed => invalidate BFS cache
         self.mouth_tick += 1
         if self.mouth_tick >= 3:
             self.mouth_tick = 0

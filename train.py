@@ -29,7 +29,7 @@ import requests
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 torch.set_num_threads(1)
 
-NUM_ENVS        = 16
+NUM_ENVS        = 10
 ROLLOUT_STEPS   = 256
 MINI_BATCH      = 2048
 MICRO_BATCH     = 512      #gradient accumulation chunk size (MINI_BATCH / 4)
@@ -831,7 +831,7 @@ def train():
         ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_act, ds_olp, ds_adv, ds_ret = train_transfer.transfer(
             arr_sp, arr_gsp_unique, arr_gsp_ids, arr_ve, arr_cve, arr_vm, arr_ht, arr_act, arr_olp, arr_adv, arr_ret)
         N_total = ds_sp.shape[0]
-        # verify action indices are within spatial bounds
+        #verify action indices are within spatial bounds
         _sp_hw = ds_sp.shape[-2] * ds_sp.shape[-1]
         if int(ds_act.max().item()) >= _sp_hw:
             print(f"  ⚠️  Action OOB in buffer: max={ds_act.max().item()} >= H*W={_sp_hw}")

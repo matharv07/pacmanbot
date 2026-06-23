@@ -81,7 +81,7 @@ class RewardShaper:
         if math.isinf(d) or math.isnan(d):
             d = 999.0
         diag = len(ghost.grid) + len(ghost.grid[0])
-        # positive potential for distance when powered -> encourages fleeing
+        #positive potential for distance when powered -> encourages fleeing
         return self.alpha * (d / diag)
 
     def _phi_surround(self, ghost, all_ghosts) -> float:
@@ -101,7 +101,7 @@ class RewardShaper:
             angles.append(math.atan2(dy, dx))
         if len(angles) < 3:
             return 0.0
-        # circular variance = 1 - || mean unit-vector ||
+        #circular variance = 1 - || mean unit-vector ||
         N = len(angles)
         R = math.hypot(sum(math.cos(a) for a in angles) / N,
                        sum(math.sin(a) for a in angles) / N)
