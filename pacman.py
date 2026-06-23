@@ -513,9 +513,7 @@ class Game:
                     if num in self.ghosts:
                         self.debug_ghost_id = num
                 elif event.key == pygame.K_r:
-                    score = self.player.score
                     self.new_game()
-                    self.player.score = score
             if event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1: 
                     if self.state == "playing":
@@ -536,9 +534,7 @@ class Game:
             self.message_timer -= 1
             if self.message_timer <= 0:
                 if self.state == "win":
-                    score = self.player.score
                     self.new_game()
-                    self.player.score = score
                     self.state = "playing"
                 elif self.state == "dead":
                     self.state = "playing"

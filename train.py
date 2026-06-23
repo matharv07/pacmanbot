@@ -907,6 +907,25 @@ def train():
                 critic_warmup_remaining = 20
                 with open(log_path, "a") as f:
                     f.write(json.dumps({"curriculum_advance": curriculum.stage_idx, "update": p_up, "new_grid": f"{stage.rows}x{stage.cols}", "new_lr": opt_actor.param_groups[0]['lr']}) + "\n")
+                #save checkpoint when curriculum advances
+                path = os.path.join(CKPT_DIR, f"ckpt_{p_up}_stage_{curriculum.stage_idx}.pt")
+                torch.save({"actor": actor.state_dict(),
+                             "critic": critic.state_dict(),
+                             "opt_actor": opt_actor.state_dict(),
+                             "opt_critic": opt_critic.state_dict(),
+                             "ret_rms": ret_rms.state_dict(),
+                             "update": p_up,
+                             "episodes": res['episodes'],
+                             "total_steps": res['total_steps'],
+                             "curriculum": curriculum.state_dict(),
+                             "critic_warmup_remaining": critic_warmup_remaining,
+                             "ema_return": ema_return,
+                             "bc_decay_step": bc_decay_step,
+                             "rng_state": torch.get_rng_state(),
+                             "np_rng_state": np.random.get_state()}, path)
+                with open(log_path, "a") as f:
+                    f.write(json.dumps({"checkpoint": path, "update": p_up, "reason": "curriculum_advance"}) + "\n")
+                print(f"  💾 Checkpoint saved on curriculum advance: {path}")
             if p_up % 10 == 0:
                 threading.Thread(target=push_to_discord, args=(row,), daemon=True).start()
                 elapsed = res["wall_s"]
