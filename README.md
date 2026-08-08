@@ -1,3 +1,5 @@
+Visit https://github.com/matharv07/minibot - to see a gazebo simulation of physical bots with routing logic playing pacman with all the same restrictions as layed down below:
+
 This repo aims to develop a PACMAN autonomous hive network, wherein the ghosts in the game have been altered to communincate together and plan how to eradicate the pacman - which is controlled by a human player. This will act as a proof of concept for developing a quadruped hive network for multiagentic reconnisance missions, which will be the next part of our mission.
 
 There have been multiple modifications to the game, as a means to evaluate our system based on multiagentic collaborative metrics:
