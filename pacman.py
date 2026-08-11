@@ -87,8 +87,14 @@ def load_rl_model():
             print("No checkpoints found. RL Mode disabled.")
             RL_MODE = False
             return False            
-        latest = max(ckpts, key=os.path.getctime)
-        if check != -1 and glob.glob(f"checkpoints/ckpt_{check}.pt"):
+        def ckpt_score(f):
+            try:
+                num = int(f.split('ckpt_')[-1].split('.pt')[0])
+                return (num > 0 and num % 100 == 0, num)
+            except ValueError:
+                return (False, -1)
+        latest = max(ckpts, key=ckpt_score)
+        if check != -1 and os.path.exists(f"checkpoints/ckpt_{check}.pt"):
             latest = f"checkpoints/ckpt_{check}.pt"
         print(f"Loading checkpoint: {latest}")
         RL_ACTOR = GhostActor().to(RL_DEVICE)
