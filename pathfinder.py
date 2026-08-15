@@ -46,29 +46,41 @@ def build_scipy_graph(grid: list):
         return
     import numpy as np
     from scipy.sparse import csr_matrix
-    rows = len(grid)
-    cols = len(grid[0])
-    open_cells = []
-    cell_to_idx = {}
-    for r in range(rows):
-        for c in range(cols):
-            if grid[r][c] != WALL:
-                idx = len(open_cells)
-                open_cells.append((r, c))
-                cell_to_idx[(r, c)] = idx
-    n = len(open_cells)
+    grid_arr = np.array(grid, dtype=np.int8)
+    rows, cols = grid_arr.shape
+    open_mask = grid_arr != WALL
+    open_r, open_c = np.nonzero(open_mask)
+    n = len(open_r)
+    idx_map = np.full((rows, cols), -1, dtype=np.int32)
+    idx_map[open_r, open_c] = np.arange(n)
+    open_cells = list(zip(open_r.tolist(), open_c.tolist()))
+    cell_to_idx = {cell: i for i, cell in enumerate(open_cells)}
     row_ind = []
     col_ind = []
     data = []
-    for i, (r, c) in enumerate(open_cells):
-        for dr, dc in _DIRS:
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < rows and 0 <= nc < cols and grid[nr][nc] != WALL:
-                j = cell_to_idx[(nr, nc)]
-                cost = _cost(grid, nr, nc)
-                row_ind.append(i)
-                col_ind.append(j)
-                data.append(cost)
+    dirs = np.array([[-1, 0], [1, 0], [0, -1], [0, 1]])
+    for dr, dc in dirs:
+        nr = open_r + dr
+        nc = open_c + dc
+        valid = (nr >= 0) & (nr < rows) & (nc >= 0) & (nc < cols)
+        valid_indices = np.nonzero(valid)[0]
+        v_nr = nr[valid]
+        v_nc = nc[valid]
+        j_indices = idx_map[v_nr, v_nc]
+        is_open = j_indices >= 0
+        valid_i = valid_indices[is_open]
+        valid_j = j_indices[is_open]
+        valid_nr = v_nr[is_open]
+        valid_nc = v_nc[is_open]
+        row_ind.extend(valid_i.tolist())
+        col_ind.extend(valid_j.tolist())
+        cells = grid_arr[valid_nr, valid_nc]
+        costs = np.full(len(cells), np.inf)
+        costs[cells == EMPTY] = 1.0
+        costs[cells == PELLET] = 1.0
+        costs[cells == POWER] = 0.5
+        costs[cells == UNKNOWN] = 3.0
+        data.extend(costs.tolist())
     graph = csr_matrix((data, (row_ind, col_ind)), shape=(n, n))
     global _SCIPY_CACHE_GEN
     _SCIPY_CACHE_GEN += 1
@@ -84,7 +96,6 @@ def build_scipy_graph(grid: list):
         keys_to_del = [k for k, v in _SCIPY_GRID_GEN.items() if v not in _SCIPY_GRAPH_CACHE]
         for k in keys_to_del:
             _SCIPY_GRID_GEN.pop(k, None)
-
 #cell costs for path planning - wall taken to be impassable
 _COST = {EMPTY: 1.0, PELLET: 1.0, POWER: 0.5, UNKNOWN: 3.0, WALL: math.inf}   #unknown territory taken to be passable but 3x more costly than known cells
 _DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]

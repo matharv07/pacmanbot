@@ -41,7 +41,8 @@ else:
 CELL = 20
 WIDTH = COLS * CELL
 HEIGHT = ROWS * CELL + 48
-FPS = 10
+FPS = 150
+SIM_SPEEDUP = 1
 
 BLACK  = (0, 0, 0)
 WHITE  = (255, 255, 255)
@@ -120,14 +121,22 @@ def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = N_POWER, ran
     blocked = np.any(dist_sq <= (r + 0.35)**2, axis=1)
     grid_flat = np.where(blocked, WALL, EMPTY)
     grid = grid_flat.reshape((rows, cols))
-    for p in world.pellets:
-        r_c, c_c = int(p[1]), int(p[0])
-        if 0 <= r_c < rows and 0 <= c_c < cols and grid[r_c, c_c] == EMPTY:
-            grid[r_c, c_c] = PELLET
-    for p in world.power_pellets:
-        r_c, c_c = int(p[1]), int(p[0])
-        if 0 <= r_c < rows and 0 <= c_c < cols and grid[r_c, c_c] in (EMPTY, PELLET):
-            grid[r_c, c_c] = POWER
+    if world.pellets:
+        pellets = np.array(world.pellets)
+        pr = pellets[:, 1].astype(int)
+        pc = pellets[:, 0].astype(int)
+        valid = (pr >= 0) & (pr < rows) & (pc >= 0) & (pc < cols)
+        pr, pc = pr[valid], pc[valid]
+        empty_mask = grid[pr, pc] == EMPTY
+        grid[pr[empty_mask], pc[empty_mask]] = PELLET
+    if world.power_pellets:
+        power_pellets = np.array(world.power_pellets)
+        pr = power_pellets[:, 1].astype(int)
+        pc = power_pellets[:, 0].astype(int)
+        valid = (pr >= 0) & (pr < rows) & (pc >= 0) & (pc < cols)
+        pr, pc = pr[valid], pc[valid]
+        valid_mask = (grid[pr, pc] == EMPTY) | (grid[pr, pc] == PELLET)
+        grid[pr[valid_mask], pc[valid_mask]] = POWER
     pr, pc = int(world.safe_area[0][1]), int(world.safe_area[0][0])
     return grid, (pr, pc), world
 
@@ -135,13 +144,13 @@ class Player:
     def __init__(self, grid, pos, world=None):
         self.grid = grid
         self.world = world
-        self.row, self.col = float(pos[0]), float(pos[1])
-        self.prev_row, self.prev_col = self.row, self.col
+        self.y, self.x = float(pos[0]), float(pos[1])
+        self.prev_y, self.prev_x = self.y, self.x
         self.start = pos
         self.vx = 0.0
         self.vy = 0.0
         self.max_speed = 1.0
-        self.radius = 0.4
+        self.radius = 0.3
         self.dir = RIGHT
         self.next_dir = RIGHT
         self.score = 0
@@ -171,8 +180,8 @@ class Player:
                 g_indices = []
                 for g in ghosts.values():
                     if not g.dead:
-                        gr = max(0, min(rows - 1, int(round(g.row))))
-                        gc = max(0, min(cols - 1, int(round(g.col))))
+                        gr = max(0, min(rows - 1, int(round(g.y))))
+                        gc = max(0, min(cols - 1, int(round(g.x))))
                         if (gr, gc) in cell_to_idx:
                             g_indices.append(cell_to_idx[(gr, gc)])
                 if g_indices:
@@ -190,8 +199,8 @@ class Player:
     def _pick_target(self, ghosts):
         """BFS scoring to pick the best pellet (or ghost when powered) target."""
         rows, cols = len(self.grid), len(self.grid[0])
-        ir = max(0, min(rows - 1, int(round(self.row))))
-        ic = max(0, min(cols - 1, int(round(self.col))))
+        ir = max(0, min(rows - 1, int(round(self.y))))
+        ic = max(0, min(cols - 1, int(round(self.x))))
         #snap to nearest open cell if in a wall
         if self.grid[ir][ic] == WALL:
             best_d = float('inf')
@@ -203,13 +212,13 @@ class Player:
                         if d < best_d:
                             best_d = d
                             ir, ic = nr, nc
-        if self.powered:
+        if self.powered and self.power_timer > 15:
             best_ghost_dist = float('inf')
             best_ghost_target = None
             for g in ghosts.values():
                 if not g.dead:
-                    gr = max(0, min(rows - 1, int(round(g.row))))
-                    gc = max(0, min(cols - 1, int(round(g.col))))
+                    gr = max(0, min(rows - 1, int(round(g.y))))
+                    gc = max(0, min(cols - 1, int(round(g.x))))
                     if self.grid[gr][gc] != WALL:
                         d = abs(ir - gr) + abs(ic - gc)
                         if d < best_ghost_dist:
@@ -219,11 +228,11 @@ class Player:
                 path = pathfinder.astar(self.grid, (ir, ic), best_ghost_target)
                 if len(path) >= 2:
                     return best_ghost_target, list(path[1:])
-        ghost_cells = []      #ghost cell list for danger scoring
+        ghost_cells = []                #ghost cell list for danger scoring
         for g in ghosts.values():
             if not g.dead:
-                gr = max(0, min(rows - 1, int(round(g.row))))
-                gc = max(0, min(cols - 1, int(round(g.col))))
+                gr = max(0, min(rows - 1, int(round(g.y))))
+                gc = max(0, min(cols - 1, int(round(g.x))))
                 ghost_cells.append((gr, gc))
         best_score = float('inf')       #multi-source BFS from player position to find best pellet
         best_target = None
@@ -234,19 +243,30 @@ class Player:
             if (ir, ic) in cell_to_idx:
                 start_idx = cell_to_idx[(ir, ic)]
                 distances, predecessors = pathfinder.scipy_dijkstra(graph, directed=False, indices=start_idx, return_predecessors=True)
-                for idx, (r, c) in enumerate(open_cells):
-                    d = distances[idx]
-                    if d > 80 or math.isinf(d):
-                        continue
-                    cell = self.grid[r][c]
-                    if cell in (PELLET, POWER):
-                        ghost_safety = min(abs(r - gr) + abs(c - gc) for gr, gc in ghost_cells) if ghost_cells else 999
-                        danger = max(0.0, 3.0 - ghost_safety) * 15.0 if ghost_safety < 3 else 0.0
-                        weight = 0.5 if cell == POWER else 1.5
-                        score = d * weight + danger
-                        if score < best_score:
-                            best_score = score
-                            best_target = (r, c)
+                open_r = np.array([r for r, c in open_cells])
+                open_c = np.array([c for r, c in open_cells])
+                grid_arr = np.array(self.grid)
+                cells = grid_arr[open_r, open_c]
+                valid_mask = (distances <= 80) & np.isfinite(distances)
+                pellet_mask = (cells == PELLET) | (cells == POWER)
+                mask = valid_mask & pellet_mask
+                if np.any(mask):
+                    valid_r = open_r[mask]
+                    valid_c = open_c[mask]
+                    valid_d = distances[mask]
+                    valid_cells = cells[mask]
+                    if ghost_cells:
+                        gr_arr = np.array([gr for gr, gc in ghost_cells])[:, np.newaxis]
+                        gc_arr = np.array([gc for gr, gc in ghost_cells])[:, np.newaxis]
+                        g_dists = np.abs(valid_r - gr_arr) + np.abs(valid_c - gc_arr)
+                        ghost_safety = np.min(g_dists, axis=0)
+                        danger = np.where(ghost_safety < 3, (3.0 - ghost_safety) * 15.0, 0.0)
+                    else:
+                        danger = np.zeros_like(valid_d)
+                    weights = np.where(valid_cells == POWER, 0.5, 1.5)
+                    scores = valid_d * weights + danger
+                    best_idx = np.argmin(scores)
+                    best_target = (int(valid_r[best_idx]), int(valid_c[best_idx]))
                 scipy_success = True
         if not scipy_success:
             dist_map = np.full((rows, cols), -1, dtype=np.int32)
@@ -294,7 +314,7 @@ class Player:
             self.dead_timer -= 1
             if self.dead_timer <= 0:
                 self.dead = False
-                self.row, self.col = self.start
+                self.y, self.x = self.start
                 self.dir = RIGHT
                 self.next_dir = RIGHT
                 self.powered = False
@@ -310,8 +330,7 @@ class Player:
             if 0 <= r < rows and 0 <= c < cols:
                 return self.grid[int(r)][int(c)] == WALL
             return True
-
-        self.prev_row, self.prev_col = self.row, self.col
+        self.prev_y, self.prev_x = self.y, self.x
         if self.stationary:
             if not self.powered and random.random() < 0.0107:
                 self.powered = True
@@ -321,11 +340,11 @@ class Player:
             min_ghost_dist = float('inf')
             for g in ghosts.values():
                 if not g.dead:
-                    gd = math.hypot(self.row - g.row, self.col - g.col)
+                    gd = math.hypot(self.y - g.y, self.x - g.x)
                     if gd < min_ghost_dist:
                         min_ghost_dist = gd
             #check if route needs replanning
-            ghost_emergency = not self.powered and min_ghost_dist < 2.5
+            ghost_emergency = not self.powered and min_ghost_dist < 2.5 and self._route_age >= 3
             power_changed = self.powered != self._route_power_state
             target_eaten = (self._route_target is not None and self.grid[self._route_target[0]][self._route_target[1]] not in (PELLET, POWER) and not self.powered)
             path_exhausted = not self._route
@@ -337,13 +356,13 @@ class Player:
                 self._route_power_state = self.powered
                 self._route_age = 0
             #pop waypoints we've reached
-            while self._route and abs(self.row - self._route[0][0]) < 0.4 and abs(self.col - self._route[0][1]) < 0.4:
+            while self._route and abs(self.y - (self._route[0][0] + 0.5)) < 0.4 and abs(self.x - (self._route[0][1] + 0.5)) < 0.4:
                 self._route.pop(0)
             #get desired heading from next waypoint
             if self._route:
                 wp_r, wp_c = self._route[0]
-                dr = wp_r - self.row
-                dc = wp_c - self.col
+                dr = (wp_r + 0.5) - self.y
+                dc = (wp_c + 0.5) - self.x
                 heading_len = math.hypot(dr, dc)
                 if heading_len > 0.01:
                     desired_vy = dr / heading_len
@@ -370,31 +389,31 @@ class Player:
             ray_vx_arr = np.cos(angles)
             ray_vy_arr = np.sin(angles)
             check_dist_max = current_speed * 1.5 + self.radius
-            n_steps = max(2, int(math.ceil(check_dist_max / 0.05)))
+            n_steps = max(2, int(math.ceil(check_dist_max / 0.2)))
             fracs = np.linspace(1/n_steps, 1.0, n_steps)
-            cc_grid = self.col + np.outer(ray_vx_arr, fracs) * check_dist_max
-            cr_grid = self.row + np.outer(ray_vy_arr, fracs) * check_dist_max
+            cc_grid = self.x + np.outer(ray_vx_arr, fracs) * check_dist_max
+            cr_grid = self.y + np.outer(ray_vy_arr, fracs) * check_dist_max
             if self.world and hasattr(self.world, 'batch_is_passable'):
                 passable = self.world.batch_is_passable(cc_grid.flatten(), cr_grid.flatten(), self.radius).reshape((num_rays, n_steps))
             else:
-                passable = np.ones((num_rays, n_steps), dtype=bool)
-                for i in range(num_rays):
-                    for s in range(n_steps):
-                        if is_wall(cr_grid[i, s], cc_grid[i, s]):
-                            passable[i, s] = False           
-            for i in range(num_rays):
-                ray_penalty = 0.0
-                for s in range(n_steps):
-                    if not passable[i, s]:
-                        frac = (s + 1) / n_steps
-                        ray_penalty = 1000.0 / frac
-                        break
-                interest = ray_vx_arr[i] * desired_vx + ray_vy_arr[i] * desired_vy
-                hysteresis = 0.2 * (ray_vx_arr[i] * cur_vx_norm + ray_vy_arr[i] * cur_vy_norm)
-                score = interest + hysteresis - ray_penalty
-                if score > best_score:
-                    best_score = score
-                    best_vx, best_vy = ray_vx_arr[i], ray_vy_arr[i]
+                r_c = cr_grid.astype(int)
+                c_c = cc_grid.astype(int)
+                valid = (r_c >= 0) & (r_c < len(self.grid)) & (c_c >= 0) & (c_c < len(self.grid[0]))
+                safe_r = np.where(valid, r_c, 0)
+                safe_c = np.where(valid, c_c, 0)
+                grid_arr = np.array(self.grid)
+                cells = grid_arr[safe_r, safe_c]
+                passable = valid & (cells != WALL)
+            hit_mask = ~passable
+            hit_indices = np.argmax(hit_mask, axis=1)
+            has_hit = np.any(hit_mask, axis=1)
+            hit_fracs = (hit_indices + 1) / n_steps
+            ray_penalties = np.where(has_hit, 1000.0 / hit_fracs, 0.0)
+            interests = ray_vx_arr * desired_vx + ray_vy_arr * desired_vy
+            hysteresis = 0.2 * (ray_vx_arr * cur_vx_norm + ray_vy_arr * cur_vy_norm)
+            scores = interests + hysteresis - ray_penalties
+            best_idx = np.argmax(scores)
+            best_vx, best_vy = ray_vx_arr[best_idx], ray_vy_arr[best_idx]
             #implementing momentum based low pass filter - while verifying if its safe to prevent wall clipping
             target_vy = best_vy * self.max_speed * speed_mult
             target_vx = best_vx * self.max_speed * speed_mult
@@ -406,12 +425,12 @@ class Player:
                 smooth_mag = math.hypot(smooth_vx, smooth_vy)
                 if smooth_mag > 1e-6:
                     check_dist = smooth_mag * 1.5 + self.radius
-                    n_steps_s = max(2, int(math.ceil(check_dist / 0.05)))
+                    n_steps_s = max(2, int(math.ceil(check_dist / 0.2)))
                     s_vy_norm = smooth_vy / smooth_mag
                     s_vx_norm = smooth_vx / smooth_mag
                     fracs = np.linspace(1/n_steps_s, 1.0, n_steps_s)
-                    cc_arr = self.col + s_vx_norm * check_dist * fracs
-                    cr_arr = self.row + s_vy_norm * check_dist * fracs
+                    cc_arr = self.x + s_vx_norm * check_dist * fracs
+                    cr_arr = self.y + s_vy_norm * check_dist * fracs
                     passable = self.world.batch_is_passable(cc_arr, cr_arr, self.radius)
                     smooth_safe = np.all(passable)
             if smooth_safe:
@@ -424,34 +443,36 @@ class Player:
         if not self.stationary:
             #substepped continuous collision detection (CCD)
             if self.world and hasattr(self.world, 'resolve_collision'):
+                self.path_this_frame = [(self.x, self.y)]
                 steps = max(1, int(math.ceil(math.hypot(self.vx, self.vy) / 0.2)))
                 step_vx = self.vx / steps
                 step_vy = self.vy / steps
                 for _ in range(steps):
-                    self.col += step_vx
-                    self.row += step_vy
-                    self.col, self.row = self.world.resolve_collision(self.col, self.row, self.radius, max_iters=10)
+                    self.x += step_vx
+                    self.y += step_vy
+                    self.x, self.y = self.world.resolve_collision(self.x, self.y, self.radius, max_iters=10)
+                    self.path_this_frame.append((self.x, self.y))
             else:
                 #simple collision: check corners of bounding box
-                nr = self.row + self.vy
-                nc = self.col + self.vx
+                nr = self.y + self.vy
+                nc = self.x + self.vx
                 r_rad, c_rad = self.radius, self.radius
-                if not (is_wall(self.row - r_rad, nc - c_rad) or is_wall(self.row - r_rad, nc + c_rad) or 
-                        is_wall(self.row + r_rad, nc - c_rad) or is_wall(self.row + r_rad, nc + c_rad)):
-                    self.col = nc
-                if not (is_wall(nr - r_rad, self.col - c_rad) or is_wall(nr - r_rad, self.col + c_rad) or 
-                        is_wall(nr + r_rad, self.col - c_rad) or is_wall(nr + r_rad, self.col + c_rad)):
-                    self.row = nr
+                if not (is_wall(self.y - r_rad, nc - c_rad) or is_wall(self.y - r_rad, nc + c_rad) or 
+                        is_wall(self.y + r_rad, nc - c_rad) or is_wall(self.y + r_rad, nc + c_rad)):
+                    self.x = nc
+                if not (is_wall(nr - r_rad, self.x - c_rad) or is_wall(nr - r_rad, self.x + c_rad) or 
+                        is_wall(nr + r_rad, self.x - c_rad) or is_wall(nr + r_rad, self.x + c_rad)):
+                    self.y = nr
             if self.vx > 0: self.dir = RIGHT
             elif self.vx < 0: self.dir = LEFT
             elif self.vy > 0: self.dir = DOWN
             elif self.vy < 0: self.dir = UP
-            self.col = max(self.radius, min(len(self.grid[0]) - self.radius, self.col))
-            self.row = max(self.radius, min(len(self.grid) - self.radius, self.row))
-        r_min = max(0, int(self.row - self.radius))
-        r_max = min(len(self.grid) - 1, int(self.row + self.radius))
-        c_min = max(0, int(self.col - self.radius))
-        c_max = min(len(self.grid[0]) - 1, int(self.col + self.radius))
+            self.x = max(self.radius, min(len(self.grid[0]) - self.radius, self.x))
+            self.y = max(self.radius, min(len(self.grid) - self.radius, self.y))
+        r_min = max(0, int(self.y - self.radius))
+        r_max = min(len(self.grid) - 1, int(self.y + self.radius))
+        c_min = max(0, int(self.x - self.radius))
+        c_max = min(len(self.grid[0]) - 1, int(self.x + self.radius))
         collected_anything = False
         for cr in range(r_min, r_max + 1):
             for cc in range(c_min, c_max + 1):
@@ -478,8 +499,8 @@ class Player:
         self.dead_timer = 20
 
     def draw(self, surf):
-        x = int(self.col * CELL)
-        y = int(self.row * CELL)
+        x = int(self.x * CELL)
+        y = int(self.y * CELL)
         r = CELL // 2 - 2
         angle = 0
         if self.vx > 0: angle = 0
@@ -542,7 +563,7 @@ class Game:
             best_idx = np.argmax(scores)
             ghost_starts.append(tuple(open_cells[best_idx]))
             available[best_idx] = False
-        self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i % len(GHOST_COLORS)], self.player_start) for i, pos in enumerate(ghost_starts)}
+        self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i % len(GHOST_COLORS)], self.player_start, self.world) for i, pos in enumerate(ghost_starts)}
         self.state = "playing"
         self.message_timer = 0
         self.debug_ghost_id = 0
@@ -654,20 +675,47 @@ class Game:
                         if tasks:
                             all_targets = [t.target_pos for t in tasks]
                             from pathfinder import dijkstra_multi
-                            dists = dijkstra_multi(g.grid, (g.row, g.col), all_targets)
+                            dists = dijkstra_multi(g.grid, (g.y, g.x), all_targets)
                             h_dists.update(dists)
                         g.cbba_agent._phase1(g, all_tasks, h_dists)
         self.player.update(self.ghosts)
         powered = self.player.powered
         for ghost in self.ghosts.values():
-            ghost.update((int(self.player.row), int(self.player.col)), powered, self.ghosts)
+            ghost.update((int(self.player.y), int(self.player.x)), powered, self.ghosts)
         if not self.player.dead:
             for gid, ghost in list(self.ghosts.items()):
                 if ghost.dead:
                     continue
-                dist = math.hypot(ghost.y - self.player.row, ghost.x - self.player.col)
-                collision_radius = self.player.radius + 0.4  # ghost radius ~0.4
-                if dist < collision_radius:
+                collision_radius = self.player.radius + ghost.radius
+                collided = False
+                p_path = getattr(self.player, 'path_this_frame', [(self.player.x, self.player.y)])
+                g_path = getattr(ghost, 'path_this_frame', [(ghost.x, ghost.y)])
+                n_p = len(p_path)
+                n_g = len(g_path)
+                max_segs = max(1, n_p - 1, n_g - 1)
+                samples = max_segs * 3 + 1
+                for step in range(samples):
+                    t = step / (samples - 1) if samples > 1 else 0.0
+                    if n_p == 1:
+                        px, py = p_path[0]
+                    else:
+                        fp = t * (n_p - 1)
+                        ip = min(int(fp), n_p - 2)
+                        rem_p = fp - ip
+                        px = p_path[ip][0] * (1 - rem_p) + p_path[ip + 1][0] * rem_p
+                        py = p_path[ip][1] * (1 - rem_p) + p_path[ip + 1][1] * rem_p    
+                    if n_g == 1:
+                        gx, gy = g_path[0]
+                    else:
+                        fg = t * (n_g - 1)
+                        ig = min(int(fg), n_g - 2)
+                        rem_g = fg - ig
+                        gx = g_path[ig][0] * (1 - rem_g) + g_path[ig + 1][0] * rem_g
+                        gy = g_path[ig][1] * (1 - rem_g) + g_path[ig + 1][1] * rem_g
+                    if math.hypot(gx - px, gy - py) < collision_radius:
+                        collided = True
+                        break
+                if collided:
                     if self.player.powered:
                         ghost.kill()
                         self.player.score += 200
@@ -678,8 +726,7 @@ class Game:
                         break
         if self.pellets_left() == 0:
             self.state = "win"
-            self.message_timer = 60 if not AUTO_MODE else 0
-
+            self.message_timer = 90 if not AUTO_MODE else 0
     def draw_grid(self):
         surf = self.screen
         for obs in self.world.obstacles:
@@ -769,11 +816,11 @@ class Game:
             pygame.draw.circle(self.screen, GHOST_COLORS[gid], (x, y), CELL // 2 - 2)
             label = self.small.render(str(gid), True, WHITE)
             self.screen.blit(label, (WIDTH + gc * CELL + 2, gr * CELL + 2))
-        x = WIDTH + ghost.col * CELL + CELL // 2
-        y = ghost.row * CELL + CELL // 2
+        x = WIDTH + ghost.x * CELL + CELL // 2
+        y = ghost.y * CELL + CELL // 2
         pygame.draw.circle(self.screen, GHOST_COLORS[self.debug_ghost_id], (x, y), CELL // 2 - 2)
         label = self.small.render(str(self.debug_ghost_id), True, WHITE)
-        self.screen.blit(label, (WIDTH + ghost.col * CELL + 2, ghost.row * CELL + 2))
+        self.screen.blit(label, (WIDTH + ghost.x * CELL + 2, ghost.y * CELL + 2))
         if ghost.known_pacman:
             pr, pc = ghost.known_pacman
             x = WIDTH + pc * CELL + CELL // 2
@@ -795,7 +842,8 @@ class Game:
     def run(self):
         while True:
             self.handle_events()
-            self.update()
+            for _ in range(SIM_SPEEDUP):
+                self.update()
             self.screen.fill(BLACK)
             self.draw_grid()
             for ghost in self.ghosts.values():

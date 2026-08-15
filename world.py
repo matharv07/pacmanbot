@@ -45,7 +45,10 @@ class Capsule(Obstacle):
 
 class CurvedWall(Obstacle):
     def __init__(self, points, r):
-        self.capsules = [Capsule(points[i][0], points[i][1], points[i+1][0], points[i+1][1], r) for i in range(len(points)-1)]
+        self.capsules = []
+        for i in range(len(points)-1):
+            if (i + 1) % 3 != 0:
+                self.capsules.append(Capsule(points[i][0], points[i][1], points[i+1][0], points[i+1][1], r))
         
     def contains(self, x, y):
         return any(c.contains(x, y) for c in self.capsules)
@@ -79,15 +82,14 @@ class World:
     def _points_to_segments_dist_sq(self, px, py):
         """Vectorized point-to-segment squared distance. px, py are (M,) arrays."""
         if len(self.compiled_segments) == 0:
-            return np.full((len(px), 0), np.inf), np.empty((1, 0))
-
+            return np.full((len(px), 0), np.inf), np.empty((1, 0)) 
+        x1 = self.compiled_segments[:, 0][np.newaxis, :]
+        y1 = self.compiled_segments[:, 1][np.newaxis, :]
+        x2 = self.compiled_segments[:, 2][np.newaxis, :]
+        y2 = self.compiled_segments[:, 3][np.newaxis, :]
+        r  = self.compiled_segments[:, 4][np.newaxis, :]
         px = px[:, np.newaxis] #(M, 1)
         py = py[:, np.newaxis]
-        x1 = self.compiled_segments[np.newaxis, :, 0] #(1, N)
-        y1 = self.compiled_segments[np.newaxis, :, 1]
-        x2 = self.compiled_segments[np.newaxis, :, 2]
-        y2 = self.compiled_segments[np.newaxis, :, 3]
-        r  = self.compiled_segments[np.newaxis, :, 4]
         dx, dy = x2 - x1, y2 - y1
         l2 = dx*dx + dy*dy
         mask = (l2 == 0)
@@ -97,7 +99,7 @@ class World:
         t = np.where(mask, 0.0, t)        
         proj_x = x1 + t * dx
         proj_y = y1 + t * dy
-        dist_sq = (px - proj_x)**2 + (py - proj_y)**2 #(M, N)
+        dist_sq = (px - proj_x)**2 + (py - proj_y)**2 #(M, N_filtered)
         return dist_sq, r
 
     def is_passable(self, x, y, radius=0):
@@ -121,6 +123,31 @@ class World:
         dist_sq, r_seg = self._points_to_segments_dist_sq(px, py)
         collided = np.any(dist_sq <= (r_seg + radius)**2, axis=1)
         return ~(out_of_bounds | collided)
+
+    def line_of_sight(self, p1, p2, radius=0, step_size=0.2):         #checks for obstacles along a line segment
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        dist = math.hypot(dx, dy)
+        if dist == 0:
+            return self.is_passable(p1[0], p1[1], radius)
+        n_steps = max(2, int(math.ceil(dist / step_size)))
+        fracs = np.linspace(0, 1.0, n_steps)
+        px = p1[0] + dx * fracs
+        py = p1[1] + dy * fracs
+        return np.all(self.batch_is_passable(px, py, radius))
+
+    def rasterize(self, cell_size, buffer=0.0):           #returns a boolean 2D array where True indicates blocked/wall.
+        cols = int(self.width / cell_size)
+        rows = int(self.height / cell_size)
+        grid_y, grid_x = np.mgrid[0:rows, 0:cols]
+        px = (grid_x.ravel() * cell_size) + (cell_size / 2)
+        py = (grid_y.ravel() * cell_size) + (cell_size / 2)
+        dist_sq, r = self._points_to_segments_dist_sq(px, py)
+        if len(self.compiled_segments) > 0:
+            blocked = np.any(dist_sq <= (r + buffer)**2, axis=1)
+        else:
+            blocked = np.zeros_like(px, dtype=bool)
+        return blocked.reshape((rows, cols))
 
     def resolve_collision(self, px, py, radius, max_iters=3):
         px_arr = np.empty((1,), dtype=np.float32)
@@ -191,7 +218,7 @@ class World:
                 points.append((x, y))
                 for _ in range(length):
                     angle += random.uniform(-0.8, 0.8)
-                    step = random.uniform(1.0, 3.0)
+                    step = random.uniform(2.5, 4.0)
                     x += math.cos(angle) * step
                     y += math.sin(angle) * step
                     points.append((x, y))
@@ -249,9 +276,9 @@ class World:
             power_indices = [random.randint(0, len(self.pellets)-1)]
             distances = np.sum((pellets_arr - pellets_arr[power_indices[0]])**2, axis=1)
             for _ in range(1, n_power):
-                farthest = int(np.argmax(distances))
                 power_indices.append(farthest)
                 new_dists = np.sum((pellets_arr - pellets_arr[farthest])**2, axis=1)
+                farthest = int(np.argmax(distances))
                 distances = np.minimum(distances, new_dists)
             power_indices.sort(reverse=True)
             for idx in power_indices:

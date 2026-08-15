@@ -68,7 +68,7 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int = None, cols: int = 
         out[4] = ghost.belief_map._b[:rows, :cols]
     if hasattr(ghost.belief_map, '_safety'):
         out[5] = ghost.belief_map._safety[:rows, :cols]
-    out[6, ghost.row, ghost.col] = 1.0
+    out[6, int(ghost.y), int(ghost.x)] = 1.0
     target = _pacman_target(ghost)
     if target is not None:
         tr, tc = target
@@ -93,7 +93,7 @@ def build_vector(ghost) -> np.ndarray:
     rows = len(ghost.grid)
     cols = len(ghost.grid[0])
     f = []
-    f.extend([ghost.row / rows, ghost.col / cols])
+    f.extend([ghost.y / rows, ghost.x / cols])
     timer = getattr(ghost, 'pacman_power_timer', 0)
     f.append(timer / 40.0 if getattr(ghost, 'pacman_powered', False) else 0.0)
     since = ghost.frame - ghost.pacman_last_seen if ghost.pacman_last_seen >= 0 else 200
@@ -167,8 +167,8 @@ def build_global_spatial(env, rows, cols) -> np.ndarray:
     out[1] = (env.grid == 2)
     out[2] = (env.grid == 3)
     if not env.player.dead:
-        out[3, env.player.row, env.player.col] = 1.0
+        out[3, int(env.player.y), int(env.player.x)] = 1.0
     for g in env.ghosts.values():
         if not g.dead:
-            out[4 + g.gid, g.row, g.col] = 1.0
+            out[4 + g.gid, int(g.y), int(g.x)] = 1.0
     return out

@@ -39,7 +39,7 @@ RIGHT = ( 0,  1)
 DIRS  = [UP, DOWN, LEFT, RIGHT]
 
 RADIUS            = 12
-RAY_COUNT         = 360
+RAY_COUNT         = 90
 MAX_RAY_DIST      = 10
 UNKNOWN           = -1
 MEMORY_FRAMES     = 10
@@ -48,24 +48,25 @@ HEARTBEAT_TIMEOUT = 25
 RESYNC_EVERY      = 50
 OSCILLATION_WINDOW = 8   #position history length to prevent oscillations
 
-_ANGLES = np.radians(np.arange(RAY_COUNT))
+_ANGLES = np.linspace(0, 2*math.pi, RAY_COUNT, endpoint=False)
 _DX = np.cos(_ANGLES) * 0.5
 _DY = np.sin(_ANGLES) * 0.5
 
 class Ghost:
-    def __init__(self, gid, grid, pos, color, player_start):
+    def __init__(self, gid, grid, pos, color, player_start, world=None):
         self.gid = gid
         self.grid = grid
-        self.row, self.col = pos
-        self.prev_row, self.prev_col = pos
+        self.world = world
+        self.radius = 0.3
         self.x, self.y = float(pos[1]), float(pos[0])
+        self.prev_x, self.prev_y = self.x, self.y
         self.vx, self.vy = 0.0, 0.0
         self.max_speed = 0.5
         self.target_cell = pos
         self.color = color
         self.dead = False
         self.in_fallback_mode = False
-        self.move_every = 2
+        self.move_every = 1
         self.last_dir = random.choice(DIRS)
         rows = len(grid)
         cols = len(grid[0])
@@ -94,19 +95,8 @@ class Ghost:
         self._last_synced_map: dict[int, np.ndarray] = {}   # per-peer snapshot for delta sync
         self._tail_pacman_remaining = 0         #post-pop number of ghosts that will be tailing
 
-    def update(self, player_pos, powered, all_ghosts, skip_movement=False):
+    def update(self, player_pos, powered, all_ghosts, skip_movement=False, speed_mult=1.0):
         self.frame += 1
-        target_x, target_y = float(self.col), float(self.row)
-        dx = target_x - self.x
-        dy = target_y - self.y
-        dist = math.hypot(dx, dy)
-        if dist > 0:
-            actual_speed = self.max_speed * 1.0
-            if dist <= actual_speed:
-                self.x, self.y = target_x, target_y
-            else:
-                self.x += (dx / dist) * actual_speed
-                self.y += (dy / dist) * actual_speed
         if getattr(self, 'pacman_power_timer', 0) > 0:
             self.pacman_power_timer -= 1
             if self.pacman_power_timer <= 0:
@@ -117,181 +107,262 @@ class Ghost:
             return newly_discovered, stale_refreshed
         self._check_liveness(all_ghosts)
         diffs, newly_discovered, stale_refreshed = self._update_personal_map(all_ghosts, player_pos, powered)
-        #piggyback heartbeat every N=5 frames
         if self.frame % HEARTBEAT_EVERY == 0:
-            diffs.append(("heartbeat", self.gid, self.row, self.col, self.frame))
+            diffs.append(("heartbeat", self.gid, int(self.y), int(self.x), self.frame))
         self._broadcast(diffs, all_ghosts)
         self._process_messages(all_ghosts)
         self.belief_map.update_safety_map(self.known_agents, self.frame, powered=self.pacman_powered)
-        if self.frame % self.move_every != 0:
+        if self.frame % self.move_every != 0 or skip_movement:
+            if skip_movement:
+                self.pos_history.append((self.y, self.x))
+                self._check_oscillation()
             return newly_discovered, stale_refreshed
-        if skip_movement:
-            self.pos_history.append((self.row, self.col))
-            self._check_oscillation()
-            return newly_discovered, stale_refreshed
-        #CBBA: get active task and move toward target
         active_task = self.cbba_agent.step(self, self.frame)
         if active_task and self.pacman_powered and active_task.task_type == TaskType.HUNT:
             active_task = None
-        if active_task is not None and (self.row, self.col) == active_task.target_pos:
+        if active_task is not None and (int(self.y), int(self.x)) == active_task.target_pos:
             key = (int(active_task.task_type), active_task.target_pos, getattr(active_task, 'owner', -1))
             if key in self.cbba_agent.path: self.cbba_agent.path.remove(key)
             if key in self.cbba_agent.bundle: self.cbba_agent.bundle.remove(key)
             active_task = None
+        desired_vx = 0.0
+        desired_vy = 0.0
         moved = False
-        #adjacent capture override
-        if not self.pacman_powered and self.known_pacman:
+        #power pellet area denial
+        if not moved and not self.pacman_powered and self.known_pacman:
             pr, pc = self.known_pacman
-            if abs(self.row - pr) + abs(self.col - pc) == 1:
-                self.prev_row, self.prev_col = self.row, self.col
-                self.row, self.col = pr, pc
-                self.last_dir = (self.row - self.prev_row, self.col - self.prev_col)
-                if self.grid[self.row][self.col] == POWER:
-                    self.grid[self.row][self.col] = PELLET
-                moved = True
-                self.cbba_agent.bundle.clear()
-                self.cbba_agent.path.clear()
-                active_task = None
-                #activate tailing if few ghosts nearby (not herding)
-                nearby_ghosts = 1  #count self
+            for p_pos in (self.world.power_pellets if hasattr(self, 'world') and self.world else []):
+                p_r, p_c = int(p_pos[1]), int(p_pos[0])
+                if 0 <= p_r < len(self.grid) and 0 <= p_c < len(self.grid[0]) and self.grid[p_r][p_c] == POWER:
+                    dist_pac_to_power = abs(pr - p_r) + abs(pc - p_c)
+                    if dist_pac_to_power < 8:
+                        my_dist = abs(self.y - p_r) + abs(self.x - p_c)
+                        is_closest = True
+                        for _gid, pos in self.known_agents.items():
+                            if pos != "UNKNOWN":
+                                other_dist = abs(pos[0] - p_r) + abs(pos[1] - p_c)
+                                if other_dist < my_dist:
+                                    is_closest = False
+                                    break
+                        if is_closest:
+                            active_task = type('DummyTask', (), {'target_pos': (p_r, p_c), 'task_type': -1})()
+                            break
+        #chase override
+        CHASE_RADIUS = 5.0
+        GRAB_DIST = 2.0
+        dist_pac = 999
+        if not moved and not self.pacman_powered and self.known_pacman:
+            pr, pc = self.known_pacman
+            pac_y, pac_x = pr + 0.5, pc + 0.5
+            dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
+            if dist_pac < CHASE_RADIUS:
+                has_los = True
+                if self.world and hasattr(self.world, 'line_of_sight'):
+                    has_los = self.world.line_of_sight((self.x, self.y), (pac_x, pac_y), radius=self.radius, step_size=0.5)
+                closest_to_pac = True
+                nearby_ghosts = 1
                 for _gid, pos in self.known_agents.items():
                     if pos != "UNKNOWN":
-                        if abs(pos[0] - self.row) + abs(pos[1] - self.col) <= 6:
+                        d_other = math.hypot(pos[0] + 0.5 - pac_y, pos[1] + 0.5 - pac_x)
+                        if d_other < dist_pac:
+                            closest_to_pac = False
+                        if math.hypot(pos[0] - self.y, pos[1] - self.x) <= 6:
                             nearby_ghosts += 1
                 self._tail_pacman_remaining = 2 if nearby_ghosts <= 2 else 0
-        #adjacent power pellet override (up to 2 cells)
-        if not moved:
-            dist_to_pac = abs(self.row - self.known_pacman[0]) + abs(self.col - self.known_pacman[1]) if self.known_pacman else 999
-            if dist_to_pac > 3 or self.pacman_powered:
-                #BFS to find closest power pellet within 2 steps
-                from collections import deque
-                queue = deque([(self.row, self.col, 0, [])])
-                visited = {(self.row, self.col)}
-                target_power_step = None
-                while queue:
-                    r, c, d, path = queue.popleft()
-                    if self.grid[r][c] == POWER and d > 0:
-                        #if distance is 2, the 'cost' to pause is higher, so we require a safer distance from Pacman
-                        if d == 1 or (d == 2 and (dist_to_pac > 6 or self.pacman_powered)):
-                            target_power_step = path[0]
-                            break
-                    if d < 2:
-                        for dr, dc in DIRS:
-                            nr, nc = r + dr, c + dc
-                            if 0 <= nr < len(self.grid) and 0 <= nc < len(self.grid[0]):
-                                if self.grid[nr][nc] != WALL and (nr, nc) not in visited:
-                                    visited.add((nr, nc))
-                                    queue.append((nr, nc, d + 1, path + [(dr, dc)])) 
-                if target_power_step is not None:
-                    dr, dc = target_power_step
-                    self.prev_row, self.prev_col = self.row, self.col
-                    self.row += dr
-                    self.col += dc
-                    self.last_dir = (dr, dc)
-                    if self.grid[self.row][self.col] == POWER:
-                        self.grid[self.row][self.col] = PELLET
+                if closest_to_pac and has_los:
+                    self.cbba_agent.bundle.clear()
+                    self.cbba_agent.path.clear()
+                    active_task = None
+                    if dist_pac > 0:
+                        desired_vx = (pac_x - self.x) / dist_pac
+                        desired_vy = (pac_y - self.y) / dist_pac
                     moved = True
-                    if hasattr(self, '_committed_path'):
-                        self._committed_path = []
-        #post-capture tailing: chase Pacman for up to 2 more cells if solo/duo
+                else:
+                    tr, tc = pr, pc
+                    if not closest_to_pac:
+                        dr = pr - self.prev_pac_row if self.prev_pac_row >= 0 else 0
+                        dc = pc - self.prev_pac_col if self.prev_pac_col >= 0 else 0
+                        dr = max(-1, min(1, dr))
+                        dc = max(-1, min(1, dc))
+                        if abs(dr) + abs(dc) > 0:
+                            tr = max(0, min(len(self.grid)-1, pr + dr * 4))
+                            tc = max(0, min(len(self.grid[0])-1, pc + dc * 4))
+                    active_task = type('DummyTask', (), {'target_pos': (int(tr), int(tc)), 'task_type': -1})()
+        #power pellet grab override
+        if not moved and (not self.known_pacman or self.pacman_powered or dist_pac > CHASE_RADIUS):
+            r, c = int(self.y), int(self.x)
+            best_power = None
+            best_pd = float('inf')
+            for dr in range(-3, 4):
+                for dc in range(-3, 4):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < len(self.grid) and 0 <= nc < len(self.grid[0]) and self.grid[nr][nc] == POWER:
+                        pd = math.hypot((nr+0.5)-self.y, (nc+0.5)-self.x)
+                        if pd < GRAB_DIST and pd < best_pd:
+                            best_power = (nr+0.5, nc+0.5)
+                            best_pd = pd
+            if best_power is not None:
+                dx, dy = best_power[1] - self.x, best_power[0] - self.y
+                d = math.hypot(dx, dy)
+                if d > 0:
+                    desired_vx = dx / d
+                    desired_vy = dy / d
+                moved = True
+                if hasattr(self, '_committed_path'):
+                    self._committed_path = []
+        #tailing
         if not moved and self._tail_pacman_remaining > 0:
             if self.known_pacman and not self.pacman_powered:
                 pr, pc = self.known_pacman
-                best_dir = None
-                best_dist = abs(self.row - pr) + abs(self.col - pc)
-                for dr, dc in DIRS:
-                    nr, nc = self.row + dr, self.col + dc
-                    if 0 <= nr < len(self.grid) and 0 <= nc < len(self.grid[0]) and self.grid[nr][nc] != WALL:
-                        d = abs(nr - pr) + abs(nc - pc)
-                        if d < best_dist:
-                            best_dist = d
-                            best_dir = (dr, dc)
-                if best_dir is not None:
-                    dr, dc = best_dir
-                    self.prev_row, self.prev_col = self.row, self.col
-                    self.row += dr
-                    self.col += dc
-                    self.last_dir = (dr, dc)
-                    if self.grid[self.row][self.col] == POWER:
-                        self.grid[self.row][self.col] = PELLET
-                    moved = True
-                    self._tail_pacman_remaining -= 1
-                    if hasattr(self, '_committed_path'):
-                        self._committed_path = []
-                else:
-                    self._tail_pacman_remaining = 0
+                pac_y, pac_x = pr + 0.5, pc + 0.5
+                dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
+                if dist_pac > 0:
+                    desired_vx = (pac_x - self.x) / dist_pac
+                    desired_vy = (pac_y - self.y) / dist_pac
+                moved = True
+                self._tail_pacman_remaining -= 1
+                if hasattr(self, '_committed_path'):
+                    self._committed_path = []
             else:
-                self._tail_pacman_remaining = 0  #lost sight or powered, cancel
+                self._tail_pacman_remaining = 0
+        #belief-map coordinated search
+        if not moved and self.known_pacman is None and active_task is None:
+            if self.belief_map._initialised and self.belief_map._open_cells:
+                probs = [self.belief_map._b[r][c] for r, c in self.belief_map._open_cells]
+                if probs:
+                    max_p = max(probs)
+                    if max_p > 1e-4:
+                        best_idx = probs.index(max_p)
+                        best_r, best_c = self.belief_map._open_cells[best_idx]
+                        active_task = type('DummyTask', (), {'target_pos': (best_r, best_c), 'task_type': -1})()
         #normal task execution
         if not moved and active_task is not None:
             target = active_task.target_pos
             if getattr(self, '_committed_target', None) != target or not getattr(self, '_committed_path', []):
                 from pathfinder import astar
-                full_path = astar(self.grid, (self.row, self.col), target)
+                full_path = astar(self.grid, (int(self.y), int(self.x)), target)
                 if len(full_path) >= 2:
                     self._committed_path = full_path[1:]
                     self._committed_target = target
                 else:
                     self._committed_path = []
-            nxt = None
-            while hasattr(self, '_committed_path') and self._committed_path:
-                cand = self._committed_path.pop(0)
-                if self.grid[cand[0]][cand[1]] != WALL:
-                    nxt = cand
-                    break
-                else:
-                    from pathfinder import astar
-                    full_path = astar(self.grid, (self.row, self.col), target)
-                    if len(full_path) >= 2:
-                        self._committed_path = full_path[1:]
-                        self._committed_target = target
-                        nxt = self._committed_path.pop(0)
-                    else:
-                        self._committed_path = []
-                    break
-            if (nxt is not None and nxt != (self.row, self.col) and self.grid[nxt[0]][nxt[1]] != WALL):
-                if self.pacman_powered and self.known_pacman is not None and nxt == self.known_pacman:
-                    pass
-                else:
-                    self.prev_row, self.prev_col = self.row, self.col
-                    self.row, self.col = nxt
-                    self.last_dir = (self.row - self.prev_row, self.col - self.prev_col)
-                    if self.grid[self.row][self.col] == POWER:
-                        self.grid[self.row][self.col] = PELLET
-                    moved = True
+            if hasattr(self, '_committed_path') and self._committed_path:
+                next_cell = self._committed_path[0]
+                if abs(self.y - (next_cell[0] + 0.5)) < 0.4 and abs(self.x - (next_cell[1] + 0.5)) < 0.4:
+                    self._committed_path.pop(0)
+                    if self._committed_path:
+                        next_cell = self._committed_path[0]
+                if self._committed_path:
+                    target_y, target_x = next_cell[0] + 0.5, next_cell[1] + 0.5
+                    dx, dy = target_x - self.x, target_y - self.y
+                    d = math.hypot(dx, dy)
+                    if d > 0:
+                        desired_vx = dx / d
+                        desired_vy = dy / d
+                moved = True
         self.in_fallback_mode = not moved
         #fallback
         if not moved:
             if hasattr(self, '_committed_path'):
                 self._committed_path = []
-            rows = len(self.grid)
-            cols = len(self.grid[0])
-            pac_cell = self.known_pacman if (self.pacman_powered and self.known_pacman) else None
-            options = []
-            for dr, dc in DIRS:
-                nr, nc = self.row + dr, self.col + dc
-                if (0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL and (nr, nc) != pac_cell):
-                    options.append((dr, dc))
-            if options:
-                if self.last_dir in options and random.random() < 0.70:
-                    options = [self.last_dir]
-                else:
-                    random.shuffle(options)
-                dr, dc = options[0]
-                self.prev_row, self.prev_col = self.row, self.col
-                self.row += dr
-                self.col += dc
-                self.last_dir = (dr, dc)
-                if self.grid[self.row][self.col] == POWER:
-                    self.grid[self.row][self.col] = PELLET
-        self.pos_history.append((self.row, self.col))
+            if random.random() < 0.1 or (self.vx == 0 and self.vy == 0):
+                angle = random.uniform(0, 2*math.pi)
+                desired_vx = math.cos(angle)
+                desired_vy = math.sin(angle)
+            else:
+                cur_speed = math.hypot(self.vx, self.vy)
+                if cur_speed > 0:
+                    desired_vx = self.vx / cur_speed
+                    desired_vy = self.vy / cur_speed
+        #context steering and momentum
+        best_score = -float('inf')
+        best_vx, best_vy = desired_vx, desired_vy
+        if desired_vx != 0.0 or desired_vy != 0.0:
+            num_rays = 16
+            current_speed = self.max_speed * speed_mult
+            cur_speed_mag = math.hypot(self.vx, self.vy) + 1e-6
+            cur_vx_norm = self.vx / cur_speed_mag
+            cur_vy_norm = self.vy / cur_speed_mag
+            angles = np.linspace(0, 2*math.pi, num_rays, endpoint=False)
+            ray_vx_arr = np.cos(angles)
+            ray_vy_arr = np.sin(angles)
+            check_dist_max = current_speed * 1.5 + self.radius
+            n_steps = max(2, int(math.ceil(check_dist_max / 0.2)))
+            fracs = np.linspace(1/n_steps, 1.0, n_steps)
+            cc_grid = self.x + np.outer(ray_vx_arr, fracs) * check_dist_max
+            cr_grid = self.y + np.outer(ray_vy_arr, fracs) * check_dist_max
+            if self.world and hasattr(self.world, 'batch_is_passable'):
+                passable = self.world.batch_is_passable(cc_grid.flatten(), cr_grid.flatten(), self.radius).reshape((num_rays, n_steps))
+            else:
+                r_c = cr_grid.astype(int)
+                c_c = cc_grid.astype(int)
+                valid = (r_c >= 0) & (r_c < len(self.grid)) & (c_c >= 0) & (c_c < len(self.grid[0]))
+                safe_r = np.where(valid, r_c, 0)
+                safe_c = np.where(valid, c_c, 0)
+                grid_arr = np.array(self.grid)
+                cells = grid_arr[safe_r, safe_c]
+                passable = valid & (cells != WALL)
+            hit_mask = ~passable
+            hit_indices = np.argmax(hit_mask, axis=1)
+            has_hit = np.any(hit_mask, axis=1)
+            hit_fracs = (hit_indices + 1) / n_steps
+            ray_penalties = np.where(has_hit, 1000.0 / hit_fracs, 0.0)
+            interests = 1.5 * (ray_vx_arr * desired_vx + ray_vy_arr * desired_vy)
+            hysteresis = 0.3 * (ray_vx_arr * cur_vx_norm + ray_vy_arr * cur_vy_norm)
+            scores = interests + hysteresis - ray_penalties
+            best_idx = np.argmax(scores)
+            best_vx, best_vy = ray_vx_arr[best_idx], ray_vy_arr[best_idx]
+        target_vy = best_vy * self.max_speed * speed_mult
+        target_vx = best_vx * self.max_speed * speed_mult
+        smooth_vy = self.vy * 0.7 + target_vy * 0.3
+        smooth_vx = self.vx * 0.7 + target_vx * 0.3
+        smooth_safe = True
+        if self.world and hasattr(self.world, 'batch_is_passable'):
+            smooth_mag = math.hypot(smooth_vx, smooth_vy)
+            if smooth_mag > 1e-6:
+                check_dist = smooth_mag * 1.5 + self.radius
+                n_steps_s = max(2, int(math.ceil(check_dist / 0.2)))
+                s_vy_norm = smooth_vy / smooth_mag
+                s_vx_norm = smooth_vx / smooth_mag
+                fracs = np.linspace(1/n_steps_s, 1.0, n_steps_s)
+                cc_arr = self.x + s_vx_norm * check_dist * fracs
+                cr_arr = self.y + s_vy_norm * check_dist * fracs
+                passable = self.world.batch_is_passable(cc_arr, cr_arr, self.radius)
+                smooth_safe = np.all(passable)
+        if smooth_safe:
+            self.vy = smooth_vy
+            self.vx = smooth_vx
+        else:
+            self.vy = target_vy
+            self.vx = target_vx
+        self.path_this_frame = [(self.x, self.y)]
+        if self.world and hasattr(self.world, 'resolve_collision'):
+            steps = max(1, int(math.ceil(math.hypot(self.vx, self.vy) / 0.2)))
+            if steps > 0:
+                step_vx = self.vx / steps
+                step_vy = self.vy / steps
+                for _ in range(steps):
+                    self.x += step_vx
+                    self.y += step_vy
+                    self.x, self.y = self.world.resolve_collision(self.x, self.y, self.radius, max_iters=10)
+                    self.path_this_frame.append((self.x, self.y))
+        else:
+            self.x += self.vx
+            self.y += self.vy
+            self.x = max(self.radius, min(len(self.grid[0]) - self.radius, self.x))
+            self.y = max(self.radius, min(len(self.grid) - self.radius, self.y))
+        r, c = int(self.y), int(self.x)
+        if 0 <= r < len(self.grid) and 0 <= c < len(self.grid[0]):
+            if self.grid[r][c] == POWER:
+                self.grid[r][c] = PELLET
+        self.pos_history.append((self.y, self.x))
         self._check_oscillation()
         return newly_discovered, stale_refreshed
 
     def _check_oscillation(self):
         if len(self.pos_history) < OSCILLATION_WINDOW:
             return
-        cur = (self.row, self.col)
+        cur = (self.y, self.x)
         if self.pos_history.count(cur) >= 2:
             if self.known_pacman is None and self.last_lost_pacman is not None:
                 self.last_lost_pacman = None
@@ -313,21 +384,28 @@ class Ghost:
         visible = {}
         rows = len(self.grid)
         cols = len(self.grid[0])
-        visible[(self.row, self.col)] = self.grid[self.row][self.col]
+        visible[(int(self.y), int(self.x))] = self.grid[int(self.y)][int(self.x)]
         steps = np.arange(1, MAX_RAY_DIST * 2 + 1)[:, np.newaxis]
-        ray_x = self.col + 0.5 + steps * _DX
-        ray_y = self.row + 0.5 + steps * _DY
+        ray_x = self.x + steps * _DX
+        ray_y = self.y + steps * _DY
         ray_c = ray_x.astype(int)
         ray_r = ray_y.astype(int)
         valid = (ray_r >= 0) & (ray_r < rows) & (ray_c >= 0) & (ray_c < cols)
-        safe_r = np.where(valid, ray_r, 0)
-        safe_c = np.where(valid, ray_c, 0)
-        grid_arr = np.array(self.grid)
-        cells = grid_arr[safe_r, safe_c]
-        is_wall = (cells == WALL) | (~valid)
+        if self.world and hasattr(self.world, 'batch_is_passable'):
+            passable = self.world.batch_is_passable(ray_x.flatten(), ray_y.flatten(), radius=0.01)
+            passable = passable.reshape((MAX_RAY_DIST * 2, RAY_COUNT))
+            is_wall = (~passable) | (~valid)
+        else:
+            safe_r = np.where(valid, ray_r, 0)
+            safe_c = np.where(valid, ray_c, 0)
+            grid_arr = np.array(self.grid)
+            cells = grid_arr[safe_r, safe_c]
+            is_wall = (cells == WALL) | (~valid)
         first_wall_idx = np.argmax(is_wall, axis=0)
         step_idx = np.arange(MAX_RAY_DIST * 2)[:, np.newaxis]
         visible_mask = step_idx <= first_wall_idx
+        safe_r = np.where(valid, ray_r, 0)
+        safe_c = np.where(valid, ray_c, 0)
         final_r = safe_r[visible_mask]
         final_c = safe_c[visible_mask]
         final_valid = valid[visible_mask]
@@ -344,11 +422,11 @@ class Ghost:
                     self.known_agents[gid] = "UNKNOWN"
                     agent_diffs.append(("agent_lost", gid))
                 continue
-            if (ghost.row, ghost.col) in visible:
+            if (ghost.y, ghost.x) in visible:
                 old = self.known_agents.get(gid)
-                if old != (ghost.row, ghost.col):
-                    self.known_agents[gid] = (ghost.row, ghost.col)
-                    agent_diffs.append(("agent", gid, ghost.row, ghost.col))
+                if old != (ghost.y, ghost.x):
+                    self.known_agents[gid] = (ghost.y, ghost.x)
+                    agent_diffs.append(("agent", gid, ghost.y, ghost.x))
             else:
                 last_known = self.known_agents.get(gid)
                 if last_known is not None and last_known != "UNKNOWN":
@@ -392,7 +470,7 @@ class Ghost:
             last = self.last_seen[r, c]
             if last != -1:
                 staleness = min(self.frame - last, 200) / 200.0
-                if staleness > 0.25: # only reward if >= 50 frames stale
+                if staleness > 0.25: #reward if >= 50 frames stale
                     stale_refreshed += staleness
             self.last_seen[r, c] = self.frame
             if old != val:
@@ -417,7 +495,7 @@ class Ghost:
         elif pacman_just_lost:
             _, kr, kc, _ = pacman_diff
             self.belief_map.observe_lost((kr, kc))
-        self.belief_map.diffuse((self.row, self.col))
+        self.belief_map.diffuse((self.y, self.x))
         pac_pos = (pr, pc) if pacman_in_los else None  #preserve Pacman's cell during clear
         self.belief_map.observe_clear(set(visible.keys()), pac_pos)
         return diffs, newly_discovered, stale_refreshed
@@ -437,7 +515,7 @@ class Ghost:
         for ghost in all_ghosts.values():
             if ghost.gid == self.gid:
                 continue
-            dist = abs(ghost.row - self.row) + abs(ghost.col - self.col)
+            dist = abs(ghost.y - self.y) + abs(ghost.x - self.x)
             if dist <= RADIUS:
                 ghost.message_queue.append(msg)
                 if is_new_msg:

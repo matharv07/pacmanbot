@@ -46,7 +46,7 @@ class Env:
         self.static_pacman = False
 
     def reset(self):
-        self.grid, self._player_start = generate_map(
+        self.grid, self._player_start, self.world = generate_map(
             rows=self.grid_rows, cols=self.grid_cols, n_power=self.n_power, random_spawn=self.static_pacman)
         pathfinder.build_scipy_graph(self.grid)
         self.player = Player(self.grid, self._player_start)
@@ -67,7 +67,7 @@ class Env:
             best = np.argmax(scores)
             starts.append(tuple(open_cells[best]))
             avail[best] = False
-        self.ghosts = { i: Ghost(i, self.grid, pos, GHOST_COLORS[i % len(GHOST_COLORS)], self._player_start) for i, pos in enumerate(starts) }
+        self.ghosts = { i: Ghost(i, self.grid, pos, GHOST_COLORS[i % len(GHOST_COLORS)], self._player_start, self.world) for i, pos in enumerate(starts) }
         self.frame = 0
         self.shaper.reset()
         self.recent_nom = { i: np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32) for i in range(self.num_ghosts) }
@@ -194,8 +194,8 @@ class Env:
                 for gid, ghost in list(self.ghosts.items()):
                     if ghost.dead:
                         continue
-                    same = (ghost.row == self.player.row and ghost.col == self.player.col)
-                    swap = (ghost.row == self.player.prev_row and ghost.col == self.player.prev_col
+                    same = (ghost.y == self.player.row and ghost.x == self.player.col)
+                    swap = (ghost.y == self.player.prev_row and ghost.x == self.player.prev_col
                             and self.player.row == ghost.prev_row and self.player.col == ghost.prev_col)
                     if same or swap:
                         if self.player.powered:

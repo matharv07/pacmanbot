@@ -162,13 +162,13 @@ class CBBA_Agent:
             return 0.0
         cumulative = 0.0
         total = 0.0
-        prev_pos = (ghost.row, ghost.col)
+        prev_pos = (ghost.y, ghost.x)
         for key in path:
             task = self._task_map.get(key)
             if task is None:
                 continue
             tgt = task.target_pos
-            if prev_pos == (ghost.row, ghost.col):
+            if prev_pos == (ghost.y, ghost.x):
                 d = self._dist_cache.get(tgt, math.inf)
             else:
                 pair = (prev_pos, tgt)

@@ -53,10 +53,10 @@ class RewardShaper:
         if hasattr(ghost, 'cbba_agent') and target in ghost.cbba_agent._dist_cache:
             d = ghost.cbba_agent._dist_cache[target]
             if math.isinf(d) or math.isnan(d):
-                d = abs(ghost.row - target[0]) + abs(ghost.col - target[1])
+                d = abs(ghost.y - target[0]) + abs(ghost.x - target[1])
         else:
             #fallback to manhattan if cache miss
-            d = abs(ghost.row - target[0]) + abs(ghost.col - target[1])
+            d = abs(ghost.y - target[0]) + abs(ghost.x - target[1])
         if math.isinf(d) or math.isnan(d):
             d = 999.0
         diag = len(ghost.grid) + len(ghost.grid[0])
@@ -74,10 +74,10 @@ class RewardShaper:
         if hasattr(ghost, 'cbba_agent') and target in ghost.cbba_agent._dist_cache:
             d = ghost.cbba_agent._dist_cache[target]
             if math.isinf(d) or math.isnan(d):
-                d = abs(ghost.row - target[0]) + abs(ghost.col - target[1])
+                d = abs(ghost.y - target[0]) + abs(ghost.x - target[1])
         else:
             #fallback to manhattan if cache miss
-            d = abs(ghost.row - target[0]) + abs(ghost.col - target[1])
+            d = abs(ghost.y - target[0]) + abs(ghost.x - target[1])
         if math.isinf(d) or math.isnan(d):
             d = 999.0
         diag = len(ghost.grid) + len(ghost.grid[0])
@@ -134,7 +134,7 @@ class RewardShaper:
         for gid, g in all_ghosts.items():
             if gid == ghost.gid or g.dead:
                 continue
-            dist = abs(ghost.row - g.row) + abs(ghost.col - g.col)
+            dist = abs(ghost.y - g.row) + abs(ghost.x - g.col)
             if dist < min_dist:
                 min_dist = dist
         rows = len(ghost.grid)

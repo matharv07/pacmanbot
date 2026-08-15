@@ -158,7 +158,7 @@ def _score_explore(ghost, frame: int) -> List[Task]:
         c = int(idx % interior_cols)
         pos = (r, c)
         score = 1.0 - math.exp(-age / RECENCY_SCALE)
-        score *= _dist_score(abs(pos[0] - ghost.row) + abs(pos[1] - ghost.col), EXPLORE_SCALE)
+        score *= _dist_score(abs(pos[0] - ghost.y) + abs(pos[1] - ghost.x), EXPLORE_SCALE)
         if getattr(ghost, 'cbba_agent', None):
             for key in ghost.cbba_agent.bundle:
                 if key[1] == pos:
@@ -167,7 +167,7 @@ def _score_explore(ghost, frame: int) -> List[Task]:
     return tasks
 
 def generate_tasks(ghost, frame: int) -> tuple[List[Task], dict]:
-    start = (ghost.row, ghost.col)
+    start = (ghost.y, ghost.x)
     rows, cols = ghost.personal_map.shape
     targets: set = set()
     pac_pos = ghost.known_pacman or ghost.last_lost_pacman
