@@ -58,6 +58,10 @@ class Ghost:
         self.grid = grid
         self.row, self.col = pos
         self.prev_row, self.prev_col = pos
+        self.x, self.y = float(pos[1]), float(pos[0])
+        self.vx, self.vy = 0.0, 0.0
+        self.max_speed = 0.5
+        self.target_cell = pos
         self.color = color
         self.dead = False
         self.in_fallback_mode = False
@@ -92,6 +96,17 @@ class Ghost:
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False):
         self.frame += 1
+        target_x, target_y = float(self.col), float(self.row)
+        dx = target_x - self.x
+        dy = target_y - self.y
+        dist = math.hypot(dx, dy)
+        if dist > 0:
+            actual_speed = self.max_speed * 1.0
+            if dist <= actual_speed:
+                self.x, self.y = target_x, target_y
+            else:
+                self.x += (dx / dist) * actual_speed
+                self.y += (dy / dist) * actual_speed
         if getattr(self, 'pacman_power_timer', 0) > 0:
             self.pacman_power_timer -= 1
             if self.pacman_power_timer <= 0:
@@ -322,6 +337,12 @@ class Ghost:
         agent_diffs = []
         for gid, ghost in all_ghosts.items():
             if gid == self.gid:
+                continue
+            if getattr(ghost, 'dead', False):
+                last_known = self.known_agents.get(gid)
+                if last_known is not None and last_known != "UNKNOWN":
+                    self.known_agents[gid] = "UNKNOWN"
+                    agent_diffs.append(("agent_lost", gid))
                 continue
             if (ghost.row, ghost.col) in visible:
                 old = self.known_agents.get(gid)
@@ -568,8 +589,8 @@ class Ghost:
     def draw(self, surf):
         if self.dead:
             return
-        x = self.col * CELL + CELL // 2
-        y = self.row * CELL + CELL // 2
+        x = int(self.x * CELL)
+        y = int(self.y * CELL)
         r = CELL // 2 - 2
         color = self.color
         pygame.draw.circle(surf, color, (x, y - 2), r)

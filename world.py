@@ -1,0 +1,298 @@
+import pygame
+import math
+import random
+import numpy as np
+import scipy.ndimage
+import argparse
+from collections import deque
+
+class Obstacle:
+    def contains(self, x, y):
+        raise NotImplementedError
+    def draw(self, surface, scale, offset_x=0, offset_y=0):
+        raise NotImplementedError
+
+class Capsule(Obstacle):
+    def __init__(self, x1, y1, x2, y2, r):
+        self.x1, self.y1 = x1, y1
+        self.x2, self.y2 = x2, y2
+        self.r = r
+        self.r2 = r * r
+        
+    def contains(self, x, y):
+        dx = self.x2 - self.x1
+        dy = self.y2 - self.y1
+        l2 = dx*dx + dy*dy
+        if l2 == 0:
+            return (x - self.x1)**2 + (y - self.y1)**2 <= self.r2
+        t = max(0, min(1, ((x - self.x1)*dx + (y - self.y1)*dy) / l2))
+        px = self.x1 + t * dx
+        py = self.y1 + t * dy
+        return (x - px)**2 + (y - py)**2 <= self.r2
+
+    def draw(self, surface, scale, offset_x=0, offset_y=0):
+        pygame.draw.circle(surface, (40, 40, 200), (int(self.x1*scale + offset_x), int(self.y1*scale + offset_y)), int(self.r*scale))
+        pygame.draw.circle(surface, (40, 40, 200), (int(self.x2*scale + offset_x), int(self.y2*scale + offset_y)), int(self.r*scale))
+        if self.x1 != self.x2 or self.y1 != self.y2:
+            angle = math.atan2(self.y2 - self.y1, self.x2 - self.x1)
+            dx = math.sin(angle) * self.r * scale
+            dy = -math.cos(angle) * self.r * scale
+            p1 = (self.x1*scale + offset_x + dx, self.y1*scale + offset_y + dy)
+            p2 = (self.x1*scale + offset_x - dx, self.y1*scale + offset_y - dy)
+            p3 = (self.x2*scale + offset_x - dx, self.y2*scale + offset_y - dy)
+            p4 = (self.x2*scale + offset_x + dx, self.y2*scale + offset_y + dy)
+            pygame.draw.polygon(surface, (40, 40, 200), [p1, p2, p3, p4])
+
+class CurvedWall(Obstacle):
+    def __init__(self, points, r):
+        self.capsules = [Capsule(points[i][0], points[i][1], points[i+1][0], points[i+1][1], r) for i in range(len(points)-1)]
+        
+    def contains(self, x, y):
+        return any(c.contains(x, y) for c in self.capsules)
+        
+    def draw(self, surface, scale, offset_x=0, offset_y=0):
+        for c in self.capsules:
+            c.draw(surface, scale, offset_x, offset_y)
+
+class World:
+    def __init__(self, width, height, resolution=0.5):
+        self.width = width
+        self.height = height
+        self.obstacles = []
+        self.compiled_segments = np.empty((0, 5), dtype=np.float32) #N*[x1, y1, x2, y2, r]
+        self.pellets = []
+        self.power_pellets = []
+        self.resolution = resolution
+        self.safe_area = []
+
+    def _compile_obstacles(self):
+        """Compiles obstacle primitives into a high performance numpy tensor for vectorized ops."""
+        segs = []
+        for obs in self.obstacles:
+            if isinstance(obs, Capsule):
+                segs.append([obs.x1, obs.y1, obs.x2, obs.y2, obs.r])
+            elif isinstance(obs, CurvedWall):
+                for c in obs.capsules:
+                    segs.append([c.x1, c.y1, c.x2, c.y2, c.r])
+        self.compiled_segments = np.array(segs, dtype=np.float32)
+
+    def _points_to_segments_dist_sq(self, px, py):
+        """Vectorized point-to-segment squared distance. px, py are (M,) arrays."""
+        if len(self.compiled_segments) == 0:
+            return np.full((len(px), 0), np.inf), np.empty((1, 0))
+
+        px = px[:, np.newaxis] #(M, 1)
+        py = py[:, np.newaxis]
+        x1 = self.compiled_segments[np.newaxis, :, 0] #(1, N)
+        y1 = self.compiled_segments[np.newaxis, :, 1]
+        x2 = self.compiled_segments[np.newaxis, :, 2]
+        y2 = self.compiled_segments[np.newaxis, :, 3]
+        r  = self.compiled_segments[np.newaxis, :, 4]
+        dx, dy = x2 - x1, y2 - y1
+        l2 = dx*dx + dy*dy
+        mask = (l2 == 0)
+        l2_safe = np.where(mask, 1.0, l2)
+        t = ((px - x1)*dx + (py - y1)*dy) / l2_safe
+        t = np.clip(t, 0.0, 1.0)
+        t = np.where(mask, 0.0, t)        
+        proj_x = x1 + t * dx
+        proj_y = y1 + t * dy
+        dist_sq = (px - proj_x)**2 + (py - proj_y)**2 #(M, N)
+        return dist_sq, r
+
+    def is_passable(self, x, y, radius=0):
+        if x - radius < 0 or x + radius > self.width or y - radius < 0 or y + radius > self.height:
+            return False
+        if len(self.compiled_segments) == 0:
+            return True
+        px = np.array([x], dtype=np.float32)
+        py = np.array([y], dtype=np.float32)
+        dist_sq, r_seg = self._points_to_segments_dist_sq(px, py)
+        dist_sq = dist_sq[0]
+        r_seg = r_seg[0]
+        if np.any(dist_sq <= (r_seg + radius)**2):
+            return False
+        return True
+
+    def batch_is_passable(self, px, py, radius=0):
+        out_of_bounds = (px - radius < 0) | (px + radius > self.width) | (py - radius < 0) | (py + radius > self.height)
+        if len(self.compiled_segments) == 0:
+            return ~out_of_bounds
+        dist_sq, r_seg = self._points_to_segments_dist_sq(px, py)
+        collided = np.any(dist_sq <= (r_seg + radius)**2, axis=1)
+        return ~(out_of_bounds | collided)
+
+    def resolve_collision(self, px, py, radius, max_iters=3):
+        px_arr = np.empty((1,), dtype=np.float32)
+        py_arr = np.empty((1,), dtype=np.float32)
+        for _ in range(max_iters):
+            if len(self.compiled_segments) == 0:
+                break
+            px_arr[0] = px
+            py_arr[0] = py
+            dist_sq, r_seg = self._points_to_segments_dist_sq(px_arr, py_arr)
+            dist_sq = dist_sq[0]
+            r_seg = r_seg[0]
+            min_dist_idx = np.argmin(dist_sq)
+            min_dist = math.sqrt(dist_sq[min_dist_idx])
+            buffer = r_seg[min_dist_idx] + radius
+            if min_dist < buffer:
+                x1 = self.compiled_segments[min_dist_idx, 0]
+                y1 = self.compiled_segments[min_dist_idx, 1]
+                x2 = self.compiled_segments[min_dist_idx, 2]
+                y2 = self.compiled_segments[min_dist_idx, 3]
+                dx, dy = x2 - x1, y2 - y1
+                l2 = dx*dx + dy*dy
+                if l2 == 0:
+                    proj_x, proj_y = x1, y1
+                else:
+                    t = ((px - x1)*dx + (py - y1)*dy) / l2
+                    t = max(0.0, min(1.0, t))
+                    proj_x = x1 + t * dx
+                    proj_y = y1 + t * dy
+                nx, ny = px - proj_x, py - proj_y
+                n_len = math.hypot(nx, ny)
+                if n_len > 0:
+                    nx /= n_len
+                    ny /= n_len
+                else:
+                    nx, ny = 0.0, 1.0
+                overlap = buffer - min_dist
+                px += nx * overlap
+                py += ny * overlap
+            else:
+                break
+        px = max(radius, min(self.width - radius, px))
+        py = max(radius, min(self.height - radius, py))
+        return px, py
+
+    def generate(self, n_obstacles=25, complexity=2):
+        cols = int(self.width / self.resolution)
+        rows = int(self.height / self.resolution)
+        target_area = cols * rows * 0.35
+        attempt = 0
+        while True:
+            attempt += 1
+            print(f"Generating map... (Attempt {attempt})")
+            self.obstacles = []
+            self.pellets = []
+            self.power_pellets = []
+            t = 0.5
+            self.obstacles.append(Capsule(0, 0, self.width, 0, t))
+            self.obstacles.append(Capsule(0, self.height, self.width, self.height, t))
+            self.obstacles.append(Capsule(0, 0, 0, self.height, t))
+            self.obstacles.append(Capsule(self.width, 0, self.width, self.height, t))
+            for _ in range(n_obstacles):
+                length = random.randint(3, 8)
+                thickness = random.uniform(0.4, 0.8)
+                points = []
+                x, y = random.uniform(2, self.width-2), random.uniform(2, self.height-2)
+                angle = random.uniform(0, 2*math.pi)
+                points.append((x, y))
+                for _ in range(length):
+                    angle += random.uniform(-0.8, 0.8)
+                    step = random.uniform(1.0, 3.0)
+                    x += math.cos(angle) * step
+                    y += math.sin(angle) * step
+                    points.append((x, y))
+                self.obstacles.append(CurvedWall(points, thickness))
+            self._compile_obstacles()
+            #rasterize and flood fill to find connected safe space
+            eval_res = 0.25
+            eval_cols = int(self.width / eval_res)
+            eval_rows = int(self.height / eval_res)
+            target_area_eval = (eval_cols * eval_rows) * 0.35
+            grid_y, grid_x = np.mgrid[0:eval_rows, 0:eval_cols]
+            px = (grid_x.ravel() * eval_res) + (eval_res / 2)
+            py = (grid_y.ravel() * eval_res) + (eval_res / 2)
+            dist_sq, r = self._points_to_segments_dist_sq(px, py)
+            conn_blocked_mask = np.any(dist_sq <= (r + 0.35)**2, axis=1)    #buffer of (0.35) for connectivity so that narrow passable inlets are not split
+            grid = (~conn_blocked_mask).reshape((eval_rows, eval_cols))
+            labeled_array, num_features = scipy.ndimage.label(grid, structure=np.ones((3,3)))
+            if num_features > 0:
+                component_sizes = np.bincount(labeled_array.ravel())
+                component_sizes[0] = 0
+                largest_component = component_sizes.argmax()
+                if component_sizes[largest_component] >= target_area_eval:
+                    in_largest = (labeled_array == largest_component).ravel()
+                    pellet_safe_mask = ~np.any(dist_sq <= (r + 0.40)**2, axis=1)
+                    valid_mask = in_largest & pellet_safe_mask                    
+                    px_valid = px[valid_mask]
+                    py_valid = py[valid_mask]
+                    self.safe_area = list(zip(px_valid, py_valid))
+                    break
+        #filter safe area for pellets (poisson diskish approximation)
+        random.shuffle(self.safe_area)
+        grid_size = 1.1
+        spatial_hash = {}
+        for p in self.safe_area:
+            gx, gy = int(p[0]/grid_size), int(p[1]/grid_size)
+            conflict = False
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    if (gx+dx, gy+dy) in spatial_hash:
+                        for pp in spatial_hash[(gx+dx, gy+dy)]:
+                            if (p[0]-pp[0])**2 + (p[1]-pp[1])**2 < 1.21:
+                                conflict = True
+                                break
+                    if conflict: break
+                if conflict: break
+            if not conflict:
+                self.pellets.append(p)
+                if (gx, gy) not in spatial_hash:
+                    spatial_hash[(gx, gy)] = []
+                spatial_hash[(gx, gy)].append(p)
+        n_power = min(28, len(self.pellets) // 4)
+        if n_power > 0:
+            pellets_arr = np.array(self.pellets)
+            #Farthest Point Sampling (FPS) to maximize distance between power pellets
+            power_indices = [random.randint(0, len(self.pellets)-1)]
+            distances = np.sum((pellets_arr - pellets_arr[power_indices[0]])**2, axis=1)
+            for _ in range(1, n_power):
+                farthest = int(np.argmax(distances))
+                power_indices.append(farthest)
+                new_dists = np.sum((pellets_arr - pellets_arr[farthest])**2, axis=1)
+                distances = np.minimum(distances, new_dists)
+            power_indices.sort(reverse=True)
+            for idx in power_indices:
+                self.power_pellets.append(self.pellets.pop(idx))
+    
+    def random_open_point(self):
+        return random.choice(self.safe_area)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="World Generation Debug Visualizer")
+    parser.add_argument("--obstacles", type=int, default=25, help="Number of curved wall obstacles")
+    parser.add_argument("--scale", type=int, default=20, help="Render scale multiplier")
+    parser.add_argument("--width", type=int, default=41, help="World width")
+    parser.add_argument("--height", type=int, default=33, help="World height")
+    args = parser.parse_args()
+    pygame.init()
+    scale = args.scale
+    w, h = args.width, args.height
+    screen = pygame.display.set_mode((w * scale, h * scale))
+    pygame.display.set_caption("Generated Maze")
+    world = World(w, h)
+    world.generate(n_obstacles=args.obstacles)
+    #spawn agents
+    pacman_pos = world.random_open_point()
+    ghosts_pos = [world.random_open_point() for _ in range(7)]
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False            
+        screen.fill((0, 0, 0))
+        for obs in world.obstacles:
+            obs.draw(screen, scale)
+        for p in world.pellets:
+            pygame.draw.circle(screen, (255, 184, 174), (int(p[0]*scale), int(p[1]*scale)), int(0.15*scale))
+        for p in world.power_pellets:
+            pygame.draw.circle(screen, (255, 255, 255), (int(p[0]*scale), int(p[1]*scale)), int(0.4*scale))
+        pygame.draw.circle(screen, (255, 255, 0), (int(pacman_pos[0]*scale), int(pacman_pos[1]*scale)), int(0.5*scale))
+        colors = [(255,0,0), (255,184,255), (0,255,255), (255,184,81), (0,255,0), (255,0,255), (255,255,255)]
+        for i, gp in enumerate(ghosts_pos):
+            pygame.draw.circle(screen, colors[i%len(colors)], (int(gp[0]*scale), int(gp[1]*scale)), int(0.5*scale))
+        pygame.display.flip()
+        pygame.time.delay(50)
+    pygame.quit()
