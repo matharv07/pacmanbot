@@ -276,9 +276,9 @@ class World:
             power_indices = [random.randint(0, len(self.pellets)-1)]
             distances = np.sum((pellets_arr - pellets_arr[power_indices[0]])**2, axis=1)
             for _ in range(1, n_power):
+                farthest = int(np.argmax(distances))
                 power_indices.append(farthest)
                 new_dists = np.sum((pellets_arr - pellets_arr[farthest])**2, axis=1)
-                farthest = int(np.argmax(distances))
                 distances = np.minimum(distances, new_dists)
             power_indices.sort(reverse=True)
             for idx in power_indices:
