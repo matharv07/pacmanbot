@@ -256,11 +256,24 @@ class Player:
                     valid_d = distances[mask]
                     valid_cells = cells[mask]
                     if ghost_cells:
-                        gr_arr = np.array([gr for gr, gc in ghost_cells])[:, np.newaxis]
-                        gc_arr = np.array([gc for gr, gc in ghost_cells])[:, np.newaxis]
-                        g_dists = np.abs(valid_r - gr_arr) + np.abs(valid_c - gc_arr)
-                        ghost_safety = np.min(g_dists, axis=0)
-                        danger = np.where(ghost_safety < 3, (3.0 - ghost_safety) * 15.0, 0.0)
+                        ghost_maps = self._get_ghost_maps(ghosts)
+                        if ghost_maps:
+                            g_dists_grid = np.min(ghost_maps, axis=0)
+                            g_dists = g_dists_grid[valid_r, valid_c]
+                            safe_mask = valid_d < g_dists
+                            if np.any(safe_mask):
+                                valid_r = valid_r[safe_mask]
+                                valid_c = valid_c[safe_mask]
+                                valid_d = valid_d[safe_mask]
+                                valid_cells = valid_cells[safe_mask]
+                                g_dists = g_dists[safe_mask]
+                            danger = np.where(g_dists < 4, (4.0 - g_dists) * 15.0, 0.0)
+                        else:
+                            gr_arr = np.array([gr for gr, gc in ghost_cells])[:, np.newaxis]
+                            gc_arr = np.array([gc for gr, gc in ghost_cells])[:, np.newaxis]
+                            g_dists = np.abs(valid_r - gr_arr) + np.abs(valid_c - gc_arr)
+                            ghost_safety = np.min(g_dists, axis=0)
+                            danger = np.where(ghost_safety < 3, (3.0 - ghost_safety) * 15.0, 0.0)
                     else:
                         danger = np.zeros_like(valid_d)
                     weights = np.where(valid_cells == POWER, 0.5, 1.5)
