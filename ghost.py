@@ -112,7 +112,7 @@ class Ghost:
         self._broadcast(diffs, all_ghosts)
         self._process_messages(all_ghosts)
         self.belief_map.update_safety_map(self.known_agents, self.frame, powered=self.pacman_powered)
-        if self.frame % self.move_every != 0 or skip_movement:
+        if skip_movement:
             if skip_movement:
                 self.pos_history.append((self.y, self.x))
                 self._check_oscillation()
@@ -344,7 +344,7 @@ class Ghost:
                 for _ in range(steps):
                     self.x += step_vx
                     self.y += step_vy
-                    self.x, self.y = self.world.resolve_collision(self.x, self.y, self.radius, max_iters=10)
+                    self.x, self.y = self.world.resolve_collision(self.x, self.y, self.radius, max_iters=3)
                     self.path_this_frame.append((self.x, self.y))
         else:
             self.x += self.vx
@@ -391,16 +391,11 @@ class Ghost:
         ray_c = ray_x.astype(int)
         ray_r = ray_y.astype(int)
         valid = (ray_r >= 0) & (ray_r < rows) & (ray_c >= 0) & (ray_c < cols)
-        if self.world and hasattr(self.world, 'batch_is_passable'):
-            passable = self.world.batch_is_passable(ray_x.flatten(), ray_y.flatten(), radius=0.01)
-            passable = passable.reshape((MAX_RAY_DIST * 2, RAY_COUNT))
-            is_wall = (~passable) | (~valid)
-        else:
-            safe_r = np.where(valid, ray_r, 0)
-            safe_c = np.where(valid, ray_c, 0)
-            grid_arr = np.array(self.grid)
-            cells = grid_arr[safe_r, safe_c]
-            is_wall = (cells == WALL) | (~valid)
+        safe_r = np.where(valid, ray_r, 0)
+        safe_c = np.where(valid, ray_c, 0)
+        grid_arr = np.array(self.grid)
+        cells = grid_arr[safe_r, safe_c]
+        is_wall = (cells == WALL) | (~valid)
         first_wall_idx = np.argmax(is_wall, axis=0)
         step_idx = np.arange(MAX_RAY_DIST * 2)[:, np.newaxis]
         visible_mask = step_idx <= first_wall_idx

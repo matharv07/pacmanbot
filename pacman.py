@@ -212,7 +212,7 @@ class Player:
                         if d < best_d:
                             best_d = d
                             ir, ic = nr, nc
-        if self.powered and self.power_timer > 15:
+        if self.powered:
             best_ghost_dist = float('inf')
             best_ghost_target = None
             for g in ghosts.values():
@@ -221,7 +221,7 @@ class Player:
                     gc = max(0, min(cols - 1, int(round(g.x))))
                     if self.grid[gr][gc] != WALL:
                         d = abs(ir - gr) + abs(ic - gc)
-                        if d < best_ghost_dist:
+                        if d < best_ghost_dist and self.power_timer > (d * 2.0) + 15:
                             best_ghost_dist = d
                             best_ghost_target = (gr, gc)
             if best_ghost_target is not None:
@@ -247,7 +247,7 @@ class Player:
                 open_c = np.array([c for r, c in open_cells])
                 grid_arr = np.array(self.grid)
                 cells = grid_arr[open_r, open_c]
-                valid_mask = (distances <= 80) & np.isfinite(distances)
+                valid_mask = (distances <= 400) & np.isfinite(distances)
                 pellet_mask = (cells == PELLET) | (cells == POWER)
                 mask = valid_mask & pellet_mask
                 if np.any(mask):
@@ -284,7 +284,7 @@ class Player:
                     if score < best_score:
                         best_score = score
                         best_target = (r, c)
-                if d < 80:  #max bfs radius
+                if d < 400:  #max bfs radius
                     for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
                         nr, nc = r + dr, c + dc
                         if 0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL and dist_map[nr, nc] == -1:
@@ -450,7 +450,7 @@ class Player:
                 for _ in range(steps):
                     self.x += step_vx
                     self.y += step_vy
-                    self.x, self.y = self.world.resolve_collision(self.x, self.y, self.radius, max_iters=10)
+                    self.x, self.y = self.world.resolve_collision(self.x, self.y, self.radius, max_iters=3)
                     self.path_this_frame.append((self.x, self.y))
             else:
                 #simple collision: check corners of bounding box
@@ -686,7 +686,8 @@ class Game:
             for gid, ghost in list(self.ghosts.items()):
                 if ghost.dead:
                     continue
-                collision_radius = self.player.radius + ghost.radius
+                # add 0.15 tolerance to account for ghost's visual y-2 offset and continuous off-center steering
+                collision_radius = self.player.radius + ghost.radius + 0.15
                 collided = False
                 p_path = getattr(self.player, 'path_this_frame', [(self.player.x, self.player.y)])
                 g_path = getattr(ghost, 'path_this_frame', [(ghost.x, ghost.y)])

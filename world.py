@@ -78,29 +78,31 @@ class World:
                 for c in obs.capsules:
                     segs.append([c.x1, c.y1, c.x2, c.y2, c.r])
         self.compiled_segments = np.array(segs, dtype=np.float32)
+        if len(self.compiled_segments) > 0:
+            self._x1 = self.compiled_segments[:, 0][np.newaxis, :]
+            self._y1 = self.compiled_segments[:, 1][np.newaxis, :]
+            self._x2 = self.compiled_segments[:, 2][np.newaxis, :]
+            self._y2 = self.compiled_segments[:, 3][np.newaxis, :]
+            self._r  = self.compiled_segments[:, 4][np.newaxis, :]
+            self._dx = self._x2 - self._x1
+            self._dy = self._y2 - self._y1
+            l2 = self._dx**2 + self._dy**2
+            self._mask = (l2 == 0)
+            self._l2_safe = np.where(self._mask, 1.0, l2)
 
     def _points_to_segments_dist_sq(self, px, py):
         """Vectorized point-to-segment squared distance. px, py are (M,) arrays."""
         if len(self.compiled_segments) == 0:
             return np.full((len(px), 0), np.inf), np.empty((1, 0)) 
-        x1 = self.compiled_segments[:, 0][np.newaxis, :]
-        y1 = self.compiled_segments[:, 1][np.newaxis, :]
-        x2 = self.compiled_segments[:, 2][np.newaxis, :]
-        y2 = self.compiled_segments[:, 3][np.newaxis, :]
-        r  = self.compiled_segments[:, 4][np.newaxis, :]
         px = px[:, np.newaxis] #(M, 1)
         py = py[:, np.newaxis]
-        dx, dy = x2 - x1, y2 - y1
-        l2 = dx*dx + dy*dy
-        mask = (l2 == 0)
-        l2_safe = np.where(mask, 1.0, l2)
-        t = ((px - x1)*dx + (py - y1)*dy) / l2_safe
+        t = ((px - self._x1)*self._dx + (py - self._y1)*self._dy) / self._l2_safe
         t = np.clip(t, 0.0, 1.0)
-        t = np.where(mask, 0.0, t)        
-        proj_x = x1 + t * dx
-        proj_y = y1 + t * dy
+        t = np.where(self._mask, 0.0, t)        
+        proj_x = self._x1 + t * self._dx
+        proj_y = self._y1 + t * self._dy
         dist_sq = (px - proj_x)**2 + (py - proj_y)**2 #(M, N_filtered)
-        return dist_sq, r
+        return dist_sq, self._r
 
     def is_passable(self, x, y, radius=0):
         if x - radius < 0 or x + radius > self.width or y - radius < 0 or y + radius > self.height:
@@ -224,7 +226,7 @@ class World:
                     points.append((x, y))
                 self.obstacles.append(CurvedWall(points, thickness))
             self._compile_obstacles()
-            #rasterize and flood fill to find connected safe space
+            # rasterize and flood fill to find connected safe space
             eval_res = 0.25
             eval_cols = int(self.width / eval_res)
             eval_rows = int(self.height / eval_res)
@@ -232,10 +234,70 @@ class World:
             grid_y, grid_x = np.mgrid[0:eval_rows, 0:eval_cols]
             px = (grid_x.ravel() * eval_res) + (eval_res / 2)
             py = (grid_y.ravel() * eval_res) + (eval_res / 2)
+
+            # Carve openings to connect all regions
+            for _ in range(200):
+                dist_sq, r = self._points_to_segments_dist_sq(px, py)
+                conn_blocked_mask = np.any(dist_sq <= (r + 0.35)**2, axis=1)
+                grid = (~conn_blocked_mask).reshape((eval_rows, eval_cols))
+                labeled_array, num_features = scipy.ndimage.label(grid, structure=np.ones((3,3)))
+                
+                if num_features <= 1:
+                    break
+                    
+                component_sizes = np.bincount(labeled_array.ravel())
+                component_sizes[0] = 0
+                largest_component = component_sizes.argmax()
+                
+                valid_components = np.where(component_sizes >= 15)[0]
+                if len(valid_components) <= 1:
+                    break
+                    
+                mask_largest = (labeled_array == largest_component)
+                mask_other = np.isin(labeled_array, valid_components) & ~mask_largest
+                
+                dilated_largest = scipy.ndimage.binary_dilation(mask_largest, iterations=15)
+                dilated_other = scipy.ndimage.binary_dilation(mask_other, iterations=15)
+                
+                boundary = dilated_largest & dilated_other & (labeled_array == 0)
+                boundary_pts = np.argwhere(boundary)
+                
+                if len(boundary_pts) == 0:
+                    break
+                    
+                pt = boundary_pts[random.randint(0, len(boundary_pts)-1)]
+                bx = pt[1] * eval_res + eval_res / 2
+                by = pt[0] * eval_res + eval_res / 2
+                
+                best_capsule, best_obs, best_dist = None, None, float('inf')
+                for obs in self.obstacles[4:]:
+                    capsules_to_check = obs.capsules if isinstance(obs, CurvedWall) else [obs]
+                    for c in capsules_to_check:
+                        dx, dy = c.x2 - c.x1, c.y2 - c.y1
+                        l2 = dx*dx + dy*dy
+                        if l2 == 0:
+                            d = (bx - c.x1)**2 + (by - c.y1)**2
+                        else:
+                            t = max(0, min(1, ((bx - c.x1)*dx + (by - c.y1)*dy) / l2))
+                            d = (bx - (c.x1 + t * dx))**2 + (by - (c.y1 + t * dy))**2
+                        if d < best_dist:
+                            best_dist = d
+                            best_capsule = c
+                            best_obs = obs
+                            
+                if best_capsule and best_obs:
+                    if isinstance(best_obs, CurvedWall) and best_capsule in best_obs.capsules:
+                        best_obs.capsules.remove(best_capsule)
+                    elif isinstance(best_obs, Capsule) and best_obs in self.obstacles:
+                        self.obstacles.remove(best_obs)
+                    self._compile_obstacles()
+            
+            # Re-evaluate final connected space
             dist_sq, r = self._points_to_segments_dist_sq(px, py)
-            conn_blocked_mask = np.any(dist_sq <= (r + 0.35)**2, axis=1)    #buffer of (0.35) for connectivity so that narrow passable inlets are not split
+            conn_blocked_mask = np.any(dist_sq <= (r + 0.35)**2, axis=1)
             grid = (~conn_blocked_mask).reshape((eval_rows, eval_cols))
             labeled_array, num_features = scipy.ndimage.label(grid, structure=np.ones((3,3)))
+            
             if num_features > 0:
                 component_sizes = np.bincount(labeled_array.ravel())
                 component_sizes[0] = 0
