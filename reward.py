@@ -95,7 +95,7 @@ class RewardShaper:
         for g in all_ghosts.values():
             if g.dead:
                 continue
-            dy, dx = g.row - pr, g.col - pc
+            dy, dx = g.y - pr, g.x - pc
             if dy == 0 and dx == 0:
                 continue
             angles.append(math.atan2(dy, dx))
@@ -134,7 +134,7 @@ class RewardShaper:
         for gid, g in all_ghosts.items():
             if gid == ghost.gid or g.dead:
                 continue
-            dist = abs(ghost.y - g.row) + abs(ghost.x - g.col)
+            dist = math.hypot(ghost.y - g.y, ghost.x - g.x)
             if dist < min_dist:
                 min_dist = dist
         rows = len(ghost.grid)

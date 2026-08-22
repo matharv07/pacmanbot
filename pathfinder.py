@@ -1,116 +1,23 @@
-"""
-This program implements A* and Dijkstra as seperate means to compute optimal paths using each ghost's personal map.
-A* is used for single-target pathfinding for the RL model, wheras Dijkstra's multi-target nature is used by CBBA to score multi-candidate tasks.
-"""
-
 import heapq
 import math
 
-WALL    =  1
-EMPTY   =  0
-PELLET  =  2
-POWER   =  3
-UNKNOWN = -1
+def _euclidean(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
-_SCIPY_AVAILABLE = False
-try:
-    from scipy.sparse.csgraph import dijkstra as scipy_dijkstra
-    _SCIPY_AVAILABLE = True
-except Exception:
-    scipy_dijkstra = None
+def _connect_temp_node(world, node):
+    connections = []
+    # Find up to 10 closest nodes in PRM to connect to
+    if not hasattr(world, 'prm_nodes'): return []
+    dists = []
+    for n in world.prm_nodes:
+        dists.append((_euclidean(node, n), n))
+    dists.sort()
+    for d, n in dists[:15]:
+        if d < 7.0 and world.line_of_sight(node, n, radius=0.4):
+            connections.append((d, n))
+    return connections
 
-#cache: generation_id -> (csr_matrix, open_cells_list, cell_to_idx)
-_SCIPY_GRAPH_CACHE = {}
-_SCIPY_CACHE_GEN = 0   #monotonic counter
-_SCIPY_GRID_GEN = {}   #id(grid) -> generation_id (for lookup)
-
-def _hash_grid(grid: list) -> str:
-    import numpy as np
-    import hashlib
-    arr = np.array(grid, dtype=np.int8)
-    arr[arr == 2] = 0
-    return hashlib.md5(arr.tobytes()).hexdigest()
-
-def get_scipy_graph(grid: list):
-    if not _SCIPY_AVAILABLE:
-        return None
-    h = _hash_grid(grid)
-    gen = _SCIPY_GRID_GEN.get(h)
-    if gen is None or gen not in _SCIPY_GRAPH_CACHE:
-        build_scipy_graph(grid)
-        gen = _SCIPY_GRID_GEN.get(h)
-    return _SCIPY_GRAPH_CACHE.get(gen)
-
-def build_scipy_graph(grid: list):
-    if not _SCIPY_AVAILABLE:
-        return
-    import numpy as np
-    from scipy.sparse import csr_matrix
-    grid_arr = np.array(grid, dtype=np.int8)
-    rows, cols = grid_arr.shape
-    open_mask = grid_arr != WALL
-    open_r, open_c = np.nonzero(open_mask)
-    n = len(open_r)
-    idx_map = np.full((rows, cols), -1, dtype=np.int32)
-    idx_map[open_r, open_c] = np.arange(n)
-    open_cells = list(zip(open_r.tolist(), open_c.tolist()))
-    cell_to_idx = {cell: i for i, cell in enumerate(open_cells)}
-    row_ind = []
-    col_ind = []
-    data = []
-    dirs = np.array([[-1, 0], [1, 0], [0, -1], [0, 1]])
-    for dr, dc in dirs:
-        nr = open_r + dr
-        nc = open_c + dc
-        valid = (nr >= 0) & (nr < rows) & (nc >= 0) & (nc < cols)
-        valid_indices = np.nonzero(valid)[0]
-        v_nr = nr[valid]
-        v_nc = nc[valid]
-        j_indices = idx_map[v_nr, v_nc]
-        is_open = j_indices >= 0
-        valid_i = valid_indices[is_open]
-        valid_j = j_indices[is_open]
-        valid_nr = v_nr[is_open]
-        valid_nc = v_nc[is_open]
-        row_ind.extend(valid_i.tolist())
-        col_ind.extend(valid_j.tolist())
-        cells = grid_arr[valid_nr, valid_nc]
-        costs = np.full(len(cells), np.inf)
-        costs[cells == EMPTY] = 1.0
-        costs[cells == PELLET] = 1.0
-        costs[cells == POWER] = 0.5
-        costs[cells == UNKNOWN] = 3.0
-        data.extend(costs.tolist())
-    graph = csr_matrix((data, (row_ind, col_ind)), shape=(n, n))
-    global _SCIPY_CACHE_GEN
-    _SCIPY_CACHE_GEN += 1
-    gen = _SCIPY_CACHE_GEN
-    _SCIPY_GRAPH_CACHE[gen] = (graph, open_cells, cell_to_idx)
-    grid_hash = _hash_grid(grid)
-    _SCIPY_GRID_GEN[grid_hash] = gen
-    #keep only latest 128 to handle multiple envs
-    if len(_SCIPY_GRAPH_CACHE) > 128:
-        oldest = min(_SCIPY_GRAPH_CACHE.keys())
-        _SCIPY_GRAPH_CACHE.pop(oldest, None)
-        #prune grid gen map to prevent memory leak over curriculum progression
-        keys_to_del = [k for k, v in _SCIPY_GRID_GEN.items() if v not in _SCIPY_GRAPH_CACHE]
-        for k in keys_to_del:
-            _SCIPY_GRID_GEN.pop(k, None)
-#cell costs for path planning - wall taken to be impassable
-_COST = {EMPTY: 1.0, PELLET: 1.0, POWER: 0.5, UNKNOWN: 3.0, WALL: math.inf}   #unknown territory taken to be passable but 3x more costly than known cells
-_DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-
-def _cost(grid: list, r: int, c: int) -> float:
-    val = grid[r][c]
-    return _COST.get(val, math.inf)
-
-def _in_bounds(r: int, c: int, rows: int, cols: int) -> bool:
-    return 0 <= r < rows and 0 <= c < cols
-
-def _manhattan(a: tuple, b: tuple) -> float:    #we use manhattan as the A* heuristic since ghosts travel in cardinal directions, so its better than euclidean
-    return float(abs(a[0] - b[0]) + abs(a[1] - b[1]))
-
-def _reconstruct(came_from: dict, node: tuple) -> list:
+def _reconstruct(came_from, node):
     path = [node]
     while node in came_from:
         node = came_from[node]
@@ -118,150 +25,134 @@ def _reconstruct(came_from: dict, node: tuple) -> list:
     path.reverse()
     return path
 
-def _astar_python(grid: list, start: tuple, goal: tuple) -> list:
+def astar(world, start, goal):
     if start == goal:
         return [start]
-    rows = len(grid)
-    cols = len(grid[0])
-    if not (_in_bounds(start[0], start[1], rows, cols) and _in_bounds(goal[0], goal[1], rows, cols)) or _cost(grid, start[0], start[1]) == math.inf or _cost(grid, goal[0], goal[1]) == math.inf:
+    if not hasattr(world, 'prm_graph'):
         return []
-    g_score: dict = {start: 0.0}
-    came_from: dict = {}
-    open_heap = [(0.0 + _manhattan(start, goal), 0.0, start)]
-    closed: set = set()
+        
+    start_conns = _connect_temp_node(world, start)
+    goal_conns = _connect_temp_node(world, goal)
+    
+    # Ad-hoc graph access function
+    def get_neighbors(n):
+        if n == start:
+            return [(d, tgt) for d, tgt in start_conns]
+        elif n == goal:
+            return []
+        else:
+            nbrs = []
+            for tgt in world.prm_graph.get(n, []):
+                nbrs.append((_euclidean(n, tgt), tgt))
+            # Also check if it connects to goal
+            for d, tgt in goal_conns:
+                if tgt == n:
+                    nbrs.append((d, goal))
+            return nbrs
+
+    g_score = {start: 0.0}
+    came_from = {}
+    open_heap = [(0.0 + _euclidean(start, goal), 0.0, start)]
+    closed = set()
+    
     while open_heap:
         f, g, node = heapq.heappop(open_heap)
-        if node in closed:   #best path to node alr known, skip
+        if node in closed:
             continue
         closed.add(node)
         if node == goal:
-            return _reconstruct(came_from, node)  #found goal, reconstruct and return path
-        r, c = node
-        for dr, dc in _DIRS:
-            nr, nc = r + dr, c + dc
-            if not _in_bounds(nr, nc, rows, cols):
-                continue
-            neighbour = (nr, nc)
+            return _reconstruct(came_from, node)
+            
+        for step_cost, neighbour in get_neighbors(node):
             if neighbour in closed:
-                continue
-            step_cost = _cost(grid, nr, nc)
-            if step_cost == math.inf:
                 continue
             tentative_g = g + step_cost
             if tentative_g < g_score.get(neighbour, math.inf):
-                g_score[neighbour]  = tentative_g
+                g_score[neighbour] = tentative_g
                 came_from[neighbour] = node
-                f_new = tentative_g + _manhattan(neighbour, goal)
+                f_new = tentative_g + _euclidean(neighbour, goal)
                 heapq.heappush(open_heap, (f_new, tentative_g, neighbour))
-    return []   #if goal is unreachable from start
+                
+    return []
 
-def astar(grid: list, start: tuple, goal: tuple) -> list:
-    if start == goal:
-        return [start]
-    if _SCIPY_AVAILABLE:
-        cache = get_scipy_graph(grid)
-        if cache is not None:
-            graph, open_cells, cell_to_idx = cache
-            if start in cell_to_idx and goal in cell_to_idx:
-                src_idx = cell_to_idx[start]
-                tidx = cell_to_idx[goal]
-                dist_arr, predecessors = scipy_dijkstra(csgraph=graph, directed=False, indices=src_idx, return_predecessors=True)
-                d = float(dist_arr[tidx])
-                if math.isfinite(d):
-                    path_idx = []
-                    node = tidx
-                    while node != -9999 and node >= 0 and node != src_idx:
-                        path_idx.append(node)
-                        node = int(predecessors[node])
-                    if node == src_idx:
-                        path_idx.append(src_idx)
-                    path_idx.reverse()
-                    return [open_cells[i] for i in path_idx]
-    return _astar_python(grid, start, goal)
-
-def dijkstra_multi(grid: list, start: tuple, targets: list) -> dict:
-    if _SCIPY_AVAILABLE:
-        cache = get_scipy_graph(grid)
-        if cache is not None:
-            graph, open_cells, cell_to_idx = cache
-            #map start and targets to indices
-            if start not in cell_to_idx:
-                return {}
-            src_idx = cell_to_idx[start]
-            #compute all distances and predecessors from source
-            dist_arr, predecessors = scipy_dijkstra(csgraph=graph, directed=False, indices=src_idx, return_predecessors=True)
-            results: dict = {}
-            for t in targets:
-                if t not in cell_to_idx:
-                    continue
-                tidx = cell_to_idx[t]
-                d = float(dist_arr[tidx])
-                if not math.isfinite(d):
-                    results[t] = (math.inf, [])
-                    continue
-                #reconstruct path from src_idx -> tidx using predecessors
-                path_idx = []
-                node = tidx
-                while node != -9999 and node >= 0 and node != src_idx:
-                    path_idx.append(node)
-                    node = int(predecessors[node])
-                if node == src_idx:
-                    path_idx.append(src_idx)
-                path_idx.reverse()
-                path = [open_cells[i] for i in path_idx]
-                results[t] = (d, path)
-            return results
-    #fallback to original python implementation
-    if not targets:
+def dijkstra_multi(world, start, targets):
+    if not targets or not hasattr(world, 'prm_graph'):
         return {}
-    rows = len(grid)
-    cols = len(grid[0])
-    target_set = set()
-    for t in targets:
-        if _in_bounds(t[0], t[1], rows, cols):
-            target_set.add(t)
-    results: dict = {t: (math.inf, []) for t in target_set}
+        
+    start_conns = _connect_temp_node(world, start)
+    target_set = set(targets)
+    
+    # Precompute goal connections for fast lookup
+    target_conns_map = {}
+    for t in target_set:
+        target_conns_map[t] = _connect_temp_node(world, t)
+        
+    # Map PRM nodes to the targets they connect to
+    prm_to_targets = {}
+    for t, conns in target_conns_map.items():
+        for d, prm_node in conns:
+            if prm_node not in prm_to_targets:
+                prm_to_targets[prm_node] = []
+            prm_to_targets[prm_node].append((d, t))
+            
+    def get_neighbors(n):
+        if n == start:
+            return [(d, tgt) for d, tgt in start_conns]
+        if n in target_set:
+            return []
+            
+        nbrs = []
+        for tgt in world.prm_graph.get(n, []):
+            nbrs.append((_euclidean(n, tgt), tgt))
+            
+        # Connect to targets if in range
+        if n in prm_to_targets:
+            for d, t in prm_to_targets[n]:
+                nbrs.append((d, t))
+                
+        return nbrs
+
+    results = {t: (math.inf, []) for t in target_set}
     remaining = set(target_set)
+    
     if start in target_set:
         results[start] = (0.0, [start])
         remaining.discard(start)
+        
     if not remaining:
         return results
-    dist: dict = {start: 0.0}
-    came_from: dict = {}
+        
+    dist = {start: 0.0}
+    came_from = {}
     open_heap = [(0.0, start)]
-    closed: set = set()
+    closed = set()
+    
     while open_heap and remaining:
         d, node = heapq.heappop(open_heap)
         if node in closed:
             continue
         closed.add(node)
-        if node in remaining:       #found a target, reconstruct path and store result
+        
+        if node in remaining:
             path = _reconstruct(came_from, node)
             results[node] = (d, path)
             remaining.discard(node)
             if not remaining:
                 break
-        r, c = node
-        for dr, dc in _DIRS:
-            nr, nc = r + dr, c + dc
-            if not _in_bounds(nr, nc, rows, cols):
-                continue
-            neighbour = (nr, nc)
+                
+        for step_cost, neighbour in get_neighbors(node):
             if neighbour in closed:
-                continue
-            step_cost = _cost(grid, nr, nc)
-            if step_cost == math.inf:
                 continue
             tentative = d + step_cost
             if tentative < dist.get(neighbour, math.inf):
-                dist[neighbour]      = tentative
+                dist[neighbour] = tentative
                 came_from[neighbour] = node
                 heapq.heappush(open_heap, (tentative, neighbour))
-    return results                                              #return infinite if all goals are unreachable from start
+                
+    return results
 
-def next_step(grid: list, start: tuple, goal: tuple) -> tuple | None:       #return immediate next step towards goal
-    path = astar(grid, start, goal)
+def next_step(world, start, goal):
+    path = astar(world, start, goal)
     if len(path) >= 2:
         return path[1]
     return None

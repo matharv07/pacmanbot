@@ -70,10 +70,9 @@ def _score_hunt(ghost, dists: dict) -> list[Task]:
     score = _dist_score(dist, HUNT_SCALE)
     tasks.append(Task(task_type=TaskType.HUNT, target_pos=target,
                       score=score, owner=ghost.gid))
-    rows, cols = ghost.personal_map.shape
     for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
-        cr, cc = pr + dr*4, pc + dc*4
-        if 0 <= cr < rows and 0 <= cc < cols and ghost.personal_map[cr, cc] != WALL:
+        cr, cc = float(pr + dr*4), float(pc + dc*4)
+        if ghost.world and ghost.world.is_passable(cc, cr, radius=0.4):
             cutoff_info = dists.get((cr, cc))
             if cutoff_info and cutoff_info[0] != math.inf:
                 cutoff_score = _dist_score(cutoff_info[0], HUNT_SCALE) * 0.85
@@ -82,9 +81,8 @@ def _score_hunt(ghost, dists: dict) -> list[Task]:
 
 def _score_convert(ghost, dists: dict) -> List[Task]:
     tasks: list[Task] = []
-    power_cells = np.argwhere(ghost.personal_map == POWER)
-    for pos_arr in power_cells:
-        pos = (int(pos_arr[0]), int(pos_arr[1]))
+    if not hasattr(ghost, 'known_power_pellets'): return tasks
+    for pos in ghost.known_power_pellets:
         info = dists.get(pos)
         if info is None:
             continue
@@ -97,18 +95,16 @@ def _score_convert(ghost, dists: dict) -> List[Task]:
 
 def _find_flee_pos(ghost, pacman_pos: tuple) -> Optional[tuple]:
     pr, pc = pacman_pos
-    p_map = np.array(ghost.personal_map)
-    valid = (p_map != WALL) & (p_map != UNKNOWN)
-    if not valid.any():
-        return None
-    rows, cols = p_map.shape
-    r_idx, c_idx = np.indices((rows, cols))
-    dists = np.abs(r_idx - pr) + np.abs(c_idx - pc)
-    dists[~valid] = -1
-    max_idx = np.argmax(dists)
-    best_r = max_idx // cols
-    best_c = max_idx % cols
-    return (int(best_r), int(best_c))
+    if getattr(ghost, 'world', None) is None: return None
+    corners = [(1.5, 1.5), (1.5, float(ghost.world.width - 2)), (float(ghost.world.height - 2), 1.5), (float(ghost.world.height - 2), float(ghost.world.width - 2))]
+    best_corner = None
+    best_dist = -1
+    for cr, cc in corners:
+        d = abs(cr - pr) + abs(cc - pc)
+        if d > best_dist:
+            best_dist = d
+            best_corner = (cr, cc)
+    return best_corner
 
 def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
     if not ghost.pacman_powered:
@@ -130,33 +126,18 @@ def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
         return Task(task_type=TaskType.EVADE_TRACK, target_pos=target, score=score, created_frame=frame, owner=ghost.gid)
 
 def _score_explore(ghost, frame: int) -> List[Task]:
-    p = ghost.personal_map
-    rows, cols = p.shape
-    interior = p
-    ls = ghost.last_seen
-    wall_mask = (interior == WALL)
-    unknown_mask = (interior == UNKNOWN)
-    ages = np.zeros_like(interior, dtype=np.float64)
-    ages[unknown_mask] = frame + UNKNOWN_BONUS
-    known_mask = (~wall_mask) & (~unknown_mask)
-    ages[known_mask] = np.where(ls[known_mask] >= 0, frame - ls[known_mask], frame+1).astype(np.float64)
-    ages[wall_mask] = -1
-    flat_ages = ages.ravel()
-    n_valid = np.sum(flat_ages >= 0)
-    if n_valid == 0:
-        return []
-    k = min(EXPLORE_TOP_K, int(n_valid))
-    top_flat = np.argpartition(flat_ages, -k)[-k:]
-    top_flat = top_flat[np.argsort(flat_ages[top_flat])[::-1]]
+    ls = ghost.prm_last_seen
+    ages = {}
+    for node, last_seen_frame in ls.items():
+        if last_seen_frame < 0:
+            ages[node] = frame + UNKNOWN_BONUS
+        else:
+            ages[node] = frame - last_seen_frame
+            
+    sorted_nodes = sorted(ages.items(), key=lambda item: item[1], reverse=True)
+    
     tasks: list = []
-    interior_cols = cols
-    for idx in top_flat:
-        age = flat_ages[idx]
-        if age < 0:
-            continue
-        r = int(idx // interior_cols)
-        c = int(idx % interior_cols)
-        pos = (r, c)
+    for pos, age in sorted_nodes[:EXPLORE_TOP_K]:
         score = 1.0 - math.exp(-age / RECENCY_SCALE)
         score *= _dist_score(abs(pos[0] - ghost.y) + abs(pos[1] - ghost.x), EXPLORE_SCALE)
         if getattr(ghost, 'cbba_agent', None):
@@ -167,33 +148,31 @@ def _score_explore(ghost, frame: int) -> List[Task]:
     return tasks
 
 def generate_tasks(ghost, frame: int) -> tuple[List[Task], dict]:
-    start = (ghost.y, ghost.x)
-    rows, cols = ghost.personal_map.shape
+    start = (float(ghost.y), float(ghost.x))
     targets: set = set()
     pac_pos = ghost.known_pacman or ghost.last_lost_pacman
     if pac_pos is not None:
-        targets.add(pac_pos)
-        pr, pc = pac_pos
+        pr, pc = float(pac_pos[0]), float(pac_pos[1])
+        targets.add((pr, pc))
         for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
             cr, cc = pr + dr*4, pc + dc*4
-            if 0 <= cr < rows and 0 <= cc < cols and ghost.personal_map[cr, cc] != WALL:
+            if ghost.world and ghost.world.is_passable(cc, cr, radius=0.4):
                 targets.add((cr, cc))
-    power_cells = np.argwhere(ghost.personal_map == POWER)
-    for r, c in power_cells:
-        targets.add((int(r), int(c)))
-    corners = [(1, 1), (1, cols - 2), (rows - 2, 1), (rows - 2, cols - 2)]
+    for p in ghost.world.power_pellets:
+        targets.add(p)
+    corners = [(1.5, 1.5), (1.5, float(ghost.world.width - 2)), (float(ghost.world.height - 2), 1.5), (float(ghost.world.height - 2), float(ghost.world.width - 2))]
     for cn in corners:
         targets.add(cn)
     explore_tasks = _score_explore(ghost, frame)
     for et in explore_tasks:
-        targets.add(et.target_pos)
-    dists = dijkstra_multi(ghost.grid, start, list(targets))
+        targets.add((float(et.target_pos[0]), float(et.target_pos[1])))
+    dists = dijkstra_multi(ghost.world, start, list(targets))
     tasks: list[Task] = []
     if getattr(ghost, 'pacman_powered', False):
         evade_track = _score_evade_track(ghost, dists, frame)
         if evade_track is not None:
             if evade_track.target_pos not in dists:
-                extra_dist = dijkstra_multi(ghost.grid, start, [evade_track.target_pos])
+                extra_dist = dijkstra_multi(ghost.world, start, [evade_track.target_pos])
                 dists.update(extra_dist)
             tasks.append(evade_track)
         tasks.extend(explore_tasks)

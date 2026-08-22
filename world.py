@@ -138,7 +138,54 @@ class World:
         py = p1[1] + dy * fracs
         return np.all(self.batch_is_passable(px, py, radius))
 
-    def rasterize(self, cell_size, buffer=0.0):           #returns a boolean 2D array where True indicates blocked/wall.
+    def batch_line_of_sight(self, p1, p2s, radius=0, step_size=0.2):
+        if len(p2s) == 0:
+            return np.array([], dtype=bool)
+        p2s = np.array(p2s)
+        dx = p2s[:, 0] - p1[0]
+        dy = p2s[:, 1] - p1[1]
+        dist = np.hypot(dx, dy)
+        max_dist = np.max(dist)
+        if max_dist == 0:
+            return np.full(len(p2s), self.is_passable(p1[0], p1[1], radius))
+        n_steps = max(2, int(math.ceil(max_dist / step_size)))
+        fracs = np.linspace(0, 1.0, n_steps)[:, np.newaxis]
+        step_dists = fracs * max_dist
+        valid_steps = step_dists <= dist
+        px = p1[0] + fracs * dx
+        py = p1[1] + fracs * dy
+        passable = self.batch_is_passable(px.flatten(), py.flatten(), radius)
+        passable = passable.reshape(px.shape)
+        passable = passable | (~valid_steps)
+        return np.all(passable, axis=0)
+
+    def batch_raycast(self, origin, directions, max_dist=10.0):
+        if len(self.compiled_segments) == 0:
+            return np.array([]), np.array([])
+        Ox, Oy = origin[0], origin[1]
+        Dx = directions[:, 0][:, np.newaxis]
+        Dy = directions[:, 1][:, np.newaxis]
+        Ax, Ay = self._x1, self._y1
+        Bx, By = self._x2, self._y2
+        R = self._r
+        Sx = Bx - Ax
+        Sy = By - Ay
+        denom = Dx * Sy - Dy * Sx
+        denom = np.where(denom == 0, 1e-8, denom)
+        t = ((Ax - Ox)*Sy - (Ay - Oy)*Sx) / denom
+        u = ((Ax - Ox)*Dy - (Ay - Oy)*Dx) / denom
+        valid = (t >= 0) & (u >= -0.1) & (u <= 1.1)
+        t_hit = t - R
+        t_hit[~valid] = np.inf
+        t_hit[t_hit > max_dist] = np.inf
+        t_hit[t_hit < 0] = 0
+        min_t = np.min(t_hit, axis=1)
+        hit_mask = min_t < np.inf
+        hit_x = Ox + min_t[hit_mask] * directions[hit_mask, 0]
+        hit_y = Oy + min_t[hit_mask] * directions[hit_mask, 1]
+        return hit_x, hit_y
+
+    def rasterize(self, cell_size, buffer=0.0):
         cols = int(self.width / cell_size)
         rows = int(self.height / cell_size)
         grid_y, grid_x = np.mgrid[0:rows, 0:cols]
@@ -151,7 +198,7 @@ class World:
             blocked = np.zeros_like(px, dtype=bool)
         return blocked.reshape((rows, cols))
 
-    def resolve_collision(self, px, py, radius, max_iters=3):
+    def resolve_collision(self, px, py, radius, max_iters=10):
         px_arr = np.empty((1,), dtype=np.float32)
         py_arr = np.empty((1,), dtype=np.float32)
         for _ in range(max_iters):
@@ -345,6 +392,55 @@ class World:
             power_indices.sort(reverse=True)
             for idx in power_indices:
                 self.power_pellets.append(self.pellets.pop(idx))
+        self.generate_roadmap()
+    
+    def generate_roadmap(self, n_samples=600):
+        print("Building continuous PRM (Probabilistic Roadmap)...")
+        x_cands = np.random.uniform(0.5, self.width - 0.5, size=n_samples * 5)
+        y_cands = np.random.uniform(0.5, self.height - 0.5, size=n_samples * 5)
+        passable = self.batch_is_passable(x_cands, y_cands, radius=0.4)
+        # Yield PRM nodes in (y, x) format for the intelligence stack
+        self.prm_nodes = list(zip(y_cands[passable][:n_samples], x_cands[passable][:n_samples]))
+        
+        for p in self.pellets + self.power_pellets:
+            yx_p = (p[1], p[0])
+            if yx_p not in self.prm_nodes:
+                self.prm_nodes.append(yx_p)
+                
+        self.prm_graph = {n: [] for n in self.prm_nodes}
+        if not self.prm_nodes: return
+        
+        nodes_arr = np.array(self.prm_nodes, dtype=np.float32)
+        import scipy.spatial
+        tree = scipy.spatial.cKDTree(nodes_arr)
+        pairs = list(tree.query_pairs(r=7.0))
+        if pairs:
+            p1_idx, p2_idx = zip(*pairs)
+            p1_idx, p2_idx = np.array(p1_idx), np.array(p2_idx)
+            p1, p2 = nodes_arr[p1_idx], nodes_arr[p2_idx]
+            # nodes are (y, x), so index 1 is x, index 0 is y
+            dx, dy = p2[:, 1] - p1[:, 1], p2[:, 0] - p1[:, 0]
+            dist = np.hypot(dx, dy)
+            valid = dist > 0.01
+            p1_idx, p2_idx = p1_idx[valid], p2_idx[valid]
+            p1, dx, dy, dist = p1[valid], dx[valid], dy[valid], dist[valid]
+            
+            if len(dist) > 0:
+                step_size = 0.4
+                max_steps = max(2, int(np.ceil(dist.max() / step_size)))
+                fracs = np.linspace(0, 1.0, max_steps)[:, None]
+                px = p1[:, 1] + dx * fracs
+                py = p1[:, 0] + dy * fracs
+                pass_mat = self.batch_is_passable(px.flatten(), py.flatten(), radius=0.4)
+                pass_mat = pass_mat.reshape((max_steps, len(p1)))
+                
+                # A line is valid if all interpolated points along it are passable
+                los_valid = np.all(pass_mat, axis=0)
+                for k, is_valid in enumerate(los_valid):
+                    if is_valid:
+                        n1, n2 = self.prm_nodes[p1_idx[k]], self.prm_nodes[p2_idx[k]]
+                        self.prm_graph[n1].append(n2)
+                        self.prm_graph[n2].append(n1)
     
     def random_open_point(self):
         return random.choice(self.safe_area)

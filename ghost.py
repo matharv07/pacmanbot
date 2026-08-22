@@ -57,7 +57,7 @@ class Ghost:
         self.gid = gid
         self.grid = grid
         self.world = world
-        self.radius = 0.3
+        self.radius = 0.4
         self.x, self.y = float(pos[1]), float(pos[0])
         self.prev_x, self.prev_y = self.x, self.y
         self.vx, self.vy = 0.0, 0.0
@@ -70,8 +70,10 @@ class Ghost:
         self.last_dir = random.choice(DIRS)
         rows = len(grid)
         cols = len(grid[0])
-        self.personal_map = np.full((rows, cols), UNKNOWN, dtype=np.int8)
-        self.last_seen = np.full((rows, cols), -1, dtype=np.int32)
+        self.lidar_memory = set()
+        self.known_pellets = set()
+        self.known_power_pellets = set()
+        self.prm_last_seen = {n: -1 for n in getattr(world, 'prm_nodes', [])}
         self.frame = 0
         self.message_queue = []
         self.seen_message_ids = {}
@@ -88,7 +90,7 @@ class Ghost:
         self.prev_pac_col: int = -1             #pacman's col on previous frame - belief map
         self.cbba_agent = CBBA_Agent(gid)       #CBBA auction agent for this ghost
         self.pos_history: deque = deque(maxlen=OSCILLATION_WINDOW)  #rolling position window for oscillation detection
-        self.belief_map = BeliefMap(gid, self.personal_map, pacman_start=player_start)
+        self.belief_map = BeliefMap(gid, self.world, pacman_start=player_start)
         self._proximity_channel_cache = None
         self._proximity_channel_frame = -1
         self._proximity_channel_target = None
@@ -106,7 +108,7 @@ class Ghost:
         if self.dead:
             return newly_discovered, stale_refreshed
         self._check_liveness(all_ghosts)
-        diffs, newly_discovered, stale_refreshed = self._update_personal_map(all_ghosts, player_pos, powered)
+        diffs, newly_discovered, stale_refreshed = self._update_lidar_memory(all_ghosts, player_pos, powered)
         if self.frame % HEARTBEAT_EVERY == 0:
             diffs.append(("heartbeat", self.gid, int(self.y), int(self.x), self.frame))
         self._broadcast(diffs, all_ghosts)
@@ -132,28 +134,27 @@ class Ghost:
         if not moved and not self.pacman_powered and self.known_pacman:
             pr, pc = self.known_pacman
             for p_pos in (self.world.power_pellets if hasattr(self, 'world') and self.world else []):
-                p_r, p_c = int(p_pos[1]), int(p_pos[0])
-                if 0 <= p_r < len(self.grid) and 0 <= p_c < len(self.grid[0]) and self.grid[p_r][p_c] == POWER:
-                    dist_pac_to_power = abs(pr - p_r) + abs(pc - p_c)
-                    if dist_pac_to_power < 8:
-                        my_dist = abs(self.y - p_r) + abs(self.x - p_c)
-                        is_closest = True
-                        for _gid, pos in self.known_agents.items():
-                            if pos != "UNKNOWN":
-                                other_dist = abs(pos[0] - p_r) + abs(pos[1] - p_c)
-                                if other_dist < my_dist:
-                                    is_closest = False
-                                    break
-                        if is_closest:
-                            active_task = type('DummyTask', (), {'target_pos': (p_r, p_c), 'task_type': -1})()
-                            break
+                p_r, p_c = float(p_pos[0]), float(p_pos[1])
+                dist_pac_to_power = abs(pr - p_r) + abs(pc - p_c)
+                if dist_pac_to_power < 8:
+                    my_dist = abs(self.y - p_r) + abs(self.x - p_c)
+                    is_closest = True
+                    for _gid, pos in self.known_agents.items():
+                        if pos != "UNKNOWN":
+                            other_dist = abs(pos[0] - p_r) + abs(pos[1] - p_c)
+                            if other_dist < my_dist:
+                                is_closest = False
+                                break
+                    if is_closest:
+                        active_task = type('DummyTask', (), {'target_pos': (p_r, p_c), 'task_type': -1})()
+                        break
         #chase override
         CHASE_RADIUS = 5.0
         GRAB_DIST = 2.0
         dist_pac = 999
         if not moved and not self.pacman_powered and self.known_pacman:
             pr, pc = self.known_pacman
-            pac_y, pac_x = pr + 0.5, pc + 0.5
+            pac_y, pac_x = pr, pc
             dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
             if dist_pac < CHASE_RADIUS:
                 has_los = True
@@ -214,7 +215,7 @@ class Ghost:
         if not moved and self._tail_pacman_remaining > 0:
             if self.known_pacman and not self.pacman_powered:
                 pr, pc = self.known_pacman
-                pac_y, pac_x = pr + 0.5, pc + 0.5
+                pac_y, pac_x = float(pr), float(pc)
                 dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
                 if dist_pac > 0:
                     desired_vx = (pac_x - self.x) / dist_pac
@@ -228,7 +229,7 @@ class Ghost:
         #belief-map coordinated search
         if not moved and self.known_pacman is None and active_task is None:
             if self.belief_map._initialised and self.belief_map._open_cells:
-                probs = [self.belief_map._b[r][c] for r, c in self.belief_map._open_cells]
+                probs = self.belief_map._b_flat.tolist()
                 if probs:
                     max_p = max(probs)
                     if max_p > 1e-4:
@@ -240,7 +241,7 @@ class Ghost:
             target = active_task.target_pos
             if getattr(self, '_committed_target', None) != target or not getattr(self, '_committed_path', []):
                 from pathfinder import astar
-                full_path = astar(self.grid, (int(self.y), int(self.x)), target)
+                full_path = astar(self.world, (float(self.y), float(self.x)), target)
                 if len(full_path) >= 2:
                     self._committed_path = full_path[1:]
                     self._committed_target = target
@@ -248,12 +249,12 @@ class Ghost:
                     self._committed_path = []
             if hasattr(self, '_committed_path') and self._committed_path:
                 next_cell = self._committed_path[0]
-                if abs(self.y - (next_cell[0] + 0.5)) < 0.4 and abs(self.x - (next_cell[1] + 0.5)) < 0.4:
+                if abs(self.y - next_cell[0]) < 0.4 and abs(self.x - next_cell[1]) < 0.4:
                     self._committed_path.pop(0)
                     if self._committed_path:
                         next_cell = self._committed_path[0]
                 if self._committed_path:
-                    target_y, target_x = next_cell[0] + 0.5, next_cell[1] + 0.5
+                    target_y, target_x = next_cell[0], next_cell[1]
                     dx, dy = target_x - self.x, target_y - self.y
                     d = math.hypot(dx, dy)
                     if d > 0:
@@ -380,119 +381,160 @@ class Ghost:
                     self.known_agents[gid] = "UNKNOWN"
                     self._broadcast([("agent_lost", gid)], all_ghosts)
 
-    def _get_visible_cells(self, all_ghosts, player_pos, powered=False):
-        visible = {}
-        rows = len(self.grid)
-        cols = len(self.grid[0])
-        visible[(int(self.y), int(self.x))] = self.grid[int(self.y)][int(self.x)]
-        steps = np.arange(1, MAX_RAY_DIST * 2 + 1)[:, np.newaxis]
-        ray_x = self.x + steps * _DX
-        ray_y = self.y + steps * _DY
-        ray_c = ray_x.astype(int)
-        ray_r = ray_y.astype(int)
-        valid = (ray_r >= 0) & (ray_r < rows) & (ray_c >= 0) & (ray_c < cols)
-        safe_r = np.where(valid, ray_r, 0)
-        safe_c = np.where(valid, ray_c, 0)
-        grid_arr = np.array(self.grid)
-        cells = grid_arr[safe_r, safe_c]
-        is_wall = (cells == WALL) | (~valid)
-        first_wall_idx = np.argmax(is_wall, axis=0)
-        step_idx = np.arange(MAX_RAY_DIST * 2)[:, np.newaxis]
-        visible_mask = step_idx <= first_wall_idx
-        safe_r = np.where(valid, ray_r, 0)
-        safe_c = np.where(valid, ray_c, 0)
-        final_r = safe_r[visible_mask]
-        final_c = safe_c[visible_mask]
-        final_valid = valid[visible_mask]
-        for r, c in zip(final_r[final_valid], final_c[final_valid]):
-            visible[(r, c)] = self.grid[r][c]
-        #check co-ghost visibility
+    def _lidar_sweep(self, all_ghosts, player_pos, powered=False):
+        visible_prm = []
+        prm_nodes = getattr(self.world, 'prm_nodes', [])
+        if prm_nodes:
+            prm_nodes = np.array(prm_nodes)
+            dx = prm_nodes[:, 1] - self.x
+            dy = prm_nodes[:, 0] - self.y
+            dist = np.hypot(dx, dy)
+            valid_mask = dist <= MAX_RAY_DIST
+            if np.any(valid_mask):
+                valid_nodes = prm_nodes[valid_mask]
+                valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
+                is_los = self.world.batch_line_of_sight((self.x, self.y), valid_targets, radius=0.4)
+                visible_prm = [tuple(n) for n, vis in zip(valid_nodes, is_los) if vis]
+        directions = np.column_stack((_DX, _DY))
+        hit_x, hit_y = self.world.batch_raycast((self.x, self.y), directions, max_dist=MAX_RAY_DIST)
+        lidar_hits = set(zip(np.round(hit_y, 2), np.round(hit_x, 2)))
+        
+        pellet_diffs = []
+        if getattr(self.world, 'pellets', []):
+            targets = np.array(self.world.pellets)
+            dx = targets[:, 0] - self.x
+            dy = targets[:, 1] - self.y
+            dist = np.hypot(dx, dy)
+            valid = targets[dist <= MAX_RAY_DIST]
+            if len(valid) > 0:
+                is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0)
+                for p, v in zip(valid, is_los):
+                    if v and tuple(p) not in self.known_pellets:
+                        self.known_pellets.add(tuple(p))
+                        pellet_diffs.append(("pellet", tuple(p)))
+                        
+        if getattr(self.world, 'power_pellets', []):
+            targets = np.array(self.world.power_pellets)
+            dx = targets[:, 0] - self.x
+            dy = targets[:, 1] - self.y
+            dist = np.hypot(dx, dy)
+            valid = targets[dist <= MAX_RAY_DIST]
+            if len(valid) > 0:
+                is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0)
+                for p, v in zip(valid, is_los):
+                    if v and tuple(p) not in self.known_power_pellets:
+                        self.known_power_pellets.add(tuple(p))
+                        pellet_diffs.append(("power", tuple(p)))
         agent_diffs = []
+        alive_ghosts = []
+        alive_gids = []
         for gid, ghost in all_ghosts.items():
-            if gid == self.gid:
-                continue
+            if gid == self.gid: continue
             if getattr(ghost, 'dead', False):
                 last_known = self.known_agents.get(gid)
                 if last_known is not None and last_known != "UNKNOWN":
                     self.known_agents[gid] = "UNKNOWN"
                     agent_diffs.append(("agent_lost", gid))
                 continue
-            if (ghost.y, ghost.x) in visible:
-                old = self.known_agents.get(gid)
-                if old != (ghost.y, ghost.x):
-                    self.known_agents[gid] = (ghost.y, ghost.x)
-                    agent_diffs.append(("agent", gid, ghost.y, ghost.x))
+            alive_ghosts.append(ghost)
+            alive_gids.append(gid)
+            
+        if alive_ghosts:
+            targets = np.array([[(g.x, g.y)] for g in alive_ghosts]).reshape(-1, 2)
+            dx = targets[:, 0] - self.x
+            dy = targets[:, 1] - self.y
+            dists = np.hypot(dx, dy)
+            valid_mask = dists <= MAX_RAY_DIST
+            if np.any(valid_mask):
+                valid_gids = np.array(alive_gids)[valid_mask]
+                valid_targets = targets[valid_mask]
+                is_los = self.world.batch_line_of_sight((self.x, self.y), valid_targets, radius=0.4)
+                los_gids = valid_gids[is_los]
             else:
-                last_known = self.known_agents.get(gid)
-                if last_known is not None and last_known != "UNKNOWN":
-                    lr, lc = last_known
-                    if (lr, lc) in visible:
+                los_gids = []
+                
+            for gid, ghost in zip(alive_gids, alive_ghosts):
+                if gid in los_gids:
+                    old = self.known_agents.get(gid)
+                    if old != (ghost.y, ghost.x):
+                        self.known_agents[gid] = (ghost.y, ghost.x)
+                        agent_diffs.append(("agent", gid, ghost.y, ghost.x))
+                else:
+                    last_known = self.known_agents.get(gid)
+                    if last_known is not None and last_known != "UNKNOWN":
                         self.known_agents[gid] = "UNKNOWN"
                         agent_diffs.append(("agent_lost", gid))
-        #check pacman visibility
+                    
         pacman_diff = None
         pr, pc = player_pos
-        if (pr, pc) in visible:
+        pac_d = math.hypot(pr - self.y, pc - self.x)
+        if pac_d <= MAX_RAY_DIST and self.world.line_of_sight((self.x, self.y), (pc, pr), radius=0.4):
             if self.known_pacman != (pr, pc) or self.pacman_powered != powered:
-                self.known_pacman    = (pr, pc)
+                self.known_pacman = (pr, pc)
                 if powered and not self.pacman_powered:
                     self.pacman_power_timer = 40
-                self.pacman_powered  = powered
-                if not powered:
-                    self.pacman_power_timer = 0
+                self.pacman_powered = powered
+                if not powered: self.pacman_power_timer = 0
                 self.pacman_last_seen = self.frame
                 pacman_diff = ("pacman", pr, pc, powered, self.frame)
             else:
                 self.pacman_last_seen = self.frame
         else:
-            #if pacman not visible, check if we can see where it was last seen
             if self.known_pacman is not None:
                 kr, kc = self.known_pacman
-                if (kr, kc) in visible:
-                    self.last_lost_pacman = (kr, kc)
-                    self.pacman_last_seen = self.frame 
-                    self.known_pacman     = None
-                    pacman_diff = ("pacman_lost", kr, kc, self.frame)
-        return visible, agent_diffs, pacman_diff
+                self.last_lost_pacman = (kr, kc)
+                self.pacman_last_seen = self.frame 
+                self.known_pacman = None
+                pacman_diff = ("pacman_lost", kr, kc, self.frame)
+        return lidar_hits, visible_prm, agent_diffs, pacman_diff, pellet_diffs
 
-    def _update_personal_map(self, all_ghosts, player_pos, powered=False):
-        visible, agent_diffs, pacman_diff = self._get_visible_cells(all_ghosts, player_pos, powered)
+    def _update_lidar_memory(self, all_ghosts, player_pos, powered=False):
+        lidar_hits, visible_prm, agent_diffs, pacman_diff, pellet_diffs = self._lidar_sweep(all_ghosts, player_pos, powered)
         diffs = []
         newly_discovered = 0
         stale_refreshed = 0.0
-        for (r, c), val in visible.items():
-            old = self.personal_map[r, c]
-            last = self.last_seen[r, c]
+        
+        diffs.extend(pellet_diffs)
+        
+        for pt in lidar_hits:
+            if pt not in self.lidar_memory:
+                newly_discovered += 1
+                self.lidar_memory.add(pt)
+                diffs.append(("wall_hit", pt))
+                
+        for n in visible_prm:
+            last = self.prm_last_seen.get(n, -1)
             if last != -1:
                 staleness = min(self.frame - last, 200) / 200.0
-                if staleness > 0.25: #reward if >= 50 frames stale
-                    stale_refreshed += staleness
-            self.last_seen[r, c] = self.frame
-            if old != val:
-                if old == UNKNOWN:
-                    newly_discovered += 1
-                self.personal_map[r, c] = val
-                if val == WALL:
-                    self.belief_map.update_local_map_cell((r, c), WALL)
-                diffs.append(("cell", r, c, val))
+                if staleness > 0.25: stale_refreshed += staleness
+            self.prm_last_seen[n] = self.frame
+            diffs.append(("prm_refresh", n))
+            
         diffs.extend(agent_diffs)
-        if pacman_diff:
-            diffs.append(pacman_diff)
+        if pacman_diff: diffs.append(pacman_diff)
+        
         pr, pc = player_pos
-        pacman_in_los  = (pr, pc) in visible      #true every frame Pacman is actually visible
+        pacman_in_los = (self.known_pacman is not None)
         pacman_just_lost = pacman_diff is not None and pacman_diff[0] == "pacman_lost"
+        
         if pacman_in_los:
             pac_dir = (0, 0)
             if self.prev_pac_row >= 0:
                 pac_dir = (pr - self.prev_pac_row, pc - self.prev_pac_col)
-            self.belief_map.observe((pr, pc), pac_dir)
-            self.prev_pac_row, self.prev_pac_col = pr, pc  #update every LOS frame for accurate direction
+            self.belief_map.observe((float(pr), float(pc)), pac_dir)
+            self.prev_pac_row, self.prev_pac_col = pr, pc
         elif pacman_just_lost:
             _, kr, kc, _ = pacman_diff
-            self.belief_map.observe_lost((kr, kc))
-        self.belief_map.diffuse((self.y, self.x))
-        pac_pos = (pr, pc) if pacman_in_los else None  #preserve Pacman's cell during clear
-        self.belief_map.observe_clear(set(visible.keys()), pac_pos)
+            self.belief_map.observe_lost((float(kr), float(kc)))
+            
+        self.belief_map.diffuse((float(self.y), float(self.x)))
+        pac_pos = (float(pr), float(pc)) if pacman_in_los else None
+        self.belief_map.observe_clear(set(visible_prm), pac_pos)
+        
+        # Cleanup eaten pellets from memory
+        self.known_pellets = {p for p in self.known_pellets if p in getattr(self.world, 'pellets', [])}
+        self.known_power_pellets = {p for p in self.known_power_pellets if p in getattr(self.world, 'power_pellets', [])}
+        
         return diffs, newly_discovered, stale_refreshed
 
     def _broadcast(self, diffs, all_ghosts, msg_id=None, hop=0):
@@ -510,7 +552,7 @@ class Ghost:
         for ghost in all_ghosts.values():
             if ghost.gid == self.gid:
                 continue
-            dist = abs(ghost.y - self.y) + abs(ghost.x - self.x)
+            dist = math.hypot(ghost.y - self.y, ghost.x - self.x)
             if dist <= RADIUS:
                 ghost.message_queue.append(msg)
                 if is_new_msg:
@@ -522,16 +564,24 @@ class Ghost:
                         ghost._send_full_sync(self)
 
     def _send_full_sync(self, target_ghost):
-        last = self._last_synced_map.get(target_ghost.gid)
-        if last is not None:
-            changed = (self.personal_map != last) & (self.personal_map != UNKNOWN)
-            rs, cs = np.nonzero(changed)
-        else:
-            mask = self.personal_map != UNKNOWN
-            rs, cs = np.nonzero(mask)
-        sync_diffs = [("cell", int(r), int(c), int(self.personal_map[r, c])) for r, c in zip(rs, cs)]
-        self._last_synced_map[target_ghost.gid] = self.personal_map.copy()
-        #iterate through agent positions and liveness
+        sync_diffs = []
+        # sync missing lidar hits (very naive full sync, could be optimized)
+        for pt in self.lidar_memory:
+            if pt not in target_ghost.lidar_memory:
+                sync_diffs.append(("wall_hit", pt))
+        # sync prm timestamps
+        for n, last_seen in self.prm_last_seen.items():
+            if last_seen != -1:
+                sync_diffs.append(("prm_refresh", n))
+                
+        # sync known pellets
+        for p in self.known_pellets:
+            if p not in getattr(target_ghost, 'known_pellets', set()):
+                sync_diffs.append(("pellet", p))
+        for p in self.known_power_pellets:
+            if p not in getattr(target_ghost, 'known_power_pellets', set()):
+                sync_diffs.append(("power", p))
+                
         for gid, pos in self.known_agents.items():
             if pos == "UNKNOWN":
                 sync_diffs.append(("agent_lost", gid))
@@ -540,7 +590,6 @@ class Ghost:
         for gid, hb_frame in self.last_heartbeat.items():
             frames_ago = self.frame - hb_frame
             sync_diffs.append(("hb_sync", gid, frames_ago))
-        #check & relay pacman state
         if self.known_pacman is not None:
             sync_diffs.append(("pacman", self.known_pacman[0], self.known_pacman[1], self.pacman_powered, self.pacman_last_seen))
         elif self.last_lost_pacman is not None and self.pacman_last_seen > -1:
@@ -559,15 +608,15 @@ class Ghost:
             relay_diffs = []
             for diff in msg["diffs"]:
                 dtype = diff[0]
-                if dtype == "cell":
-                    _, r, c, val = diff
-                    old = self.personal_map[r, c]
-                    if old != val:
-                        if old != UNKNOWN and self.last_seen[r, c] >= self.frame - MEMORY_FRAMES:
-                            continue    #reject stale cell update if we have seen it recently
-                        self.personal_map[r, c] = val
-                        if val == WALL:
-                            self.belief_map.update_local_map_cell((r, c), WALL)
+                if dtype == "wall_hit":
+                    _, pt = diff
+                    if pt not in self.lidar_memory:
+                        self.lidar_memory.add(pt)
+                        relay_diffs.append(diff)
+                elif dtype == "prm_refresh":
+                    _, n = diff
+                    if self.prm_last_seen.get(n, -1) < self.frame - MEMORY_FRAMES:
+                        self.prm_last_seen[n] = self.frame
                         relay_diffs.append(diff)
                 elif dtype == "agent":
                     _, gid, r, c = diff
@@ -576,6 +625,16 @@ class Ghost:
                     old = self.known_agents.get(gid)
                     if old != (r, c):
                         self.known_agents[gid] = (r, c)
+                        relay_diffs.append(diff)
+                elif dtype == "pellet":
+                    _, p = diff
+                    if p not in self.known_pellets:
+                        self.known_pellets.add(p)
+                        relay_diffs.append(diff)
+                elif dtype == "power":
+                    _, p = diff
+                    if p not in self.known_power_pellets:
+                        self.known_power_pellets.add(p)
                         relay_diffs.append(diff)
                 elif dtype == "agent_lost":
                     _, gid = diff
@@ -596,7 +655,7 @@ class Ghost:
                         if old != (r, c):
                             self.known_agents[gid] = (r, c)
                             relay_diffs.append(("agent", gid, r, c))
-                    relay_diffs.append(diff)  #always relay heartbeats so all agents know where others are
+                    relay_diffs.append(diff)
                 elif dtype == "hb_sync":
                     _, gid, frames_ago = diff
                     if gid == self.gid:
@@ -659,16 +718,43 @@ class Ghost:
     def kill(self):
         self.dead = True
 
-    def draw(self, surf):
+    def draw(self, surf, scale=None, offset_x=0, offset_y=0):
+        if scale is None:
+            scale = CELL
         if self.dead:
             return
-        x = int(self.x * CELL)
-        y = int(self.y * CELL)
-        r = CELL // 2 - 2
-        color = self.color
+        x = int(self.x * scale) + offset_x
+        y = int(self.y * scale) + offset_y
+        r = scale // 2 - 2
+        #powered state — blue tint when pacman is powered (ghosts are vulnerable)
+        if self.pacman_powered:
+            color = POWERED_COLOR
+        else:
+            color = self.color
         pygame.draw.circle(surf, color, (x, y - 2), r)
         pygame.draw.rect(surf, color, (x - r, y - 2, r * 2, r + 2))
-        pygame.draw.circle(surf, WHITE, (x - 4, y - 4), 3)
-        pygame.draw.circle(surf, WHITE, (x + 4, y - 4), 3)
-        pygame.draw.circle(surf, BLACK, (x - 3, y - 4), 2)
-        pygame.draw.circle(surf, BLACK, (x + 5, y - 4), 2)
+        #wavy bottom edge
+        wave_r = max(2, scale // 8)
+        for i in range(3):
+            wx = x - r + wave_r + i * (r * 2 - wave_r * 2) // 2
+            wy = y + r - 1
+            pygame.draw.circle(surf, BLACK, (wx, wy), wave_r)
+        #direction-tracking eyes based on velocity
+        speed = math.hypot(self.vx, self.vy)
+        if speed > 0.01:
+            dx_n = self.vx / speed
+            dy_n = self.vy / speed
+        else:
+            dx_n, dy_n = 1.0, 0.0
+        eye_sep = max(3, scale // 5)
+        pupil_off = max(1, scale // 12)
+        eye_r = max(2, scale // 7)
+        pupil_r = max(1, eye_r - 1)
+        #white sclera
+        pygame.draw.circle(surf, WHITE, (x - eye_sep, y - eye_sep // 2), eye_r)
+        pygame.draw.circle(surf, WHITE, (x + eye_sep, y - eye_sep // 2), eye_r)
+        #black pupils — offset in movement direction
+        px_off = int(dx_n * pupil_off)
+        py_off = int(dy_n * pupil_off)
+        pygame.draw.circle(surf, BLACK, (x - eye_sep + px_off, y - eye_sep // 2 + py_off), pupil_r)
+        pygame.draw.circle(surf, BLACK, (x + eye_sep + px_off, y - eye_sep // 2 + py_off), pupil_r)

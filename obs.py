@@ -17,7 +17,7 @@ MAX_W = 41
 MAX_GHOSTS   = 7
 SPATIAL_CH   = 16       #number of spatial channels (see channel map below)
 GLOBAL_SPATIAL_CH = 11   #number of channels in the omniscient global state
-VEC_DIM      = 102
+VEC_DIM      = 104
 CRITIC_VEC_DIM = MAX_GHOSTS * VEC_DIM + MAX_GHOSTS
 
 """
@@ -68,12 +68,23 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int = None, cols: int = 
         out[4] = ghost.belief_map._b[:rows, :cols]
     if hasattr(ghost.belief_map, '_safety'):
         out[5] = ghost.belief_map._safety[:rows, :cols]
-    out[6, int(ghost.y), int(ghost.x)] = 1.0
+    #gaussian blob position encoding — preserves sub-cell precision for continuous coordinates
+    _BLOB_SIGMA = 0.6
+    def _place_blob(channel, fy, fx):
+        """Place a small Gaussian blob at continuous position (fy, fx) on the given channel."""
+        cr, cc = int(fy), int(fx)
+        for dr in range(-1, 2):
+            for dc in range(-1, 2):
+                nr, nc = cr + dr, cc + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    d2 = (fy - (nr + 0.5))**2 + (fx - (nc + 0.5))**2
+                    channel[nr, nc] = max(channel[nr, nc], np.exp(-d2 / (2 * _BLOB_SIGMA**2)))
+    _place_blob(out[6], ghost.y, ghost.x)
     target = _pacman_target(ghost)
     if target is not None:
         tr, tc = target
         if 0 <= tr < rows and 0 <= tc < cols:
-            out[7, tr, tc] = 1.0
+            _place_blob(out[7], float(tr) + 0.5, float(tc) + 0.5)
     for gid in range(MAX_GHOSTS):
         if gid == ghost.gid:
             continue
@@ -82,7 +93,7 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int = None, cols: int = 
         if pos is not None and pos != "UNKNOWN":
             r, c = pos
             if 0 <= r < rows and 0 <= c < cols:
-                out[ch, r, c] = 1.0
+                _place_blob(out[ch], float(r), float(c))
     ls = np.asarray(ghost.last_seen, dtype=np.float32)
     stale = np.clip(ghost.frame - ls, 0, 200) / 200.0
     out[14] = stale
@@ -94,6 +105,8 @@ def build_vector(ghost) -> np.ndarray:
     cols = len(ghost.grid[0])
     f = []
     f.extend([ghost.y / rows, ghost.x / cols])
+    #sub-cell fractional position — gives exact continuous position info beyond spatial blob
+    f.extend([ghost.y % 1.0, ghost.x % 1.0])
     timer = getattr(ghost, 'pacman_power_timer', 0)
     f.append(timer / 40.0 if getattr(ghost, 'pacman_powered', False) else 0.0)
     since = ghost.frame - ghost.pacman_last_seen if ghost.pacman_last_seen >= 0 else 200
@@ -162,13 +175,22 @@ def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int) -
 
 def build_global_spatial(env, rows, cols) -> np.ndarray:
     #build the omniscient global state for the critic
+    _BLOB_SIGMA = 0.6
+    def _place_blob(channel, fy, fx):
+        cr, cc = int(fy), int(fx)
+        for dr in range(-1, 2):
+            for dc in range(-1, 2):
+                nr, nc = cr + dr, cc + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    d2 = (fy - (nr + 0.5))**2 + (fx - (nc + 0.5))**2
+                    channel[nr, nc] = max(channel[nr, nc], np.exp(-d2 / (2 * _BLOB_SIGMA**2)))
     out = np.zeros((11, rows, cols), dtype=np.float32)
     out[0] = (env.grid == 1)
     out[1] = (env.grid == 2)
     out[2] = (env.grid == 3)
     if not env.player.dead:
-        out[3, int(env.player.y), int(env.player.x)] = 1.0
+        _place_blob(out[3], env.player.y, env.player.x)
     for g in env.ghosts.values():
         if not g.dead:
-            out[4 + g.gid, int(g.y), int(g.x)] = 1.0
+            _place_blob(out[4 + g.gid], g.y, g.x)
     return out

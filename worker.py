@@ -48,7 +48,6 @@ class Env:
     def reset(self):
         self.grid, self._player_start, self.world = generate_map(
             rows=self.grid_rows, cols=self.grid_cols, n_power=self.n_power, random_spawn=self.static_pacman)
-        pathfinder.build_scipy_graph(self.grid)
         self.player = Player(self.grid, self._player_start)
         if self.static_pacman:
             self.player.stationary = True
@@ -177,7 +176,7 @@ class Env:
                     if tasks:
                         all_targets = [t.target_pos for t in tasks]
                         from pathfinder import dijkstra_multi
-                        dists = dijkstra_multi(g.grid, (g.row, g.col), all_targets)
+                        dists = dijkstra_multi(g.grid, (int(g.y), int(g.x)), all_targets)
                         h_dists.update(dists)  
                     g.cbba_agent._phase1(g, all_tasks, h_dists)
         rewards = {gid: 0.0 for gid in alive}
@@ -189,15 +188,42 @@ class Env:
             for gid, ghost in list(self.ghosts.items()):
                 if ghost.dead:
                     continue
-                ghost.update((self.player.row, self.player.col), powered, self.ghosts)
+                ghost.update((self.player.y, self.player.x), powered, self.ghosts)
             if not self.player.dead:
                 for gid, ghost in list(self.ghosts.items()):
                     if ghost.dead:
                         continue
-                    same = (ghost.y == self.player.row and ghost.x == self.player.col)
-                    swap = (ghost.y == self.player.prev_row and ghost.x == self.player.prev_col
-                            and self.player.row == ghost.prev_row and self.player.col == ghost.prev_col)
-                    if same or swap:
+                    #continuous radius-based swept-path collision (matches pacman.py visualizer)
+                    collision_radius = self.player.radius + ghost.radius + 0.15
+                    collided = False
+                    p_path = getattr(self.player, 'path_this_frame', [(self.player.x, self.player.y)])
+                    g_path = getattr(ghost, 'path_this_frame', [(ghost.x, ghost.y)])
+                    n_p = len(p_path)
+                    n_g = len(g_path)
+                    max_segs = max(1, n_p - 1, n_g - 1)
+                    samples = max_segs * 3 + 1
+                    for step in range(samples):
+                        t = step / (samples - 1) if samples > 1 else 0.0
+                        if n_p == 1:
+                            px, py = p_path[0]
+                        else:
+                            fp = t * (n_p - 1)
+                            ip = min(int(fp), n_p - 2)
+                            rem_p = fp - ip
+                            px = p_path[ip][0] * (1 - rem_p) + p_path[ip + 1][0] * rem_p
+                            py = p_path[ip][1] * (1 - rem_p) + p_path[ip + 1][1] * rem_p
+                        if n_g == 1:
+                            gx, gy = g_path[0]
+                        else:
+                            fg = t * (n_g - 1)
+                            ig = min(int(fg), n_g - 2)
+                            rem_g = fg - ig
+                            gx = g_path[ig][0] * (1 - rem_g) + g_path[ig + 1][0] * rem_g
+                            gy = g_path[ig][1] * (1 - rem_g) + g_path[ig + 1][1] * rem_g
+                        if math.hypot(gx - px, gy - py) < collision_radius:
+                            collided = True
+                            break
+                    if collided:
                         if self.player.powered:
                             ghost.kill()
                             if gid in rewards:
@@ -210,7 +236,7 @@ class Env:
                             TEAM_KILL_SHARE = 0.60   #60% of kill reward shared
                             for other_gid, other_ghost in self.ghosts.items():
                                 if other_gid != gid and not other_ghost.dead and other_gid in rewards:
-                                    dist = abs(other_ghost.row - self.player.row) + abs(other_ghost.col - self.player.col)
+                                    dist = math.hypot(other_ghost.y - self.player.y, other_ghost.x - self.player.x)
                                     proximity_scale = math.exp(-dist / 5.0)
                                     rewards[other_gid] += 100.0 * TEAM_KILL_SHARE * proximity_scale
                             break
@@ -228,8 +254,7 @@ class Env:
                     if ghost_prox.dead or gid_prox not in rewards:
                         continue
                     if not self.player.powered:
-                        pr, pc = self.player.row, self.player.col
-                        dist = abs(ghost_prox.row - pr) + abs(ghost_prox.col - pc)
+                        dist = math.hypot(ghost_prox.y - self.player.y, ghost_prox.x - self.player.x)
                         #reward peaks at 0.20 when adjacent, decays to about 0 beyond 8 cells
                         prox = 0.20 * math.exp(-dist / 3.0)
                         rewards[gid_prox] += prox

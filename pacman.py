@@ -197,130 +197,51 @@ class Player:
         return ghost_maps
 
     def _pick_target(self, ghosts):
-        """BFS scoring to pick the best pellet (or ghost when powered) target."""
-        rows, cols = len(self.grid), len(self.grid[0])
-        ir = max(0, min(rows - 1, int(round(self.y))))
-        ic = max(0, min(cols - 1, int(round(self.x))))
-        #snap to nearest open cell if in a wall
-        if self.grid[ir][ic] == WALL:
-            best_d = float('inf')
-            for dr in range(-2, 3):
-                for dc in range(-2, 3):
-                    nr, nc = ir + dr, ic + dc
-                    if 0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL:
-                        d = abs(dr) + abs(dc)
-                        if d < best_d:
-                            best_d = d
-                            ir, ic = nr, nc
+        """PRM continuous scoring to pick the best pellet (or ghost when powered) target."""
+        import pathfinder
+        
+        start = (self.y, self.x)
         if self.powered:
             best_ghost_dist = float('inf')
             best_ghost_target = None
             for g in ghosts.values():
                 if not g.dead:
-                    gr = max(0, min(rows - 1, int(round(g.y))))
-                    gc = max(0, min(cols - 1, int(round(g.x))))
-                    if self.grid[gr][gc] != WALL:
-                        d = abs(ir - gr) + abs(ic - gc)
-                        if d < best_ghost_dist and self.power_timer > (d * 2.0) + 15:
-                            best_ghost_dist = d
-                            best_ghost_target = (gr, gc)
+                    d = abs(self.y - g.y) + abs(self.x - g.x)
+                    if d < best_ghost_dist and self.power_timer > (d * 2.0) + 15:
+                        best_ghost_dist = d
+                        best_ghost_target = (g.y, g.x)
             if best_ghost_target is not None:
-                path = pathfinder.astar(self.grid, (ir, ic), best_ghost_target)
+                path = pathfinder.astar(self.world, start, best_ghost_target)
                 if len(path) >= 2:
                     return best_ghost_target, list(path[1:])
-        ghost_cells = []                #ghost cell list for danger scoring
-        for g in ghosts.values():
-            if not g.dead:
-                gr = max(0, min(rows - 1, int(round(g.y))))
-                gc = max(0, min(cols - 1, int(round(g.x))))
-                ghost_cells.append((gr, gc))
-        best_score = float('inf')       #multi-source BFS from player position to find best pellet
+                    
+        targets = self.world.pellets + self.world.power_pellets
+        dists = pathfinder.dijkstra_multi(self.world, start, targets)
+        
+        best_score = float('inf')
         best_target = None
-        graph_data = pathfinder.get_scipy_graph(self.grid)
-        scipy_success = False
-        if graph_data and pathfinder._SCIPY_AVAILABLE:
-            graph, open_cells, cell_to_idx = graph_data
-            if (ir, ic) in cell_to_idx:
-                start_idx = cell_to_idx[(ir, ic)]
-                distances, predecessors = pathfinder.scipy_dijkstra(graph, directed=False, indices=start_idx, return_predecessors=True)
-                open_r = np.array([r for r, c in open_cells])
-                open_c = np.array([c for r, c in open_cells])
-                grid_arr = np.array(self.grid)
-                cells = grid_arr[open_r, open_c]
-                valid_mask = (distances <= 400) & np.isfinite(distances)
-                pellet_mask = (cells == PELLET) | (cells == POWER)
-                mask = valid_mask & pellet_mask
-                if np.any(mask):
-                    valid_r = open_r[mask]
-                    valid_c = open_c[mask]
-                    valid_d = distances[mask]
-                    valid_cells = cells[mask]
-                    if ghost_cells:
-                        ghost_maps = self._get_ghost_maps(ghosts)
-                        if ghost_maps:
-                            g_dists_grid = np.min(ghost_maps, axis=0)
-                            g_dists = g_dists_grid[valid_r, valid_c]
-                            safe_mask = valid_d < g_dists
-                            if np.any(safe_mask):
-                                valid_r = valid_r[safe_mask]
-                                valid_c = valid_c[safe_mask]
-                                valid_d = valid_d[safe_mask]
-                                valid_cells = valid_cells[safe_mask]
-                                g_dists = g_dists[safe_mask]
-                            danger = np.where(g_dists < 4, (4.0 - g_dists) * 15.0, 0.0)
-                        else:
-                            gr_arr = np.array([gr for gr, gc in ghost_cells])[:, np.newaxis]
-                            gc_arr = np.array([gc for gr, gc in ghost_cells])[:, np.newaxis]
-                            g_dists = np.abs(valid_r - gr_arr) + np.abs(valid_c - gc_arr)
-                            ghost_safety = np.min(g_dists, axis=0)
-                            danger = np.where(ghost_safety < 3, (3.0 - ghost_safety) * 15.0, 0.0)
-                    else:
-                        danger = np.zeros_like(valid_d)
-                    weights = np.where(valid_cells == POWER, 0.5, 1.5)
-                    scores = valid_d * weights + danger
-                    best_idx = np.argmin(scores)
-                    best_target = (int(valid_r[best_idx]), int(valid_c[best_idx]))
-                scipy_success = True
-        if not scipy_success:
-            dist_map = np.full((rows, cols), -1, dtype=np.int32)
-            dist_map[ir, ic] = 0
-            queue = deque([(ir, ic)])
-            while queue:
-                r, c = queue.popleft()
-                d = int(dist_map[r, c])
-                cell = self.grid[r][c]
-                if cell in (PELLET, POWER):
-                    ghost_safety = min(abs(r - gr) + abs(c - gc) for gr, gc in ghost_cells) if ghost_cells else 999
-                    danger = max(0.0, 3.0 - ghost_safety) * 15.0 if ghost_safety < 3 else 0.0
-                    weight = 0.5 if cell == POWER else 1.5
-                    score = d * weight + danger
-                    if score < best_score:
-                        best_score = score
-                        best_target = (r, c)
-                if d < 400:  #max bfs radius
-                    for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
-                        nr, nc = r + dr, c + dc
-                        if 0 <= nr < rows and 0 <= nc < cols and self.grid[nr][nc] != WALL and dist_map[nr, nc] == -1:
-                            dist_map[nr, nc] = d + 1
-                            queue.append((nr, nc))
-        if best_target is None:
-            return None, []
-        if scipy_success and best_target in cell_to_idx:
-            path = []
-            curr_idx = cell_to_idx[best_target]
-            while curr_idx >= 0 and curr_idx != -9999:
-                path.append(open_cells[curr_idx])
-                if curr_idx == start_idx:
-                    break
-                curr_idx = predecessors[curr_idx]
-            path.reverse()
-            if len(path) >= 2:
-                return best_target, list(path[1:])
-            return best_target, []
-        path = pathfinder.astar(self.grid, (ir, ic), best_target)
-        if len(path) >= 2:
-            return best_target, list(path[1:])
-        return best_target, []
+        best_path = []
+        for tgt, (dist, path) in dists.items():
+            if dist == math.inf: continue
+            
+            danger = 0.0
+            for g in ghosts.values():
+                if not g.dead:
+                    gd = abs(tgt[0] - g.y) + abs(tgt[1] - g.x)
+                    if gd < 4:
+                        danger += (4 - gd) * 15.0
+            
+            weight = 0.5 if tgt in self.world.power_pellets else 1.5
+            score = dist * weight + danger
+            if score < best_score:
+                best_score = score
+                best_target = tgt
+                best_path = path[1:]
+                
+        if not best_target and targets:
+            best_target = targets[0]
+            
+        return best_target, best_path
 
     def update(self, ghosts):
         if self.dead:
@@ -359,7 +280,16 @@ class Player:
             #check if route needs replanning
             ghost_emergency = not self.powered and min_ghost_dist < 2.5 and self._route_age >= 3
             power_changed = self.powered != self._route_power_state
-            target_eaten = (self._route_target is not None and self.grid[self._route_target[0]][self._route_target[1]] not in (PELLET, POWER) and not self.powered)
+            target_eaten = False
+            if self._route_target is not None and not self.powered:
+                if self.world:
+                    target_eaten = (self._route_target not in self.world.pellets and self._route_target not in self.world.power_pellets)
+                else:
+                    tr, tc = int(self._route_target[0]), int(self._route_target[1])
+                    if 0 <= tr < len(self.grid) and 0 <= tc < len(self.grid[0]):
+                        target_eaten = (self.grid[tr][tc] not in (PELLET, POWER))
+                    else:
+                        target_eaten = True
             path_exhausted = not self._route
             needs_replan = (path_exhausted or ghost_emergency or power_changed or target_eaten or self._route_age > 15)
             if needs_replan:
@@ -369,13 +299,13 @@ class Player:
                 self._route_power_state = self.powered
                 self._route_age = 0
             #pop waypoints we've reached
-            while self._route and abs(self.y - (self._route[0][0] + 0.5)) < 0.4 and abs(self.x - (self._route[0][1] + 0.5)) < 0.4:
+            while self._route and abs(self.y - self._route[0][0]) < 0.4 and abs(self.x - self._route[0][1]) < 0.4:
                 self._route.pop(0)
             #get desired heading from next waypoint
             if self._route:
                 wp_r, wp_c = self._route[0]
-                dr = (wp_r + 0.5) - self.y
-                dc = (wp_c + 0.5) - self.x
+                dr = wp_r - self.y
+                dc = wp_c - self.x
                 heading_len = math.hypot(dr, dc)
                 if heading_len > 0.01:
                     desired_vy = dr / heading_len
@@ -555,8 +485,6 @@ class Game:
 
     def new_game(self):
         self.grid, self.player_start, self.world = generate_map()
-        import pathfinder
-        pathfinder.build_scipy_graph(self.grid)
         self.player = Player(self.grid, self.player_start, self.world)
         self.total_pellets = int(np.sum(np.isin(self.grid, (PELLET, POWER))))
         open_cells = np.argwhere(self.grid != WALL)
@@ -694,7 +622,7 @@ class Game:
         self.player.update(self.ghosts)
         powered = self.player.powered
         for ghost in self.ghosts.values():
-            ghost.update((int(self.player.y), int(self.player.x)), powered, self.ghosts)
+            ghost.update((self.player.y, self.player.x), powered, self.ghosts)
         if not self.player.dead:
             for gid, ghost in list(self.ghosts.items()):
                 if ghost.dead:
@@ -785,32 +713,48 @@ class Game:
             if self.ghosts:
                 self.debug_ghost_id = next(iter(self.ghosts))
                 ghost = self.ghosts[self.debug_ghost_id]
+    def draw_personal_map(self):
+        ghost = self.ghosts.get(self.debug_ghost_id)
+        if not ghost:
+            if self.ghosts:
+                ghost = next(iter(self.ghosts.values()))
             else:
                 return
-        for r in range(ROWS):
-            for c in range(COLS):
-                x = WIDTH + c * CELL
-                y = r * CELL
-                val = ghost.personal_map[r][c]
-                if val == UNKNOWN:
-                    color = (30, 30, 30)
-                elif val == WALL:
-                    color = BLUE
-                elif val == PELLET:
-                    color = (180, 180, 180)
-                elif val == POWER:
-                    color = (255, 200, 0)
-                elif val == EMPTY:
-                    color = BLACK
-                else:
-                    color = (30, 30, 30)
-                pygame.draw.rect(self.screen, color, (x, y, CELL, CELL))
+        ox = WIDTH
+        
+        # Prevent continuous points from spilling over into the HUD
+        old_clip = self.screen.get_clip()
+        self.screen.set_clip(pygame.Rect(ox, 0, WIDTH, ROWS * CELL))
+        
+        pygame.draw.rect(self.screen, BLACK, (ox, 0, WIDTH, ROWS * CELL))
+        
+        # 1. draw Lidar Wall Hits (Point Cloud)
+        for py, px in ghost.lidar_memory:
+            hit_x = ox + int(px * CELL)
+            hit_y = int(py * CELL)
+            pygame.draw.rect(self.screen, (200, 200, 200), (hit_x-1, hit_y-1, 2, 2))
+            
+        # 2. draw Known Pellets
+        if hasattr(ghost, 'known_pellets'):
+            for py, px in ghost.known_pellets:
+                pygame.draw.rect(self.screen, YELLOW, (int(ox + px * CELL) - 1, int(py * CELL) - 1, 2, 2))
+                
+        # 3. draw Known Power Pellets
+        if hasattr(ghost, 'known_power_pellets'):
+            for py, px in ghost.known_power_pellets:
+                pygame.draw.circle(self.screen, WHITE, (int(ox + px * CELL), int(py * CELL)), 5)
+            
+        # 4. fog-of-war PRM nodes
+        for n, last_seen in ghost.prm_last_seen.items():
+            if last_seen == -1:
+                pygame.draw.circle(self.screen, (30, 30, 30), (int(ox + n[1] * CELL), int(n[0] * CELL)), 3)
+                
+        # 5. continuous Belief Heatmap on PRM nodes
         bm = ghost.belief_map
         if bm._initialised and bm._open_cells:
-            probs = [bm._b[r][c] for r, c in bm._open_cells]
+            probs = bm._b_flat.tolist()
             max_p = max(probs) if probs else 0.0
             if max_p > 1e-9:
-                cell_surf = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
                 for (r, c), p in zip(bm._open_cells, probs):
                     if p < 0.001:
                         continue
@@ -818,32 +762,60 @@ class Game:
                     red = int(t * 255)
                     green = int((1.0 - t) * 40)
                     blue = int((1.0 - t) * 210)
-                    alpha = int(60 + t * 180)
-                    cell_surf.fill((red, green, blue, alpha))
-                    self.screen.blit(cell_surf, (WIDTH + c * CELL, r * CELL))
+                    alpha = int(40 + t * 140)
+                    s_r = int(3 + t * 4)
+                    
+                    surf = pygame.Surface((s_r*2, s_r*2), pygame.SRCALPHA)
+                    pygame.draw.circle(surf, (red, green, blue, alpha), (s_r, s_r), s_r)
+                    self.screen.blit(surf, (ox + int(c * CELL) - s_r, int(r * CELL) - s_r))
+                    
+        # 6. CBBA task targets
+        active_task = ghost.cbba_agent.get_active_task()
+        if active_task is not None:
+            tr, tc = active_task.target_pos
+            tx = ox + int(tc * CELL)
+            ty = int(tr * CELL)
+            pygame.draw.circle(self.screen, (255, 255, 0), (tx, ty), CELL // 2 + 2, 2)
+            pygame.draw.line(self.screen, (255, 255, 0), (tx - 4, ty - 4), (tx + 4, ty + 4), 2)
+            pygame.draw.line(self.screen, (255, 255, 0), (tx - 4, ty + 4), (tx + 4, ty - 4), 2)
+            
+        # 7. communication radius circle
+        from ghost import RADIUS as _COMM_RADIUS
+        cx = ox + int(ghost.x * CELL)
+        cy = int(ghost.y * CELL)
+        pygame.draw.circle(self.screen, (60, 60, 120), (cx, cy), int(_COMM_RADIUS * CELL), 1)
+        
+        # 8. known agents
         for gid, pos in ghost.known_agents.items():
-            if pos == "UNKNOWN":
-                continue
+            if pos == "UNKNOWN": continue
             gr, gc = pos
-            x = WIDTH + gc * CELL + CELL // 2
-            y = gr * CELL + CELL // 2
-            pygame.draw.circle(self.screen, GHOST_COLORS[gid], (x, y), CELL // 2 - 2)
+            ax = ox + int(gc * CELL)
+            ay = int(gr * CELL)
+            c_col = GHOST_COLORS[gid % len(GHOST_COLORS)]
+            pygame.draw.circle(self.screen, c_col, (ax, ay), CELL // 2 - 2)
             label = self.small.render(str(gid), True, WHITE)
-            self.screen.blit(label, (WIDTH + gc * CELL + 2, gr * CELL + 2))
-        x = WIDTH + ghost.x * CELL + CELL // 2
-        y = ghost.y * CELL + CELL // 2
-        pygame.draw.circle(self.screen, GHOST_COLORS[self.debug_ghost_id], (x, y), CELL // 2 - 2)
-        label = self.small.render(str(self.debug_ghost_id), True, WHITE)
-        self.screen.blit(label, (WIDTH + ghost.x * CELL + 2, ghost.y * CELL + 2))
+            self.screen.blit(label, (ax - 4, ay - 6))
+            
+        # 9. ghost sprite
+        ghost.draw(self.screen, scale=CELL, offset_x=ox)
+        
+        # 10. known pacman
         if ghost.known_pacman:
             pr, pc = ghost.known_pacman
-            x = WIDTH + pc * CELL + CELL // 2
-            y = pr * CELL + CELL // 2
-            pygame.draw.circle(self.screen, POWERED_COLOR if ghost.pacman_powered else YELLOW, (x, y), CELL // 2 - 2)
+            px = ox + int(pc * CELL)
+            py = int(pr * CELL)
+            pac_col = POWERED_COLOR if ghost.pacman_powered else YELLOW
+            pygame.draw.circle(self.screen, pac_col, (px, py), CELL // 2 - 2)
             label = self.small.render("P", True, BLACK)
-            self.screen.blit(label, (WIDTH + pc * CELL + 2, pr * CELL + 2))
-        txt = self.small.render(f"Ghost {self.debug_ghost_id} local map + belief heatmap  [0-6 to switch]", True, WHITE)
-        self.screen.blit(txt, (WIDTH + 4, ROWS * CELL + 6))
+            self.screen.blit(label, (px - 4, py - 6))
+            
+        # 11. HUD label
+        self.screen.set_clip(old_clip)  # Restore clip rect so HUD is not clipped!
+        
+        mode = "POWERED" if ghost.pacman_powered else ("HUNT" if ghost.known_pacman else "SEARCH")
+        fb = " [FALLBACK]" if ghost.in_fallback_mode else ""
+        txt = self.small.render(f"Ghost {self.debug_ghost_id} [{mode}{fb}]  [0-6 to switch]", True, WHITE)
+        self.screen.blit(txt, (ox + 4, ROWS * CELL + 6))
 
     def draw_overlay(self, msg, color=WHITE):
         overlay = pygame.Surface((WIDTH, ROWS * CELL), pygame.SRCALPHA)
