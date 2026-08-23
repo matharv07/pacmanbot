@@ -90,7 +90,12 @@ class Ghost:
         self.prev_pac_col: int = -1             #pacman's col on previous frame - belief map
         self.cbba_agent = CBBA_Agent(gid)       #CBBA auction agent for this ghost
         self.pos_history: deque = deque(maxlen=OSCILLATION_WINDOW)  #rolling position window for oscillation detection
-        self.belief_map = BeliefMap(gid, self.world, pacman_start=player_start)
+        p_start = None
+        if player_start:
+            import numpy as np
+            p_start = (float(np.float32(player_start[0])), float(np.float32(player_start[1])))
+        self.belief_map = BeliefMap(gid, self.world, pacman_start=p_start)
+        self.belief_map.init_full_topology(getattr(self.world, 'prm_graph', {}))
         self._proximity_channel_cache = None
         self._proximity_channel_frame = -1
         self._proximity_channel_target = None
@@ -563,10 +568,7 @@ class Ghost:
             self.prm_last_seen[n] = self.frame
             diffs.append(("prm_refresh", n))
         
-        # Feed observed PRM nodes into the belief map's incremental topology
-        if visible_prm:
-            self.belief_map.ingest_observed_nodes(visible_prm, getattr(self.world, 'prm_graph', {}))
-            
+
         diffs.extend(agent_diffs)
         if pacman_diff: diffs.append(pacman_diff)
         
@@ -586,7 +588,7 @@ class Ghost:
             
         self.belief_map.diffuse((float(self.y), float(self.x)))
         pac_pos = (float(pr), float(pc)) if pacman_in_los else None
-        self.belief_map.observe_clear(set(visible_prm), pac_pos)
+        self.belief_map.observe_clear((float(self.y), float(self.x)), pac_pos)
         
         # Cleanup eaten pellets from memory
         self.known_pellets = {p for p in self.known_pellets if p in getattr(self.world, 'pellets', [])}

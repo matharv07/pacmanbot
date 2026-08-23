@@ -202,7 +202,7 @@ class Player:
                 if len(path) >= 2:
                     return best_ghost_target, list(path[1:])
                     
-        targets = self.world.pellets + self.world.power_pellets
+        targets = [(t[1], t[0]) for t in self.world.pellets + self.world.power_pellets]
         dists = pathfinder.dijkstra_multi(self.world, start, targets)
         
         best_score = float('inf')
@@ -218,15 +218,16 @@ class Player:
                     if gd < 4:
                         danger += (4 - gd) * 15.0
             
-            weight = 0.5 if tgt in self.world.power_pellets else 1.5
+            orig_tgt = (tgt[1], tgt[0])
+            weight = 0.5 if orig_tgt in self.world.power_pellets else 1.5
             score = dist * weight + danger
             if score < best_score:
                 best_score = score
-                best_target = tgt
+                best_target = orig_tgt
                 best_path = path[1:]
                 
         if not best_target and targets:
-            best_target = targets[0]
+            best_target = (targets[0][1], targets[0][0])
             
         return best_target, best_path
 
@@ -723,25 +724,21 @@ class Game:
         
         pygame.draw.rect(self.screen, BLACK, (ox, 0, WIDTH, ROWS * CELL))
         
-        # Draw the continuous underlying map very dimly (fog of war context)
-        if hasattr(ghost, 'world') and ghost.world:
-            dim_surf = pygame.Surface((WIDTH, ROWS * CELL), pygame.SRCALPHA)
-            dim_surf.fill((0, 0, 0, 0))
-            for obs in ghost.world.obstacles:
-                # We can't easily change the obstacle color without overriding draw(), 
-                # so we draw it then overlay a dark rectangle to dim it.
-                obs.draw(dim_surf, CELL, offset_x=0)
-            # Make it 75% dark
-            dim_mask = pygame.Surface((WIDTH, ROWS * CELL), pygame.SRCALPHA)
-            dim_mask.fill((0, 0, 0, 190))
-            dim_surf.blit(dim_mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
-            self.screen.blit(dim_surf, (ox, 0))
-        
+
         # 1. draw Lidar Wall Hits (Point Cloud - Bright)
-        for py, px in ghost.lidar_memory:
-            hit_x = ox + int(px * CELL)
-            hit_y = int(py * CELL)
-            pygame.draw.rect(self.screen, (200, 200, 200), (hit_x-1, hit_y-1, 3, 3))
+        if len(ghost.lidar_memory) > 0:
+            if not hasattr(self, '_lidar_surf'):
+                self._lidar_surf = pygame.Surface((WIDTH, ROWS * CELL), pygame.SRCALPHA)
+                self._lidar_count = 0
+                
+            if len(ghost.lidar_memory) != self._lidar_count:
+                self._lidar_surf.fill((0, 0, 0, 0))
+                for py, px in ghost.lidar_memory:
+                    hit_x = int(px * CELL)
+                    hit_y = int(py * CELL)
+                    pygame.draw.rect(self._lidar_surf, (150, 150, 255), (hit_x, hit_y, 2, 2))
+                self._lidar_count = len(ghost.lidar_memory)
+            self.screen.blit(self._lidar_surf, (ox, 0))
             
         # 2. draw Known Pellets
         if hasattr(ghost, 'known_pellets'):
@@ -753,10 +750,15 @@ class Game:
             for px, py in ghost.known_power_pellets:
                 pygame.draw.circle(self.screen, WHITE, (int(ox + px * CELL), int(py * CELL)), 5)
             
-        # 4. fog-of-war PRM nodes
-        for n, last_seen in ghost.prm_last_seen.items():
-            if last_seen == -1:
-                pygame.draw.circle(self.screen, (30, 30, 30), (int(ox + n[1] * CELL), int(n[0] * CELL)), 3)
+        # 4. fog-of-war: all belief topology nodes (including wall-area grid nodes)
+        bm = ghost.belief_map
+        if bm._open_cells:
+            if not hasattr(self, '_prm_cache') or getattr(self, '_prm_cache_n', 0) != bm.n_nodes:
+                self._prm_cache = pygame.Surface((WIDTH, ROWS * CELL), pygame.SRCALPHA)
+                for n in bm._open_cells:
+                    pygame.draw.rect(self._prm_cache, (30, 30, 30), (int(n[1] * CELL), int(n[0] * CELL), 4, 4))
+                self._prm_cache_n = bm.n_nodes
+            self.screen.blit(self._prm_cache, (ox, 0))
                 
         # 5. continuous Belief Heatmap on PRM nodes
         bm = ghost.belief_map
@@ -764,18 +766,27 @@ class Game:
             probs = bm._b_flat.tolist()
             max_p = max(probs) if probs else 0.0
             if max_p > 1e-9:
+                if not hasattr(self, '_heat_cache'):
+                    self._heat_cache = {}
                 for (r, c), p in zip(bm._open_cells, probs):
                     if p < 0.001:
                         continue
                     t = min(1.0, p / max_p)
-                    red = int(t * 255)
-                    green = int((1.0 - t) * 40)
-                    blue = int((1.0 - t) * 210)
-                    alpha = int(40 + t * 140)
-                    s_r = int(3 + t * 4)
                     
-                    surf = pygame.Surface((s_r*2, s_r*2), pygame.SRCALPHA)
-                    pygame.draw.circle(surf, (red, green, blue, alpha), (s_r, s_r), s_r)
+                    # Discretize t into 32 levels to heavily hit the cache
+                    t_idx = int(t * 31)
+                    if t_idx not in self._heat_cache:
+                        t_d = t_idx / 31.0
+                        red = int(t_d * 255)
+                        green = int((1.0 - t_d) * 40)
+                        blue = int((1.0 - t_d) * 210)
+                        alpha = int(40 + t_d * 140)
+                        s_r = int(3 + t_d * 4)
+                        surf = pygame.Surface((s_r*2, s_r*2), pygame.SRCALPHA)
+                        pygame.draw.circle(surf, (red, green, blue, alpha), (s_r, s_r), s_r)
+                        self._heat_cache[t_idx] = (surf, s_r)
+                        
+                    surf, s_r = self._heat_cache[t_idx]
                     self.screen.blit(surf, (ox + int(c * CELL) - s_r, int(r * CELL) - s_r))
                     
         # 6. CBBA task targets
@@ -837,7 +848,7 @@ class Game:
     def run(self):
         while True:
             self.handle_events()
-            for _ in range(SIM_SPEEDUP):
+            for _ in range(1):
                 self.update()
             self.screen.fill(BLACK)
             self.draw_grid()
@@ -852,6 +863,7 @@ class Game:
                 self.draw_overlay(f"GAME OVER   SCORE: {self.player.score}", RED)
             pygame.display.flip()
             self.clock.tick(FPS)
+        pygame.quit()
 
 if __name__ == "__main__":
     Game().run()

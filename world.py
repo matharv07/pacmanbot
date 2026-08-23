@@ -126,7 +126,54 @@ class World:
             return False
         return True
 
+    def _compile_passable_grids(self):
+        import cv2
+        res = 0.1
+        cols = int(math.ceil(self.width / res))
+        rows = int(math.ceil(self.height / res))
+        
+        def rasterize_collided(radius):
+            grid = np.zeros((rows, cols), dtype=np.uint8)
+            for obs in self.obstacles:
+                capsules = obs.capsules if isinstance(obs, CurvedWall) else [obs]
+                for c in capsules:
+                    t_res = (c.r + radius) / res
+                    thick = max(1, int(round(2 * t_res)))
+                    pt1 = (int(c.x1 / res), int(c.y1 / res))
+                    pt2 = (int(c.x2 / res), int(c.y2 / res))
+                    cv2.line(grid, pt1, pt2, 1, thick)
+                    r_px = int(round(t_res))
+                    if r_px > 0:
+                        cv2.circle(grid, pt1, r_px, 1, -1)
+                        cv2.circle(grid, pt2, r_px, 1, -1)
+            return grid.astype(bool)
+            
+        self._grid_0_0 = ~rasterize_collided(0.0)
+        self._grid_0_4 = ~rasterize_collided(0.4)
+
     def batch_is_passable(self, px, py, radius=0):
+        if hasattr(self, '_grid_0_0'):
+            res = 0.1
+            cols = self._grid_0_0.shape[1]
+            rows = self._grid_0_0.shape[0]
+            cx = (px / res).astype(np.int32)
+            cy = (py / res).astype(np.int32)
+            valid = (cx >= 0) & (cx < cols) & (cy >= 0) & (cy < rows)
+            
+            if abs(radius - 0.4) < 1e-4:
+                grid = self._grid_0_4
+            elif radius < 1e-4:
+                grid = self._grid_0_0
+            else:
+                grid = None
+                
+            if grid is not None:
+                ans = np.zeros(len(px), dtype=bool)
+                safe_cx = cx[valid]
+                safe_cy = cy[valid]
+                ans[valid] = grid[safe_cy, safe_cx]
+                return ans
+
         out_of_bounds = (px - radius < 0) | (px + radius > self.width) | (py - radius < 0) | (py + radius > self.height)
         if len(self.compiled_segments) == 0:
             return ~out_of_bounds
@@ -295,11 +342,27 @@ class World:
             px = (grid_x.ravel() * eval_res) + (eval_res / 2)
             py = (grid_y.ravel() * eval_res) + (eval_res / 2)
 
+            import cv2
+            
+            def get_conn_grid(rad_add):
+                grid_cv = np.zeros((eval_rows, eval_cols), dtype=np.uint8)
+                for obs in self.obstacles:
+                    capsules = obs.capsules if isinstance(obs, CurvedWall) else [obs]
+                    for c in capsules:
+                        t_res = (c.r + rad_add) / eval_res
+                        thick = max(1, int(round(2 * t_res)))
+                        pt1 = (int(c.x1 / eval_res), int(c.y1 / eval_res))
+                        pt2 = (int(c.x2 / eval_res), int(c.y2 / eval_res))
+                        cv2.line(grid_cv, pt1, pt2, 1, thick)
+                        r_px = int(round(t_res))
+                        if r_px > 0:
+                            cv2.circle(grid_cv, pt1, r_px, 1, -1)
+                            cv2.circle(grid_cv, pt2, r_px, 1, -1)
+                return ~grid_cv.astype(bool)
+
             # Carve openings to connect all regions
             for _ in range(200):
-                dist_sq, r = self._points_to_segments_dist_sq(px, py)
-                conn_blocked_mask = np.any(dist_sq <= (r + 0.35)**2, axis=1)
-                grid = (~conn_blocked_mask).reshape((eval_rows, eval_cols))
+                grid = get_conn_grid(0.35)
                 labeled_array, num_features = scipy.ndimage.label(grid, structure=np.ones((3,3)))
                 
                 if num_features <= 1:
@@ -353,9 +416,7 @@ class World:
                     self._compile_obstacles()
             
             # Re-evaluate final connected space
-            dist_sq, r = self._points_to_segments_dist_sq(px, py)
-            conn_blocked_mask = np.any(dist_sq <= (r + 0.35)**2, axis=1)
-            grid = (~conn_blocked_mask).reshape((eval_rows, eval_cols))
+            grid = get_conn_grid(0.35)
             labeled_array, num_features = scipy.ndimage.label(grid, structure=np.ones((3,3)))
             
             if num_features > 0:
@@ -364,7 +425,7 @@ class World:
                 largest_component = component_sizes.argmax()
                 if component_sizes[largest_component] >= target_area_eval:
                     in_largest = (labeled_array == largest_component).ravel()
-                    pellet_safe_mask = ~np.any(dist_sq <= (r + 0.40)**2, axis=1)
+                    pellet_safe_mask = get_conn_grid(0.40).ravel()
                     valid_mask = in_largest & pellet_safe_mask                    
                     px_valid = px[valid_mask]
                     py_valid = py[valid_mask]
@@ -416,14 +477,23 @@ class World:
         self.prm_nodes = list(zip(y_cands[passable][:n_samples], x_cands[passable][:n_samples]))
         
         for p in self.pellets + self.power_pellets:
-            yx_p = (p[1], p[0])
+            yx_p = (float(p[1]), float(p[0]))
             if yx_p not in self.prm_nodes:
                 self.prm_nodes.append(yx_p)
                 
+        for p in self.safe_area:
+            # pacman.py snaps player start to ints, so we must inject the exact integer coordinates
+            yx_p = (float(int(p[1])), float(int(p[0])))
+            if yx_p not in self.prm_nodes:
+                self.prm_nodes.append(yx_p)
+                
+        # Lock precision to float32 so dictionary hashing matches numpy array queries from ghosts
+        nodes_arr = np.array(self.prm_nodes, dtype=np.float32)
+        self.prm_nodes = [tuple(row) for row in nodes_arr]
+        
         self.prm_graph = {n: [] for n in self.prm_nodes}
         if not self.prm_nodes: return
         
-        nodes_arr = np.array(self.prm_nodes, dtype=np.float32)
         import scipy.spatial
         tree = scipy.spatial.cKDTree(nodes_arr)
         pairs = list(tree.query_pairs(r=7.0))
@@ -452,13 +522,34 @@ class World:
                 for k, is_valid in enumerate(los_valid):
                     if is_valid:
                         n1, n2 = self.prm_nodes[p1_idx[k]], self.prm_nodes[p2_idx[k]]
-                        self.prm_graph[n1].append(n2)
-                        self.prm_graph[n2].append(n1)
-        # Cache numpy arrays for vectorized per-frame operations in lidar_sweep
+                        dist_val = float(dist[k])
+                        self.prm_graph[n1].append((dist_val, n2))
+                        self.prm_graph[n2].append((dist_val, n1))
         self.prm_nodes_arr = np.array(self.prm_nodes, dtype=np.float32) if self.prm_nodes else np.empty((0, 2), dtype=np.float32)
         self._update_pellet_arrays()
-    
-    def random_open_point(self):
+        self._compile_passable_grids()
+        self._compute_apsp()
+        
+    def _compute_apsp(self):
+        import scipy.sparse as sp
+        from scipy.sparse import csgraph
+        n = len(self.prm_nodes)
+        if n == 0:
+            self.apsp = np.zeros((0,0))
+            self.prm_node_idx = {}
+            return
+        self.prm_node_idx = {n: i for i, n in enumerate(self.prm_nodes)}
+        row, col, data = [], [], []
+        for i, n1 in enumerate(self.prm_nodes):
+            for cost, n2 in self.prm_graph.get(n1, []):
+                j = self.prm_node_idx.get(n2)
+                if j is not None:
+                    row.append(i)
+                    col.append(j)
+                    data.append(cost)
+        matrix = sp.csr_matrix((data, (row, col)), shape=(n, n))
+        print("Computing APSP for PRM graph...")
+        self.apsp, self.apsp_pred = csgraph.shortest_path(matrix, directed=False, return_predecessors=True)
         return random.choice(self.safe_area)
 
 if __name__ == '__main__':

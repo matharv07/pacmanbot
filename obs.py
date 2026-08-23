@@ -58,18 +58,18 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int = None, cols: int = 
     
     #channel 4: belief map — project flat probability onto grid via PRM nodes
     bm = ghost.belief_map
-    if hasattr(bm, '_b_flat') and bm._initialised and bm._open_cells:
-        for i, (r, c) in enumerate(bm._open_cells):
-            ri, ci = int(r), int(c)
-            if 0 <= ri < rows and 0 <= ci < cols and i < len(bm._b_flat):
-                out[4, ri, ci] = max(out[4, ri, ci], bm._b_flat[i])
-    
-    #channel 5: safety map — project flat safety onto grid via PRM nodes
-    if hasattr(bm, '_safety') and bm._open_cells:
-        for i, (r, c) in enumerate(bm._open_cells):
-            ri, ci = int(r), int(c)
-            if 0 <= ri < rows and 0 <= ci < cols and i < len(bm._safety):
-                out[5, ri, ci] = max(out[5, ri, ci], bm._safety[i])
+    if hasattr(bm, '_open_arr') and len(bm._open_arr) > 0:
+        r_arr = bm._open_arr[:, 0].astype(np.int32)
+        c_arr = bm._open_arr[:, 1].astype(np.int32)
+        
+        if hasattr(bm, '_b_flat') and bm._initialised:
+            valid = (r_arr >= 0) & (r_arr < rows) & (c_arr >= 0) & (c_arr < cols) & (np.arange(len(r_arr)) < len(bm._b_flat))
+            np.maximum.at(out[4], (r_arr[valid], c_arr[valid]), bm._b_flat[valid])
+        
+        #channel 5: safety map — project flat safety onto grid via PRM nodes
+        if hasattr(bm, '_safety'):
+            valid = (r_arr >= 0) & (r_arr < rows) & (c_arr >= 0) & (c_arr < cols) & (np.arange(len(r_arr)) < len(bm._safety))
+            np.maximum.at(out[5], (r_arr[valid], c_arr[valid]), bm._safety[valid])
     
     #gaussian blob position encoding — preserves sub-cell precision for continuous coordinates
     _BLOB_SIGMA = 0.6
@@ -99,14 +99,21 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int = None, cols: int = 
                 _place_blob(out[ch], float(r), float(c))
     
     #channel 14: staleness from prm_last_seen dict
-    stale_ch = np.zeros((rows, cols), dtype=np.float32)
-    for node, last_seen in ghost.prm_last_seen.items():
-        ri, ci = int(node[0]), int(node[1])
-        if 0 <= ri < rows and 0 <= ci < cols:
-            if last_seen < 0:
-                stale_ch[ri, ci] = 1.0  # never seen = max staleness
-            else:
-                stale_ch[ri, ci] = min(ghost.frame - last_seen, 200) / 200.0
+    stale_ch = np.ones((rows, cols), dtype=np.float32)  # default max staleness
+    if ghost.prm_last_seen:
+        nodes = np.array(list(ghost.prm_last_seen.keys()))
+        last_seen = np.array(list(ghost.prm_last_seen.values()))
+        ri = nodes[:, 0].astype(np.int32)
+        ci = nodes[:, 1].astype(np.int32)
+        
+        valid = (ri >= 0) & (ri < rows) & (ci >= 0) & (ci < cols)
+        v_ri, v_ci, v_ls = ri[valid], ci[valid], last_seen[valid]
+        
+        seen_mask = v_ls >= 0
+        stale_vals = np.clip(ghost.frame - v_ls[seen_mask], 0, 200) / 200.0
+        
+        stale_ch[v_ri[seen_mask], v_ci[seen_mask]] = stale_vals
+    
     out[14] = stale_ch
     out[15] = recent_noms[:rows, :cols]
     return out

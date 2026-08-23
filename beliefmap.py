@@ -115,29 +115,59 @@ class BeliefMap:
         self._topology_dirty = True
         return True
 
-    def ingest_observed_nodes(self, observed_nodes: list, world_prm_graph: dict):
+
+
+    def init_full_topology(self, world_prm_graph: dict):
+        """Build a completely uniform, wall-agnostic belief topology.
+
+        To prevent the ghost from having implicit knowledge of the map's layout,
+        the belief map is completely decoupled from the navigation PRM graph.
+        We build a pure, uniform grid of nodes spaced 1.0 units apart across
+        the entire map. This ensures probability diffuses equally in all
+        directions, completely blind to obstacles.
         """
-        Called by the ghost after lidar sweep to feed newly observed PRM nodes
-        and their world-level edges into the belief map's incremental topology.
-        
-        Only edges between two *observed* nodes are added — we never import
-        edges to nodes we haven't seen.
-        """
-        any_new = False
-        for node in observed_nodes:
-            if self._add_node(node):
-                any_new = True
-        # Add edges between observed nodes
-        if any_new:
-            for node in observed_nodes:
-                if node in world_prm_graph:
-                    for nbr in world_prm_graph[node]:
-                        if nbr in self._open_idx_map:
-                            if nbr not in self._neighbours.get(node, []):
-                                self._neighbours.setdefault(node, []).append(nbr)
-                            if node not in self._neighbours.get(nbr, []):
-                                self._neighbours.setdefault(nbr, []).append(node)
-            self._topology_dirty = True
+        from scipy.spatial import cKDTree
+
+        BELIEF_GRID_STEP = 0.8
+        grid_nodes = []
+        y = BELIEF_GRID_STEP / 2.0
+        while y < self.rows:
+            x = BELIEF_GRID_STEP / 2.0
+            while x < self.cols:
+                node = (float(y), float(x))
+                if node not in self._open_idx_map:
+                    self._open_idx_map[node] = len(self._open_cells)
+                    self._open_cells.append(node)
+                    self.n_nodes += 1
+                    grid_nodes.append(node)
+                x += BELIEF_GRID_STEP
+            y += BELIEF_GRID_STEP
+
+        if grid_nodes:
+            new_nodes_arr = np.array(grid_nodes, dtype=np.float32)
+            if self._b_flat is None or len(self._b_flat) == 0:
+                self._b_flat = np.zeros(len(grid_nodes), dtype=np.float32)
+                self._b_flat[0] = 1.0
+                self._safety = np.ones(len(grid_nodes), dtype=np.float32)
+                self._open_arr = new_nodes_arr
+            else:
+                self._b_flat = np.concatenate([self._b_flat, np.zeros(len(grid_nodes), dtype=np.float32)])
+                self._safety = np.concatenate([self._safety, np.ones(len(grid_nodes), dtype=np.float32)])
+                self._open_arr = np.vstack([self._open_arr, new_nodes_arr])
+
+        # Connect grid nodes to their neighbours (8-way connectivity)
+        CONNECT_RADIUS = BELIEF_GRID_STEP * 1.5
+        if len(self._open_arr) > 0:
+            tree = cKDTree(self._open_arr)
+            pairs = tree.query_pairs(r=CONNECT_RADIUS)
+            for node in self._open_cells:
+                self._neighbours[node] = []
+            for i, j in pairs:
+                ni, nj = self._open_cells[i], self._open_cells[j]
+                self._neighbours[ni].append(nj)
+                self._neighbours[nj].append(ni)
+
+        self._topology_dirty = True
 
     def _closest_node(self, pos: tuple):
         if not self._open_cells: return -1
@@ -188,20 +218,66 @@ class BeliefMap:
         self._normalise()
         self._payload_dirty = True
 
-    def observe_clear(self, visible_nodes: set, pacman_pos=None):
+
+    def observe_clear(self, ghost_pos: tuple, pacman_pos=None):
         self._ensure_initialised()
-        if not visible_nodes or self._open_arr.size == 0:
+        if self._open_arr.size == 0:
             return
-        # Only clear nodes we actually have in our topology
-        idxs = []
-        for node in visible_nodes:
-            idx = self._open_idx_map.get(node)
-            if idx is not None:
-                if pacman_pos is not None and abs(node[0] - pacman_pos[0]) < 0.1 and abs(node[1] - pacman_pos[1]) < 0.1:
-                    continue
-                idxs.append(idx)
-        if not idxs: return
-        self._b_flat[idxs] = 0.0
+            
+        MAX_VISION = 15.0
+        g_arr = np.array(ghost_pos, dtype=np.float32)
+        dists = np.hypot(self._open_arr[:, 0] - g_arr[0], self._open_arr[:, 1] - g_arr[1])
+        close_mask = dists <= MAX_VISION
+        if not np.any(close_mask):
+            return
+            
+        close_nodes = self._open_arr[close_mask]
+        close_idxs = np.where(close_mask)[0]
+        
+        # 1. First, check which nearby nodes are actually walls
+        is_passable = self.world.batch_is_passable(close_nodes[:, 1], close_nodes[:, 0], radius=0.1)
+        
+        # 2. For nodes that are PASSABLE, check line-of-sight to clear them
+        passable_nodes = close_nodes[is_passable]
+        passable_idxs = close_idxs[is_passable]
+        
+        if len(passable_nodes) > 0:
+            is_los = self.world.batch_line_of_sight(ghost_pos, np.column_stack((passable_nodes[:, 1], passable_nodes[:, 0])), radius=0.0)
+            
+            clear_idxs = []
+            for i, vis in enumerate(is_los):
+                if vis:
+                    node = passable_nodes[i]
+                    if pacman_pos is not None and abs(node[0] - pacman_pos[0]) < 1.0 and abs(node[1] - pacman_pos[1]) < 1.0:
+                        continue
+                    clear_idxs.append(passable_idxs[i])
+                    
+            if clear_idxs:
+                self._b_flat[clear_idxs] = 0.0
+                
+        # 3. For nodes that are IMPASSABLE (walls), permanently remove their edges to block diffusion
+        impassable_nodes = close_nodes[~is_passable]
+        impassable_idxs = close_idxs[~is_passable]
+        
+        if len(impassable_nodes) > 0:
+            if not hasattr(self, '_disabled_wall_nodes'):
+                self._disabled_wall_nodes = set()
+                
+            disabled_any = False
+            for i, node_arr in enumerate(impassable_nodes):
+                node = (float(node_arr[0]), float(node_arr[1]))
+                if node not in self._disabled_wall_nodes:
+                    self._disabled_wall_nodes.add(node)
+                    disabled_any = True
+                    # Remove edges from this node and to this node
+                    old_nbrs = self._neighbours.get(node, [])
+                    self._neighbours[node] = []
+                    for nbr in old_nbrs:
+                        if node in self._neighbours[nbr]:
+                            self._neighbours[nbr].remove(node)
+            
+            if disabled_any:
+                self._topology_dirty = True
         self._normalise()
 
     def diffuse(self, ghost_pos: tuple):
