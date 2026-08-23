@@ -137,6 +137,16 @@ def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = N_POWER, ran
         pr, pc = pr[valid], pc[valid]
         valid_mask = (grid[pr, pc] == EMPTY) | (grid[pr, pc] == PELLET)
         grid[pr[valid_mask], pc[valid_mask]] = POWER
+        
+    # Resync continuous world lists to the finalized snapped grid
+    world.pellets = []
+    world.power_pellets = []
+    for r in range(rows):
+        for c in range(cols):
+            if grid[r][c] == PELLET: world.pellets.append((float(c) + 0.5, float(r) + 0.5))
+            elif grid[r][c] == POWER: world.power_pellets.append((float(c) + 0.5, float(r) + 0.5))
+    world._update_pellet_arrays()
+    
     pr, pc = int(world.safe_area[0][1]), int(world.safe_area[0][0])
     return grid, (pr, pc), world
 
@@ -170,31 +180,8 @@ class Player:
         self.next_dir = d
 
     def _get_ghost_maps(self, ghosts):
-        """Geodesic distance maps from each living ghost via scipy dijkstra."""
-        ghost_maps = []
-        rows, cols = len(self.grid), len(self.grid[0])
-        if pathfinder._SCIPY_AVAILABLE:
-            cache = pathfinder.get_scipy_graph(self.grid)
-            if cache is not None:
-                graph, open_cells, cell_to_idx = cache
-                g_indices = []
-                for g in ghosts.values():
-                    if not g.dead:
-                        gr = max(0, min(rows - 1, int(round(g.y))))
-                        gc = max(0, min(cols - 1, int(round(g.x))))
-                        if (gr, gc) in cell_to_idx:
-                            g_indices.append(cell_to_idx[(gr, gc)])
-                if g_indices:
-                    dist_matrix = pathfinder.scipy_dijkstra(csgraph=graph, directed=False, indices=g_indices)
-                    if dist_matrix.ndim == 1:
-                        dist_matrix = dist_matrix[np.newaxis, :]
-                    r_coords = np.array([c[0] for c in open_cells])
-                    c_coords = np.array([c[1] for c in open_cells])
-                    for i in range(len(g_indices)):
-                        g_map = np.full((rows, cols), np.inf)
-                        g_map[r_coords, c_coords] = dist_matrix[i]
-                        ghost_maps.append(g_map)
-        return ghost_maps
+        """Geodesic distance maps from each living ghost — unused in current pipeline."""
+        return []
 
     def _pick_target(self, ghosts):
         """PRM continuous scoring to pick the best pellet (or ghost when powered) target."""
@@ -423,6 +410,14 @@ class Player:
                 if cell in (PELLET, POWER):
                     self.grid[cr][cc] = EMPTY
                     self.score += 10 if cell == PELLET else 50
+                    pt = (float(cc) + 0.5, float(cr) + 0.5)
+                    if self.world:
+                        if cell == PELLET and pt in self.world.pellets:
+                            self.world.pellets.remove(pt)
+                            self.world._update_pellet_arrays()
+                        elif cell == POWER and pt in self.world.power_pellets:
+                            self.world.power_pellets.remove(pt)
+                            self.world._update_pellet_arrays()
                     if cell == POWER:
                         self.powered = True
                         self.power_timer = 40
@@ -515,7 +510,7 @@ class Game:
             load_rl_model()
 
     def pellets_left(self):
-        return sum(1 for r in self.grid for c in r if c in (PELLET, POWER))
+        return int(np.sum(np.isin(self.grid, (PELLET, POWER))))
 
     def handle_events(self):
         global AUTO_MODE, RL_MODE
@@ -616,7 +611,7 @@ class Game:
                         if tasks:
                             all_targets = [t.target_pos for t in tasks]
                             from pathfinder import dijkstra_multi
-                            dists = dijkstra_multi(g.grid, (g.y, g.x), all_targets)
+                            dists = dijkstra_multi(g.world, (g.y, g.x), all_targets)
                             h_dists.update(dists)
                         g.cbba_agent._phase1(g, all_tasks, h_dists)
         self.player.update(self.ghosts)
@@ -728,20 +723,34 @@ class Game:
         
         pygame.draw.rect(self.screen, BLACK, (ox, 0, WIDTH, ROWS * CELL))
         
-        # 1. draw Lidar Wall Hits (Point Cloud)
+        # Draw the continuous underlying map very dimly (fog of war context)
+        if hasattr(ghost, 'world') and ghost.world:
+            dim_surf = pygame.Surface((WIDTH, ROWS * CELL), pygame.SRCALPHA)
+            dim_surf.fill((0, 0, 0, 0))
+            for obs in ghost.world.obstacles:
+                # We can't easily change the obstacle color without overriding draw(), 
+                # so we draw it then overlay a dark rectangle to dim it.
+                obs.draw(dim_surf, CELL, offset_x=0)
+            # Make it 75% dark
+            dim_mask = pygame.Surface((WIDTH, ROWS * CELL), pygame.SRCALPHA)
+            dim_mask.fill((0, 0, 0, 190))
+            dim_surf.blit(dim_mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+            self.screen.blit(dim_surf, (ox, 0))
+        
+        # 1. draw Lidar Wall Hits (Point Cloud - Bright)
         for py, px in ghost.lidar_memory:
             hit_x = ox + int(px * CELL)
             hit_y = int(py * CELL)
-            pygame.draw.rect(self.screen, (200, 200, 200), (hit_x-1, hit_y-1, 2, 2))
+            pygame.draw.rect(self.screen, (200, 200, 200), (hit_x-1, hit_y-1, 3, 3))
             
         # 2. draw Known Pellets
         if hasattr(ghost, 'known_pellets'):
-            for py, px in ghost.known_pellets:
-                pygame.draw.rect(self.screen, YELLOW, (int(ox + px * CELL) - 1, int(py * CELL) - 1, 2, 2))
+            for px, py in ghost.known_pellets:
+                pygame.draw.circle(self.screen, WHITE, (int(ox + px * CELL), int(py * CELL)), 2)
                 
         # 3. draw Known Power Pellets
         if hasattr(ghost, 'known_power_pellets'):
-            for py, px in ghost.known_power_pellets:
+            for px, py in ghost.known_power_pellets:
                 pygame.draw.circle(self.screen, WHITE, (int(ox + px * CELL), int(py * CELL)), 5)
             
         # 4. fog-of-war PRM nodes

@@ -46,11 +46,19 @@ class BeliefMap:
      
     Pacman in non-powered mode should generally move towards the safest cell in its visible neighbourhood, which we can check each frame.
     In powered mode, we can use the same safety map but invert it to get an "attraction" map and move towards the most attractive cell to hunt ghosts.
+    
+    IMPORTANT — Knowledge constraints (README rule #4):
+    The belief map starts knowing ONLY Pacman's initial (t=0) position.
+    Topology (navigable nodes and edges) is built incrementally from the
+    ghost's own observations (prm_last_seen).  At t=0 the map contains a
+    single node (pacman_start) with probability 1.0.  As the ghost explores,
+    newly observed PRM nodes are added and the probability diffuses over the
+    growing graph.
     """
 
     def __init__(self, gid: int, world, pacman_start: Optional[tuple] = None):
         self.gid = gid
-        self.world = world
+        self.world = world           # kept for is_passable checks only
         self.rows = world.height
         self.cols = world.width
         self._initialised = False
@@ -58,29 +66,78 @@ class BeliefMap:
         self.last_known_dir: tuple = (0, 0)
         self.frames_since_sighting: int = 9999
         self._pacman_start: Optional[tuple] = pacman_start
-        self._open_cells = world.prm_nodes
-        self._neighbours = world.prm_graph
-        
-        self.n_nodes = len(self._open_cells)
-        self._open_arr = np.array(self._open_cells, dtype=np.float32)
-        self._open_idx_map = {n: i for i, n in enumerate(self._open_cells)}
-        self._b_flat = np.zeros(self.n_nodes, dtype=np.float32)
-        
+
+        # --- Incremental topology: starts empty, grows from observations ---
+        self._open_cells: list = []
+        self._neighbours: dict = {}
+        self._open_idx_map: dict = {}
+        self.n_nodes = 0
+        self._open_arr = np.empty((0, 2), dtype=np.float32)
+        self._b_flat = np.zeros(0, dtype=np.float32)
+
         self._topology_dirty = True
         self._nbr_idx = np.empty((0, 0), dtype=np.int32)
         self._nbr_count = np.empty((0,), dtype=np.int32)
-        self._compute_topology()
-        
-        #safetyMap: _safety[i] contains [0, 1] mapping to prm_nodes
-        self._safety = np.ones(self.n_nodes, dtype=np.float32)
+        self._graph = sp.csr_matrix((0, 0), dtype=np.float32)
+
+        #safetyMap: _safety[i] contains [0, 1] mapping to known nodes
+        self._safety = np.ones(0, dtype=np.float32)
+
+        # Seed with pacman_start if known
+        if pacman_start is not None:
+            self._add_node(pacman_start)
         self._last_ghost_snapshot: dict = {}
         self._ghost_last_seen: dict[int, int] = {}
-        self._topology_dirty = False
         self._dirty_cells: set = set()
         self._last_safety_frame: int = -999
         self._last_powered: bool = False
         self._payload_cache: dict | None = None
         self._payload_dirty: bool = True
+
+    # --- Incremental node management ---
+
+    def _add_node(self, node: tuple) -> bool:
+        """Add a single node to the topology. Returns True if newly added."""
+        if node in self._open_idx_map:
+            return False
+        idx = len(self._open_cells)
+        self._open_cells.append(node)
+        self._open_idx_map[node] = idx
+        self._neighbours[node] = []
+        self.n_nodes = len(self._open_cells)
+        # Extend arrays
+        self._b_flat = np.append(self._b_flat, 0.0).astype(np.float32)
+        self._safety = np.append(self._safety, 1.0).astype(np.float32)
+        if len(self._open_cells) == 1:
+            self._open_arr = np.array([node], dtype=np.float32)
+        else:
+            self._open_arr = np.vstack([self._open_arr, np.array([node], dtype=np.float32)])
+        self._topology_dirty = True
+        return True
+
+    def ingest_observed_nodes(self, observed_nodes: list, world_prm_graph: dict):
+        """
+        Called by the ghost after lidar sweep to feed newly observed PRM nodes
+        and their world-level edges into the belief map's incremental topology.
+        
+        Only edges between two *observed* nodes are added — we never import
+        edges to nodes we haven't seen.
+        """
+        any_new = False
+        for node in observed_nodes:
+            if self._add_node(node):
+                any_new = True
+        # Add edges between observed nodes
+        if any_new:
+            for node in observed_nodes:
+                if node in world_prm_graph:
+                    for nbr in world_prm_graph[node]:
+                        if nbr in self._open_idx_map:
+                            if nbr not in self._neighbours.get(node, []):
+                                self._neighbours.setdefault(node, []).append(nbr)
+                            if node not in self._neighbours.get(nbr, []):
+                                self._neighbours.setdefault(nbr, []).append(node)
+            self._topology_dirty = True
 
     def _closest_node(self, pos: tuple):
         if not self._open_cells: return -1
@@ -135,44 +192,45 @@ class BeliefMap:
         self._ensure_initialised()
         if not visible_nodes or self._open_arr.size == 0:
             return
-        vis_arr = np.array(list(visible_nodes), dtype=np.float32)
-        if pacman_pos is not None:
-            keep = ~((np.abs(vis_arr[:, 0] - pacman_pos[0]) < 0.1) & (np.abs(vis_arr[:, 1] - pacman_pos[1]) < 0.1))
-            vis_arr = vis_arr[keep]
-        if vis_arr.size == 0:
-            return
-        # Find indices of all visible nodes
-        idxs = [self._open_idx_map.get((r, c)) for r, c in zip(vis_arr[:, 0], vis_arr[:, 1])]
-        idxs = [i for i in idxs if i is not None]
+        # Only clear nodes we actually have in our topology
+        idxs = []
+        for node in visible_nodes:
+            idx = self._open_idx_map.get(node)
+            if idx is not None:
+                if pacman_pos is not None and abs(node[0] - pacman_pos[0]) < 0.1 and abs(node[1] - pacman_pos[1]) < 0.1:
+                    continue
+                idxs.append(idx)
         if not idxs: return
         self._b_flat[idxs] = 0.0
         self._normalise()
 
     def diffuse(self, ghost_pos: tuple):
-        if self._dirty_cells:
-            self._rebuild_topology()
-            self._dirty_cells.clear()
+        if self._topology_dirty:
+            self._compute_topology()
             self._topology_dirty = False
         self._ensure_initialised()
         self.frames_since_sighting = min(self.frames_since_sighting + 1, 9999)
-        self._uniform_diffuse()
-        if self.last_known_pos is not None:
-            self._momentum_diffuse()
-        self._normalise()
+        if self.n_nodes > 0:
+            self._uniform_diffuse()
+            if self.last_known_pos is not None:
+                self._momentum_diffuse()
+            self._normalise()
 
     def merge(self, sender_gid: int, payload: dict, frame: int):     #P(c | self, sender) = P(c | self)^(1−conf) x P(c | sender)^conf
         self._ensure_initialised()
         sender_fss = payload.get("fss", 9999)
         cells: dict = payload.get("cells", {})
-        if not cells or self._open_arr.size == 0:
+        if not cells or self.n_nodes == 0:
             return
         confidence = max(MIN_CONFIDENCE, math.exp(-sender_fss / TAU_RECENCY))
-        n = len(self._open_arr)
+        n = self.n_nodes
         s_flat = np.full(n, COMPRESS_THRESHOLD / 2.0, dtype=np.float32)
         
         idxs = []
         vals = []
         for pt, v in cells.items():
+            # If sender mentions a node we haven't seen yet, skip it
+            # (we can't reason about topology we don't know)
             idx = self._open_idx_map.get(pt)
             if idx is not None:
                 idxs.append(idx)
@@ -234,8 +292,8 @@ class BeliefMap:
     def update_safety_map(self, known_agents: dict, current_frame: int, powered: bool = False, hunt_mode: str = "blend"):
         new_snapshot = {gid: pos for gid, pos in known_agents.items() if pos != "UNKNOWN"}
         positions_changed = (new_snapshot != self._last_ghost_snapshot)
-        mode_changed = (powered != getattr(self, "_last_powered", None))
-        due = (current_frame - getattr(self, "_last_safety_frame", -999) >= SAFETY_RECOMPUTE_EVERY)
+        mode_changed = (powered != self._last_powered)
+        due = (current_frame - self._last_safety_frame >= SAFETY_RECOMPUTE_EVERY)
         if not (positions_changed or mode_changed or due):
             return
         self._last_ghost_snapshot = new_snapshot
@@ -244,7 +302,7 @@ class BeliefMap:
         for gid, pos in known_agents.items():
             if pos != "UNKNOWN":
                 self._ghost_last_seen[gid] = current_frame
-        n_open = len(self._open_cells)
+        n_open = self.n_nodes
         if n_open == 0:
             return
         known_positions: list[tuple] = []
@@ -269,22 +327,27 @@ class BeliefMap:
                 starts.append(idx)
                 weights.append(weight)
         
-        for start_idx, weight in zip(starts, weights):
-            dist_flat = csgraph.shortest_path(self._graph, directed=False, indices=start_idx, unweighted=True)
-            mask_flat = dist_flat <= cutoff_steps
-            contrib_vals = weight * np.exp(-(dist_flat[mask_flat] ** 2) / (2.0 * sigma ** 2))
-            scores[mask_flat] += contrib_vals
-            
-            if powered:
-                proximal[mask_flat] = np.maximum(proximal[mask_flat], contrib_vals)
+        # Batch all ghost indices into a single multi-source Dijkstra call
+        if starts and self._graph.shape[0] > 0:
+            dist_matrix = csgraph.dijkstra(self._graph, directed=False, indices=starts, unweighted=False, limit=cutoff_steps)
+            if dist_matrix.ndim == 1:
+                dist_matrix = dist_matrix[np.newaxis, :]
+            for i, weight in enumerate(weights):
+                dist_flat = dist_matrix[i]
+                mask_flat = dist_flat <= cutoff_steps
+                contrib_vals = weight * np.exp(-(dist_flat[mask_flat] ** 2) / (2.0 * sigma ** 2))
+                scores[mask_flat] += contrib_vals
+                if powered:
+                    proximal[mask_flat] = np.maximum(proximal[mask_flat], contrib_vals)
+
         if not powered:
-            prior = PRIOR_UNIFORM_WT / n_open
-            flat_unknown = n_unknown * (UNSEEN_GHOST_PRIOR / n_open)
+            prior = PRIOR_UNIFORM_WT / max(n_open, 1)
+            flat_unknown = n_unknown * (UNSEEN_GHOST_PRIOR / max(n_open, 1))
             scores += prior + flat_unknown
             max_score = np.max(scores)
             if max_score < MIN_SAFETY:
                 max_score = MIN_SAFETY
-            self._safety = 1.0 - (scores / max_score)
+            self._safety[:n_open] = 1.0 - (scores / max_score)
         else:
             max_crowd = np.max(scores)
             if max_crowd < MIN_SAFETY: max_crowd = MIN_SAFETY
@@ -293,119 +356,60 @@ class BeliefMap:
             c_norm = scores / max_crowd
             p_norm = proximal / max_prox
             if hunt_mode == "proximal":
-                self._safety = p_norm
+                self._safety[:n_open] = p_norm
             elif hunt_mode == "crowd":
-                self._safety = c_norm
+                self._safety[:n_open] = c_norm
             else:
-                self._safety = ((1.0 - HUNT_CROWD_WEIGHT) * p_norm + HUNT_CROWD_WEIGHT * c_norm)
+                self._safety[:n_open] = ((1.0 - HUNT_CROWD_WEIGHT) * p_norm + HUNT_CROWD_WEIGHT * c_norm)
 
     def safety_at(self, pos: tuple) -> float:
         idx = self._closest_node(pos)
-        if idx >= 0:
+        if idx >= 0 and idx < len(self._safety):
             return float(self._safety[idx])
         return 0.0
 
     def safest_cells(self, n: int = 5) -> list[tuple]:
-        idx_map = {node: i for i, node in enumerate(self._open_cells)}
-        ranked = sorted(self._open_cells, key=lambda node: self._safety[idx_map[node]], reverse=True)
-        return ranked[:n]
+        if self.n_nodes == 0:
+            return []
+        k = min(n, self.n_nodes)
+        top_idx = np.argpartition(self._safety[:self.n_nodes], -k)[-k:]
+        top_idx = top_idx[np.argsort(self._safety[top_idx])[::-1]]
+        return [self._open_cells[i] for i in top_idx]
 
     def safest_neighbour(self, pacman_pos: tuple) -> Optional[tuple]:
         candidates = self._neighbours.get(pacman_pos, [])
         if not candidates:
             return None
-        return max(candidates, key=lambda rc: self._safety[rc[0]][rc[1]])
+        best = None
+        best_score = -1.0
+        for node in candidates:
+            idx = self._open_idx_map.get(node)
+            if idx is not None and idx < len(self._safety):
+                s = self._safety[idx]
+                if s > best_score:
+                    best_score = s
+                    best = node
+        return best
 
-    def safety_as_flat_list(self) -> list[float]:
-        return [self._safety[r][c] for r in range(self.rows) for c in range(self.cols)]
 
-    def safety_payload(self) -> dict:
-        return {(r, c): round(self._safety[r][c], 4) for r, c in self._open_cells if self._safety[r][c] < 0.95}
-
-    def update_local_map_cell(self, pos: tuple, value: int):
-        r, c = pos
-        was_open = self._open_idx[r, c] >= 0
-        self.grid[r][c] = value
-        if value == WALL:
-            mass = self._b[r][c]
-            self._b[r][c] = 0.0
-            self._safety[r][c] = 1.0
-            if not was_open:
-                return
-            neighbours = [n for n in self._neighbours.get(pos, []) if self.grid[n[0]][n[1]] != WALL and self._open_idx[n[0], n[1]] >= 0]
-            if mass > 0 and neighbours:
-                weights = {}
-                total_w = 0.0
-                if self.last_known_pos is not None:
-                    lr, lc = self.last_known_pos
-                    dr, dc = lr - r, lc - c
-                    dist = math.hypot(dr, dc)
-                    if dist > 0:
-                        dr /= dist
-                        dc /= dist
-                    for nr, nc in neighbours:
-                        alignment = (nr - r) * dr + (nc - c) * dc
-                        w = max(0.01, alignment + 1.0)
-                        weights[(nr, nc)] = w
-                        total_w += w
-                else:
-                    for nr, nc in neighbours:
-                        weights[(nr, nc)] = 1.0
-                        total_w += 1.0    
-                if total_w > 0:
-                    for (nr, nc), w in weights.items():
-                        self._b[nr][nc] += mass * (w / total_w)
-        now_open = value != WALL
-        if was_open != now_open:
-            if now_open:
-                self._add_open_cell(pos)
-            else:
-                self._remove_open_cell(pos)
-            self._dirty_cells.add(pos)
-
-    def _remove_open_cell(self, pos: tuple):
-        r, c = pos
-        if pos not in self._open_cells:
-            return
-        self._open_cells.remove(pos)
-        self._neighbours.pop(pos, None)
-        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            nr, nc = r + dr, c + dc
-            nbr_key = (nr, nc)
-            if nbr_key in self._neighbours and pos in self._neighbours[nbr_key]:
-                self._neighbours[nbr_key].remove(pos)
-
-    def _add_open_cell(self, pos: tuple):
-        r, c = pos
-        if pos in self._open_cells or self.grid[r][c] == WALL:
-            return
-        neighbours = []
-        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            nr, nc = r + dr, c + dc
-            if (0 <= nr < self.rows and 0 <= nc < self.cols and self.grid[nr][nc] != WALL):
-                neighbours.append((nr, nc))
-        self._open_cells.append(pos)
-        self._neighbours[pos] = neighbours
-        for nbr in neighbours:
-            if nbr in self._neighbours and pos not in self._neighbours[nbr]:
-                self._neighbours[nbr].append(pos)
 
     def _compute_topology(self):
         n = len(self._open_cells)
         if n == 0:
             self._nbr_idx = np.full((0, 0), -1, dtype=np.int32)
             self._nbr_count = np.zeros(0, dtype=np.int32)
+            self._graph = sp.csr_matrix((0, 0), dtype=np.float32)
             return
         nbr_idx_list = []
         nbr_count_list = []
         for cell in self._open_cells:
-            nbrs = self._neighbours[cell]
-            n_idx = [self._open_idx_map.get(n) for n in nbrs]
+            nbrs = self._neighbours.get(cell, [])
+            n_idx = [self._open_idx_map.get(nb) for nb in nbrs]
             n_idx = [i for i in n_idx if i is not None]
             nbr_count_list.append(len(n_idx))
             nbr_idx_list.append(n_idx)
         max_nbrs = max(nbr_count_list, default=0)
-        self._nbr_idx = np.full((n, max_nbrs), -1, dtype=np.int32)
+        self._nbr_idx = np.full((n, max(max_nbrs, 1)), -1, dtype=np.int32)
         for i, idxs in enumerate(nbr_idx_list):
             if idxs:
                 self._nbr_idx[i, :len(idxs)] = idxs
@@ -413,58 +417,53 @@ class BeliefMap:
         
         row_idx = []
         col_idx = []
+        data_list = []
+        nodes = self._open_cells
         for i, idxs in enumerate(nbr_idx_list):
+            n1 = nodes[i]
             for j in idxs:
+                n2 = nodes[j]
+                dist = math.hypot(n1[0] - n2[0], n1[1] - n2[1])
                 row_idx.append(i)
                 col_idx.append(j)
-        data = np.ones(len(row_idx), dtype=np.float32)
-        self._graph = sp.csr_matrix((data, (row_idx, col_idx)), shape=(n, n))
-
-    def _rebuild_topology(self):
-        self._compute_topology()
-
-    def _sync_b_to_flat(self):
-        self._b_flat = self._b[self._open_arr[:, 0], self._open_arr[:, 1]].astype(np.float32)
-
-    def _sync_flat_to_b(self):
-        self._b.fill(0.0)
-        if self._open_arr.size > 0:
-            self._b[self._open_arr[:, 0], self._open_arr[:, 1]] = self._b_flat
+                data_list.append(dist)
+        if data_list:
+            data = np.array(data_list, dtype=np.float32)
+            self._graph = sp.csr_matrix((data, (row_idx, col_idx)), shape=(n, n))
+        else:
+            self._graph = sp.csr_matrix((n, n), dtype=np.float32)
 
     def _ensure_initialised(self):
-        if self._topology_dirty or self._dirty_cells:
-            self._rebuild_topology()
+        if self._topology_dirty:
+            self._compute_topology()
             self._topology_dirty = False
-            self._dirty_cells.clear()
             
         if self._initialised:
             return
-        if (self._pacman_start is not None and self._pacman_start in self._open_cells):
+        if self._pacman_start is not None and self._pacman_start in self._open_idx_map:
             self._b_flat.fill(0.0)
             idx = self._open_idx_map.get(self._pacman_start)
             if idx is not None:
                 self._b_flat[idx] = 1.0
         else:
-            self._b_flat.fill(0.0)
-            n = len(self._open_cells)
+            n = self.n_nodes
             if n:
                 self._b_flat[:] = 1.0 / n
         self._initialised = True
 
     def _normalise(self):
-        self._ensure_initialised()
-        if len(self._open_cells) == 0:
+        if self.n_nodes == 0:
             return
         total = float(self._b_flat.sum())
         if total < 1e-12:
-            n = len(self._open_cells)
+            n = self.n_nodes
             self._b_flat[:] = 1.0 / n
         else:
             self._b_flat /= total
         self._payload_dirty = True
 
     def _uniform_diffuse(self):
-        if len(self._open_cells) == 0:
+        if self.n_nodes == 0 or self._nbr_idx.shape[1] == 0:
             return     
         outflow = self._b_flat * ALPHA_UNIFORM
         counts = self._nbr_count
@@ -480,6 +479,8 @@ class BeliefMap:
 
     def _momentum_diffuse(self):
         if self.last_known_pos is None or self.last_known_dir == (0, 0):
+            return
+        if self.n_nodes == 0 or self._nbr_idx.shape[1] == 0:
             return
         strength = ALPHA_MOMENTUM * math.exp(-self.frames_since_sighting / MOMENTUM_DECAY)
         if strength < 1e-4:

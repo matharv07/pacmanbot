@@ -83,14 +83,15 @@ def _score_convert(ghost, dists: dict) -> List[Task]:
     tasks: list[Task] = []
     if not hasattr(ghost, 'known_power_pellets'): return tasks
     for pos in ghost.known_power_pellets:
-        info = dists.get(pos)
+        yx_pos = (pos[1], pos[0])
+        info = dists.get(yx_pos)
         if info is None:
             continue
         dist, _ = info
         if dist == math.inf:
             continue
-        score = _dist_score(dist, CONVERT_SCALE)
-        tasks.append(Task(task_type=TaskType.CONVERT, target_pos=pos, score=score))
+        score = _dist_score(dist, CONVERT_SCALE) + 2.0
+        tasks.append(Task(task_type=TaskType.CONVERT, target_pos=yx_pos, score=score))
     return tasks
 
 def _find_flee_pos(ghost, pacman_pos: tuple) -> Optional[tuple]:
@@ -158,8 +159,8 @@ def generate_tasks(ghost, frame: int) -> tuple[List[Task], dict]:
             cr, cc = pr + dr*4, pc + dc*4
             if ghost.world and ghost.world.is_passable(cc, cr, radius=0.4):
                 targets.add((cr, cc))
-    for p in ghost.world.power_pellets:
-        targets.add(p)
+    for p in getattr(ghost, 'known_power_pellets', []):
+        targets.add((p[1], p[0]))
     corners = [(1.5, 1.5), (1.5, float(ghost.world.width - 2)), (float(ghost.world.height - 2), 1.5), (float(ghost.world.height - 2), float(ghost.world.width - 2))]
     for cn in corners:
         targets.add(cn)

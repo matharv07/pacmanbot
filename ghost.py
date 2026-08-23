@@ -96,6 +96,48 @@ class Ghost:
         self._proximity_channel_target = None
         self._last_synced_map: dict[int, np.ndarray] = {}   # per-peer snapshot for delta sync
         self._tail_pacman_remaining = 0         #post-pop number of ghosts that will be tailing
+        self._personal_map_cache = None         #cached personal map; invalidated on observation changes
+        self._personal_map_dirty = True
+
+    @property
+    def personal_map(self):
+        """Cached discrete 2D map from continuous memory for the RL CNN."""
+        if not self._personal_map_dirty and self._personal_map_cache is not None:
+            return self._personal_map_cache
+        rows = len(self.grid)
+        cols = len(self.grid[0])
+        pmap = np.full((rows, cols), -1, dtype=np.int8)
+        
+        # Mark walls from lidar hits
+        if self.lidar_memory:
+            pts = np.array(list(self.lidar_memory), dtype=np.float32)
+            rs = pts[:, 0].astype(np.int32)
+            cs = pts[:, 1].astype(np.int32)
+            valid = (rs >= 0) & (rs < rows) & (cs >= 0) & (cs < cols)
+            pmap[rs[valid], cs[valid]] = 1
+                
+        # Fill in empty spaces from PRM visibility
+        for n, last_seen in self.prm_last_seen.items():
+            if last_seen != -1:
+                r, c = int(n[0]), int(n[1])
+                if 0 <= r < rows and 0 <= c < cols and pmap[r, c] == -1:
+                    pmap[r, c] = 0
+                    
+        # Mark known pellets
+        for px, py in self.known_pellets:
+            r, c = int(py), int(px)
+            if 0 <= r < rows and 0 <= c < cols:
+                pmap[r, c] = 2
+                
+        # Mark known power pellets
+        for px, py in self.known_power_pellets:
+            r, c = int(py), int(px)
+            if 0 <= r < rows and 0 <= c < cols:
+                pmap[r, c] = 3
+        
+        self._personal_map_cache = pmap
+        self._personal_map_dirty = False
+        return pmap
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False, speed_mult=1.0):
         self.frame += 1
@@ -356,6 +398,21 @@ class Ghost:
         if 0 <= r < len(self.grid) and 0 <= c < len(self.grid[0]):
             if self.grid[r][c] == POWER:
                 self.grid[r][c] = PELLET
+                pt = (float(c) + 0.5, float(r) + 0.5)
+                if getattr(self, 'world', None):
+                    if pt in self.world.power_pellets:
+                        self.world.power_pellets.remove(pt)
+                    if pt not in self.world.pellets:
+                        self.world.pellets.append(pt)
+                    if hasattr(self.world, '_update_pellet_arrays'):
+                        self.world._update_pellet_arrays()
+                # Manually update local memory and force network sync
+                p_tup = pt
+                self.known_power_pellets = {p for p in self.known_power_pellets if int(p[0]) != c or int(p[1]) != r}
+                if p_tup not in self.known_pellets:
+                    self.known_pellets.add(p_tup)
+                    # broadcast instantly via the actual network method so all peers get it
+                    self._broadcast([("pellet", p_tup)], all_ghosts)
         self.pos_history.append((self.y, self.x))
         self._check_oscillation()
         return newly_discovered, stale_refreshed
@@ -363,12 +420,14 @@ class Ghost:
     def _check_oscillation(self):
         if len(self.pos_history) < OSCILLATION_WINDOW:
             return
-        cur = (self.y, self.x)
-        if self.pos_history.count(cur) >= 2:
+        cur_y, cur_x = self.y, self.x
+        tol = 0.3  # tolerance for float coordinate comparison
+        matches = sum(1 for py, px in self.pos_history if abs(py - cur_y) < tol and abs(px - cur_x) < tol)
+        if matches >= 2:
             if self.known_pacman is None and self.last_lost_pacman is not None:
                 self.last_lost_pacman = None
                 self.pos_history.clear()
-        if self.pos_history.count(cur) >= 3:
+        if matches >= 3:
             #drop current task to force re-evaluation if found oscillating
             self.cbba_agent.bundle.clear()
             self.cbba_agent.path.clear()
@@ -383,15 +442,14 @@ class Ghost:
 
     def _lidar_sweep(self, all_ghosts, player_pos, powered=False):
         visible_prm = []
-        prm_nodes = getattr(self.world, 'prm_nodes', [])
-        if prm_nodes:
-            prm_nodes = np.array(prm_nodes)
-            dx = prm_nodes[:, 1] - self.x
-            dy = prm_nodes[:, 0] - self.y
+        prm_arr = getattr(self.world, 'prm_nodes_arr', None)
+        if prm_arr is not None and len(prm_arr) > 0:
+            dx = prm_arr[:, 1] - self.x
+            dy = prm_arr[:, 0] - self.y
             dist = np.hypot(dx, dy)
             valid_mask = dist <= MAX_RAY_DIST
             if np.any(valid_mask):
-                valid_nodes = prm_nodes[valid_mask]
+                valid_nodes = prm_arr[valid_mask]
                 valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
                 is_los = self.world.batch_line_of_sight((self.x, self.y), valid_targets, radius=0.4)
                 visible_prm = [tuple(n) for n, vis in zip(valid_nodes, is_los) if vis]
@@ -400,12 +458,12 @@ class Ghost:
         lidar_hits = set(zip(np.round(hit_y, 2), np.round(hit_x, 2)))
         
         pellet_diffs = []
-        if getattr(self.world, 'pellets', []):
-            targets = np.array(self.world.pellets)
-            dx = targets[:, 0] - self.x
-            dy = targets[:, 1] - self.y
+        pellets_arr = getattr(self.world, 'pellets_arr', None)
+        if pellets_arr is not None and len(pellets_arr) > 0:
+            dx = pellets_arr[:, 0] - self.x
+            dy = pellets_arr[:, 1] - self.y
             dist = np.hypot(dx, dy)
-            valid = targets[dist <= MAX_RAY_DIST]
+            valid = pellets_arr[dist <= MAX_RAY_DIST]
             if len(valid) > 0:
                 is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0)
                 for p, v in zip(valid, is_los):
@@ -413,12 +471,12 @@ class Ghost:
                         self.known_pellets.add(tuple(p))
                         pellet_diffs.append(("pellet", tuple(p)))
                         
-        if getattr(self.world, 'power_pellets', []):
-            targets = np.array(self.world.power_pellets)
-            dx = targets[:, 0] - self.x
-            dy = targets[:, 1] - self.y
+        power_arr = getattr(self.world, 'power_pellets_arr', None)
+        if power_arr is not None and len(power_arr) > 0:
+            dx = power_arr[:, 0] - self.x
+            dy = power_arr[:, 1] - self.y
             dist = np.hypot(dx, dy)
-            valid = targets[dist <= MAX_RAY_DIST]
+            valid = power_arr[dist <= MAX_RAY_DIST]
             if len(valid) > 0:
                 is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0)
                 for p, v in zip(valid, is_los):
@@ -459,12 +517,6 @@ class Ghost:
                     if old != (ghost.y, ghost.x):
                         self.known_agents[gid] = (ghost.y, ghost.x)
                         agent_diffs.append(("agent", gid, ghost.y, ghost.x))
-                else:
-                    last_known = self.known_agents.get(gid)
-                    if last_known is not None and last_known != "UNKNOWN":
-                        self.known_agents[gid] = "UNKNOWN"
-                        agent_diffs.append(("agent_lost", gid))
-                    
         pacman_diff = None
         pr, pc = player_pos
         pac_d = math.hypot(pr - self.y, pc - self.x)
@@ -493,6 +545,7 @@ class Ghost:
         diffs = []
         newly_discovered = 0
         stale_refreshed = 0.0
+        self._personal_map_dirty = True  # invalidate cached personal_map
         
         diffs.extend(pellet_diffs)
         
@@ -509,6 +562,10 @@ class Ghost:
                 if staleness > 0.25: stale_refreshed += staleness
             self.prm_last_seen[n] = self.frame
             diffs.append(("prm_refresh", n))
+        
+        # Feed observed PRM nodes into the belief map's incremental topology
+        if visible_prm:
+            self.belief_map.ingest_observed_nodes(visible_prm, getattr(self.world, 'prm_graph', {}))
             
         diffs.extend(agent_diffs)
         if pacman_diff: diffs.append(pacman_diff)
@@ -633,7 +690,7 @@ class Ghost:
                         relay_diffs.append(diff)
                 elif dtype == "power":
                     _, p = diff
-                    if p not in self.known_power_pellets:
+                    if p not in self.known_power_pellets and p not in self.known_pellets:
                         self.known_power_pellets.add(p)
                         relay_diffs.append(diff)
                 elif dtype == "agent_lost":
@@ -726,11 +783,9 @@ class Ghost:
         x = int(self.x * scale) + offset_x
         y = int(self.y * scale) + offset_y
         r = scale // 2 - 2
-        #powered state — blue tint when pacman is powered (ghosts are vulnerable)
-        if self.pacman_powered:
-            color = POWERED_COLOR
-        else:
-            color = self.color
+        #ghosts always keep their original color — only Pacman turns blue
+        #(README rule #4: ghosts observe the colour change visually, they don't change themselves)
+        color = self.color
         pygame.draw.circle(surf, color, (x, y - 2), r)
         pygame.draw.rect(surf, color, (x - r, y - 2, r * 2, r + 2))
         #wavy bottom edge

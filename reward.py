@@ -116,9 +116,9 @@ class RewardShaper:
         return self.gamma_ex * (known / total_open)
 
     def _phi_belief(self, ghost) -> float:
-        if not hasattr(ghost.belief_map, '_b'):
+        if not hasattr(ghost.belief_map, '_b_flat'):
             return 0.0
-        b = ghost.belief_map._b
+        b = ghost.belief_map._b_flat
         p = b[b > 0]
         if p.size == 0:
             return 0.0

@@ -67,6 +67,14 @@ class World:
         self.power_pellets = []
         self.resolution = resolution
         self.safe_area = []
+        self.prm_nodes_arr = np.empty((0, 2), dtype=np.float32)
+        self.pellets_arr = np.empty((0, 2), dtype=np.float32)
+        self.power_pellets_arr = np.empty((0, 2), dtype=np.float32)
+
+    def _update_pellet_arrays(self):
+        """Rebuild cached pellet/power arrays after any pellet list change."""
+        self.pellets_arr = np.array(self.pellets, dtype=np.float32) if self.pellets else np.empty((0, 2), dtype=np.float32)
+        self.power_pellets_arr = np.array(self.power_pellets, dtype=np.float32) if self.power_pellets else np.empty((0, 2), dtype=np.float32)
 
     def _compile_obstacles(self):
         """Compiles obstacle primitives into a high performance numpy tensor for vectorized ops."""
@@ -122,8 +130,13 @@ class World:
         out_of_bounds = (px - radius < 0) | (px + radius > self.width) | (py - radius < 0) | (py + radius > self.height)
         if len(self.compiled_segments) == 0:
             return ~out_of_bounds
-        dist_sq, r_seg = self._points_to_segments_dist_sq(px, py)
-        collided = np.any(dist_sq <= (r_seg + radius)**2, axis=1)
+        collided = np.zeros(len(px), dtype=bool)
+        chunk_size = 4096
+        for i in range(0, len(px), chunk_size):
+            px_c = px[i:i+chunk_size]
+            py_c = py[i:i+chunk_size]
+            dist_sq, r_seg = self._points_to_segments_dist_sq(px_c, py_c)
+            collided[i:i+chunk_size] = np.any(dist_sq <= (r_seg + radius)**2, axis=1)
         return ~(out_of_bounds | collided)
 
     def line_of_sight(self, p1, p2, radius=0, step_size=0.2):         #checks for obstacles along a line segment
@@ -441,6 +454,9 @@ class World:
                         n1, n2 = self.prm_nodes[p1_idx[k]], self.prm_nodes[p2_idx[k]]
                         self.prm_graph[n1].append(n2)
                         self.prm_graph[n2].append(n1)
+        # Cache numpy arrays for vectorized per-frame operations in lidar_sweep
+        self.prm_nodes_arr = np.array(self.prm_nodes, dtype=np.float32) if self.prm_nodes else np.empty((0, 2), dtype=np.float32)
+        self._update_pellet_arrays()
     
     def random_open_point(self):
         return random.choice(self.safe_area)

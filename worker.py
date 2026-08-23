@@ -48,7 +48,7 @@ class Env:
     def reset(self):
         self.grid, self._player_start, self.world = generate_map(
             rows=self.grid_rows, cols=self.grid_cols, n_power=self.n_power, random_spawn=self.static_pacman)
-        self.player = Player(self.grid, self._player_start)
+        self.player = Player(self.grid, self._player_start, self.world)
         if self.static_pacman:
             self.player.stationary = True
         open_cells = np.argwhere(self.grid != WALL)
@@ -78,8 +78,8 @@ class Env:
                 h_tasks, _ = heuristic_generate_tasks(g, self.frame)
                 target = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
                 for t in h_tasks[:3]:
-                    r, c = t.target_pos
-                    if r < self.grid_rows and c < self.grid_cols:
+                    r, c = int(t.target_pos[0]), int(t.target_pos[1])
+                    if 0 <= r < self.grid_rows and 0 <= c < self.grid_cols:
                         target[r, c] = t.score
                         #gaussian blur for soft BC targets
                         for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
@@ -142,8 +142,8 @@ class Env:
                 target = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
                 if h_tasks:
                     for t in h_tasks[:3]:
-                        r, c = t.target_pos
-                        if r < self.grid_rows and c < self.grid_cols:
+                        r, c = int(t.target_pos[0]), int(t.target_pos[1])
+                        if 0 <= r < self.grid_rows and 0 <= c < self.grid_cols:
                             target[r, c] = t.score
                             #gaussian blur for soft BC targets
                             for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
@@ -176,7 +176,7 @@ class Env:
                     if tasks:
                         all_targets = [t.target_pos for t in tasks]
                         from pathfinder import dijkstra_multi
-                        dists = dijkstra_multi(g.grid, (int(g.y), int(g.x)), all_targets)
+                        dists = dijkstra_multi(g.world, (g.y, g.x), all_targets)
                         h_dists.update(dists)  
                     g.cbba_agent._phase1(g, all_tasks, h_dists)
         rewards = {gid: 0.0 for gid in alive}

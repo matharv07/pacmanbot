@@ -1,21 +1,74 @@
 import heapq
 import math
+import numpy as np
 
 def _euclidean(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 def _connect_temp_node(world, node):
+    """Vectorized PRM connection: batch distance filter + batch LOS check."""
+    if not hasattr(world, 'prm_nodes') or not world.prm_nodes:
+        return []
+    nodes_arr = np.array(world.prm_nodes, dtype=np.float32)
+    node_arr = np.array(node, dtype=np.float32)
+    dists = np.sqrt(np.sum((nodes_arr - node_arr) ** 2, axis=1))
+    # Pre-filter by distance threshold
+    within = dists < 7.0
+    if not np.any(within):
+        return []
+    valid_idx = np.nonzero(within)[0]
+    valid_dists = dists[valid_idx]
+    # Sort by distance, take top 15
+    order = np.argsort(valid_dists)[:15]
+    candidate_idx = valid_idx[order]
+    candidate_dists = valid_dists[order]
+    candidate_nodes = nodes_arr[candidate_idx]
+    # Batch LOS check: nodes are (y, x), LOS expects (x, y)
+    targets = np.column_stack((candidate_nodes[:, 1], candidate_nodes[:, 0]))
+    origin = (node[1], node[0])  # (x, y)
+    if hasattr(world, 'batch_line_of_sight'):
+        los = world.batch_line_of_sight(origin, targets, radius=0.4)
+    else:
+        los = np.array([world.line_of_sight(origin, (t[0], t[1]), radius=0.4) for t in targets])
     connections = []
-    # Find up to 10 closest nodes in PRM to connect to
-    if not hasattr(world, 'prm_nodes'): return []
-    dists = []
-    for n in world.prm_nodes:
-        dists.append((_euclidean(node, n), n))
-    dists.sort()
-    for d, n in dists[:15]:
-        if d < 7.0 and world.line_of_sight(node, n, radius=0.4):
-            connections.append((d, n))
+    for i, is_vis in enumerate(los):
+        if is_vis:
+            n = world.prm_nodes[candidate_idx[i]]
+            connections.append((float(candidate_dists[i]), n))
     return connections
+
+def _connect_temp_nodes_batch(world, nodes_list):
+    """Batch connect multiple temp nodes at once — avoids redundant array creation."""
+    if not hasattr(world, 'prm_nodes') or not world.prm_nodes:
+        return [[] for _ in nodes_list]
+    prm_arr = np.array(world.prm_nodes, dtype=np.float32)
+    results = []
+    for node in nodes_list:
+        node_arr = np.array(node, dtype=np.float32)
+        dists = np.sqrt(np.sum((prm_arr - node_arr) ** 2, axis=1))
+        within = dists < 7.0
+        if not np.any(within):
+            results.append([])
+            continue
+        valid_idx = np.nonzero(within)[0]
+        valid_dists = dists[valid_idx]
+        order = np.argsort(valid_dists)[:15]
+        candidate_idx = valid_idx[order]
+        candidate_dists = valid_dists[order]
+        candidate_nodes = prm_arr[candidate_idx]
+        targets = np.column_stack((candidate_nodes[:, 1], candidate_nodes[:, 0]))
+        origin = (node[1], node[0])
+        if hasattr(world, 'batch_line_of_sight'):
+            los = world.batch_line_of_sight(origin, targets, radius=0.4)
+        else:
+            los = np.array([world.line_of_sight(origin, (t[0], t[1]), radius=0.4) for t in targets])
+        connections = []
+        for i, is_vis in enumerate(los):
+            if is_vis:
+                n = world.prm_nodes[candidate_idx[i]]
+                connections.append((float(candidate_dists[i]), n))
+        results.append(connections)
+    return results
 
 def _reconstruct(came_from, node):
     path = [node]
@@ -31,8 +84,7 @@ def astar(world, start, goal):
     if not hasattr(world, 'prm_graph'):
         return []
         
-    start_conns = _connect_temp_node(world, start)
-    goal_conns = _connect_temp_node(world, goal)
+    start_conns, goal_conns = _connect_temp_nodes_batch(world, [start, goal])
     
     # Ad-hoc graph access function
     def get_neighbors(n):
@@ -79,13 +131,15 @@ def dijkstra_multi(world, start, targets):
     if not targets or not hasattr(world, 'prm_graph'):
         return {}
         
-    start_conns = _connect_temp_node(world, start)
     target_set = set(targets)
     
-    # Precompute goal connections for fast lookup
+    # Batch all temp node connections at once
+    all_nodes = [start] + list(target_set)
+    all_conns = _connect_temp_nodes_batch(world, all_nodes)
+    start_conns = all_conns[0]
     target_conns_map = {}
-    for t in target_set:
-        target_conns_map[t] = _connect_temp_node(world, t)
+    for i, t in enumerate(target_set):
+        target_conns_map[t] = all_conns[1 + i]
         
     # Map PRM nodes to the targets they connect to
     prm_to_targets = {}
