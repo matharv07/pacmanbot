@@ -127,6 +127,10 @@ def dijkstra_multi(world, start, targets):
             close_indices = np.where(close_mask)[0]
             for i, is_los in zip(close_indices, los_res):
                 direct_los[target_set[i]] = is_los
+                
+    start_to_all_prm = None
+    if len(si) > 0:
+        start_to_all_prm = np.min(sd[:, None] + world.apsp[si, :], axis=0)
     
     for idx, t in enumerate(target_set):
         gd, gi = all_conns[idx + 1]
@@ -135,11 +139,8 @@ def dijkstra_multi(world, start, targets):
         if direct_los[t]:
             best_dist = _euclidean(start, t)
                 
-        if len(si) > 0 and len(gi) > 0:
-            apsp_sub = world.apsp[np.ix_(si, gi)]
-            total_dists = sd[:, None] + apsp_sub + gd[None, :]
-            min_idx = np.argmin(total_dists)
-            min_d = total_dists.flat[min_idx]
+        if start_to_all_prm is not None and len(gi) > 0:
+            min_d = np.min(start_to_all_prm[gi] + gd)
             if min_d < best_dist:
                 best_dist = min_d
         

@@ -171,23 +171,26 @@ class World:
                 grid = None
                 
             if grid is not None:
-                ans = np.zeros(len(px), dtype=bool)
-                safe_cx = cx[valid]
-                safe_cy = cy[valid]
-                ans[valid] = grid[safe_cy, safe_cx]
+                ans = np.zeros_like(px, dtype=bool)
+                ans[valid] = grid[cy[valid], cx[valid]]
                 return ans
 
         out_of_bounds = (px - radius < 0) | (px + radius > self.width) | (py - radius < 0) | (py + radius > self.height)
         if len(self.compiled_segments) == 0:
             return ~out_of_bounds
-        collided = np.zeros(len(px), dtype=bool)
+        
+        px_flat = px.ravel()
+        py_flat = py.ravel()
+        collided = np.zeros(len(px_flat), dtype=bool)
         chunk_size = 4096
-        for i in range(0, len(px), chunk_size):
-            px_c = px[i:i+chunk_size]
-            py_c = py[i:i+chunk_size]
+        for i in range(0, len(px_flat), chunk_size):
+            px_c = px_flat[i:i+chunk_size]
+            py_c = py_flat[i:i+chunk_size]
             dist_sq, r_seg = self._points_to_segments_dist_sq(px_c, py_c)
             collided[i:i+chunk_size] = np.any(dist_sq <= (r_seg + radius)**2, axis=1)
-        return ~(out_of_bounds | collided)
+        
+        ans_flat = ~(out_of_bounds.ravel() | collided)
+        return ans_flat.reshape(px.shape)
 
     def line_of_sight(self, p1, p2, radius=0, step_size=0.2):         #checks for obstacles along a line segment
         dx = p2[0] - p1[0]
@@ -217,8 +220,7 @@ class World:
         valid_steps = step_dists <= dist
         px = p1[0] + fracs * dx
         py = p1[1] + fracs * dy
-        passable = self.batch_is_passable(px.flatten(), py.flatten(), radius)
-        passable = passable.reshape(px.shape)
+        passable = self.batch_is_passable(px, py, radius)
         passable = passable | (~valid_steps)
         return np.all(passable, axis=0)
 

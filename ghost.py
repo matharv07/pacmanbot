@@ -485,25 +485,32 @@ class Ghost:
 
         bm_arr = getattr(self.belief_map, '_open_arr', None)
         if bm_arr is not None and len(bm_arr) > 0:
-            dx = bm_arr[:, 1] - self.x
-            dy = bm_arr[:, 0] - self.y
-            dist = np.hypot(dx, dy)
-            valid_mask = dist <= MAX_RAY_DIST
-            if np.any(valid_mask):
-                valid_nodes = bm_arr[valid_mask]
-                valid_idxs = np.where(valid_mask)[0]
-                valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
-                is_pass = self.world.batch_is_passable(valid_targets[:, 0], valid_targets[:, 1], radius=0.0)
-                
-                passable_targets = valid_targets[is_pass]
-                passable_idxs = valid_idxs[is_pass]
-                if len(passable_targets) > 0:
-                    is_los = self.world.batch_line_of_sight((self.x, self.y), passable_targets, radius=0.0, step_size=0.5)
-                    visible_belief_idxs.update(passable_idxs[is_los])
+            sources = [(self.x, self.y)]
+            for pos in self.known_agents.values():
+                if pos != "UNKNOWN":
+                    sources.append((pos[1], pos[0]))
                     
-                impassable_nodes = valid_nodes[~is_pass]
-                if len(impassable_nodes) > 0:
-                    impassable_belief_nodes.extend([tuple(n) for n in impassable_nodes])
+            for sx, sy in sources:
+                dx = bm_arr[:, 1] - sx
+                dy = bm_arr[:, 0] - sy
+                dist = np.hypot(dx, dy)
+                valid_mask = dist <= MAX_RAY_DIST
+                if np.any(valid_mask):
+                    valid_nodes = bm_arr[valid_mask]
+                    valid_idxs = np.where(valid_mask)[0]
+                    valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
+                    is_pass = self.world.batch_is_passable(valid_targets[:, 0], valid_targets[:, 1], radius=0.0)
+                    
+                    passable_targets = valid_targets[is_pass]
+                    passable_idxs = valid_idxs[is_pass]
+                    if len(passable_targets) > 0:
+                        is_los = self.world.batch_line_of_sight((sx, sy), passable_targets, radius=0.0, step_size=0.5)
+                        visible_belief_idxs.update(passable_idxs[is_los])
+                        
+                    if (sx, sy) == (self.x, self.y):
+                        impassable_nodes = valid_nodes[~is_pass]
+                        if len(impassable_nodes) > 0:
+                            impassable_belief_nodes.extend([tuple(n) for n in impassable_nodes])
 
         directions = np.column_stack((_DX, _DY))
         hit_x, hit_y = self.world.batch_raycast((self.x, self.y), directions, max_dist=MAX_RAY_DIST)

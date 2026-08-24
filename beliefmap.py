@@ -30,9 +30,9 @@ class LSTMMovementPredictor(nn.Module):
 
 WALL = 1
 
-ALPHA_UNIFORM      = 0.35
-ALPHA_MOMENTUM     = 0.45
-MOMENTUM_DECAY     = 50
+ALPHA_UNIFORM      = 0.15
+ALPHA_MOMENTUM     = 0.15
+MOMENTUM_DECAY     = 15
 TAU_RECENCY        = 60
 MIN_CONFIDENCE     = 0.02
 LOS_CERTAINTY      = 0.99
@@ -294,9 +294,8 @@ class BeliefMap:
         self._ensure_initialised()
         self.frames_since_sighting = min(self.frames_since_sighting + 1, 9999)
         if self.n_nodes > 0:
-            # Run diffusion twice to double the frontier propagation speed 
-            # so the probability wave outpaces Pacman's maximum physical velocity
-            for _ in range(2):
+            # Run diffusion 4 times to significantly increase frontier propagation speed 
+            for _ in range(4):
                 self._predictive_diffuse(known_pellets, known_power)
             self._normalise()
 
@@ -575,8 +574,9 @@ class BeliefMap:
             d_c = nc - c_arr
             dist = np.hypot(d_r, d_c)
             
-            self._nbr_dr[valid, k] = np.where(dist[valid] > 0, d_r[valid] / dist[valid], 0.0)
-            self._nbr_dc[valid, k] = np.where(dist[valid] > 0, d_c[valid] / dist[valid], 0.0)
+            safe_dist = np.where(dist[valid] > 0, dist[valid], 1.0)
+            self._nbr_dr[valid, k] = np.where(dist[valid] > 0, d_r[valid] / safe_dist, 0.0)
+            self._nbr_dc[valid, k] = np.where(dist[valid] > 0, d_c[valid] / safe_dist, 0.0)
             self._nbr_dist[valid, k] = dist[valid]
 
         if data_list:
@@ -669,7 +669,19 @@ class BeliefMap:
                 
         if starts and getattr(self, '_graph', None) is not None and self._graph.shape[0] > 0:
             starts = list(set(starts))
-            min_dists = csgraph.dijkstra(self._graph, directed=False, indices=starts, unweighted=False, min_only=True)
+            n = self._graph.shape[0]
+            
+            indptr = self._graph.indptr
+            indices = self._graph.indices
+            data = self._graph.data
+            
+            new_indptr = np.append(indptr, indptr[-1] + len(starts))
+            new_indices = np.append(indices, starts)
+            new_data = np.append(data, np.zeros(len(starts), dtype=np.float32))
+            
+            aug_graph = sp.csr_matrix((new_data, new_indices, new_indptr), shape=(n+1, n+1))
+            
+            min_dists = csgraph.dijkstra(aug_graph, directed=True, indices=n)[:n]
             min_dists[np.isinf(min_dists)] = 9999.0
             self._pellet_dists = min_dists
             self._pellet_score = np.exp(-min_dists / 10.0)
@@ -696,13 +708,15 @@ class BeliefMap:
             nbr_danger = self._danger[self._nbr_idx]
             nbr_danger = np.where(valid_mask, nbr_danger, my_danger)
             delta_danger = my_danger - nbr_danger
-            W[valid_mask] *= np.exp(delta_danger[valid_mask] * 2.5)
+            W[valid_mask] *= np.exp(delta_danger[valid_mask] * 0.8)
         
         if self.last_known_pos is not None and self.predicted_dir != (0, 0):
             dr, dc = self.predicted_dir
             alignment = self._nbr_dr * dr + self._nbr_dc * dc
             momentum_str = math.exp(-self.frames_since_sighting / MOMENTUM_DECAY)
-            mom_factor = 1.0 + momentum_str * (np.maximum(0.1, alignment + 1.0) - 1.0)
+            mom_factor = np.where(alignment > 0, 
+                                  1.0 + momentum_str * (alignment * 3.0), 
+                                  1.0 + momentum_str * (alignment * 0.9))
             W[valid_mask] *= mom_factor[valid_mask]
             
         if not hasattr(self, '_pellet_dists') or self._pellets_changed(known_pellets, known_power):
@@ -714,7 +728,7 @@ class BeliefMap:
             nbr_dists = np.where(valid_mask, nbr_dists, my_dists)
             delta_pellet = my_dists - nbr_dists
             delta_pellet = np.clip(delta_pellet, -50.0, 50.0)
-            W[valid_mask] *= np.exp(delta_pellet[valid_mask] * 1.5)
+            W[valid_mask] *= np.exp(delta_pellet[valid_mask] * 0.5)
             
         W_sum = W.sum(axis=1, keepdims=True)
         W_sum = np.where(W_sum > 0, W_sum, 1.0)
