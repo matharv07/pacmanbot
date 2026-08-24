@@ -4,61 +4,33 @@ from typing import Optional
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.csgraph as csgraph
+from scipy.spatial import cKDTree
 
 WALL = 1
 
-ALPHA_UNIFORM      = 0.20   #fraction of mass diffused to each neighbour every frame
-ALPHA_MOMENTUM     = 0.25   #direction-based mass sharing
-MOMENTUM_DECAY     = 50     #lower value removes trust from older sightings
-TAU_RECENCY        = 60     #lower value adds trust to older messages
-MIN_CONFIDENCE     = 0.02   #minimum trust in any received message
-LOS_CERTAINTY      = 0.99   #trust in a direct sighting
-LOST_SPREAD        = 0.60   #how to spread out probability if we lose sight of pacman
-COMPRESS_THRESHOLD = 0.0005 #cells below this are omitted from payload
+ALPHA_UNIFORM      = 0.20
+ALPHA_MOMENTUM     = 0.25
+MOMENTUM_DECAY     = 50
+TAU_RECENCY        = 60
+MIN_CONFIDENCE     = 0.02
+LOS_CERTAINTY      = 0.99
+LOST_SPREAD        = 0.60
+COMPRESS_THRESHOLD = 0.0005
 
-DANGER_SIGMA       = 6.0    #gaussian variance cells for ghost danger falloff
-STALENESS_DECAY    = 40.0   #frames half-life for un-refreshed ghost positions
-UNSEEN_GHOST_PRIOR = 0.30   #PRIOR danger weight for a ghost whose position is unknown
-PRIOR_UNIFORM_WT   = 1.0    #weight of the uniform PRIOR
-MIN_SAFETY         = 1e-6   #minimum safety per cell to avoid divide-by-zero in normalisation and -infinity in logloss calc
-SAFETY_RECOMPUTE_EVERY = 3  #recompute safety map at most every N frames;
+DANGER_SIGMA       = 6.0
+STALENESS_DECAY    = 40.0
+UNSEEN_GHOST_PRIOR = 0.30
+PRIOR_UNIFORM_WT   = 1.0
+MIN_SAFETY         = 1e-6
+SAFETY_RECOMPUTE_EVERY = 8
 
-HUNT_SIGMA         = 5.0    #gaussian variance for attraction falloff toward ghosts
-HUNT_CROWD_WEIGHT  = 0.4    #blend factor for crowd scoring vs proximal scoring: 0.0 = pure proximal, 1.0 = pure crowd, 0.4 = blend
+HUNT_SIGMA         = 5.0
+HUNT_CROWD_WEIGHT  = 0.4
 
 class BeliefMap:
-    """
-    Safety ranking algorithm
-
-    For every known ghost position g_i with staleness age_i (frames since last confirmed sighting):
-        likelihood_i(c) = exp(-dist(c, g_i)**2 / (2 sigma**2))   [Gaussian falloff]
-        weight_i        = exp(-age_i / STALENESS_DECAY)          [recency discount]
-        danger_i(c)     = weight_i * likelihood_i(c)             [weighted evidence]
-
-    Bayes update (log-space, multiplicative across independent ghosts):
-        log P(c unsafe) = Σ_i  danger_i(c)
-
-    We include a uniform prior (PRIOR_UNIFORM_WT) so that cells with no ghost evidence are not treated as perfectly safe.  After summing, we normalise the
-    danger map to [0,1] and define:
-        safety(c) = 1 - danger_norm(c)
-
-    Cells are then ranked descending by safety(c) - highest safety first.
-     
-    Pacman in non-powered mode should generally move towards the safest cell in its visible neighbourhood, which we can check each frame.
-    In powered mode, we can use the same safety map but invert it to get an "attraction" map and move towards the most attractive cell to hunt ghosts.
-    
-    IMPORTANT — Knowledge constraints (README rule #4):
-    The belief map starts knowing ONLY Pacman's initial (t=0) position.
-    Topology (navigable nodes and edges) is built incrementally from the
-    ghost's own observations (prm_last_seen).  At t=0 the map contains a
-    single node (pacman_start) with probability 1.0.  As the ghost explores,
-    newly observed PRM nodes are added and the probability diffuses over the
-    growing graph.
-    """
-
     def __init__(self, gid: int, world, pacman_start: Optional[tuple] = None):
         self.gid = gid
-        self.world = world           # kept for is_passable checks only
+        self.world = world
         self.rows = world.height
         self.cols = world.width
         self._initialised = False
@@ -67,7 +39,6 @@ class BeliefMap:
         self.frames_since_sighting: int = 9999
         self._pacman_start: Optional[tuple] = pacman_start
 
-        # --- Incremental topology: starts empty, grows from observations ---
         self._open_cells: list = []
         self._neighbours: dict = {}
         self._open_idx_map: dict = {}
@@ -80,24 +51,22 @@ class BeliefMap:
         self._nbr_count = np.empty((0,), dtype=np.int32)
         self._graph = sp.csr_matrix((0, 0), dtype=np.float32)
 
-        #safetyMap: _safety[i] contains [0, 1] mapping to known nodes
         self._safety = np.ones(0, dtype=np.float32)
+        self._safety_grid = np.ones((self.rows, self.cols), dtype=np.float32)
+        self._b_grid = np.zeros((self.rows, self.cols), dtype=np.float32)
 
-        # Seed with pacman_start if known
         if pacman_start is not None:
             self._add_node(pacman_start)
+            
         self._last_ghost_snapshot: dict = {}
         self._ghost_last_seen: dict[int, int] = {}
-        self._dirty_cells: set = set()
+        self._disabled_wall_nodes: set = set()
         self._last_safety_frame: int = -999
         self._last_powered: bool = False
         self._payload_cache: dict | None = None
         self._payload_dirty: bool = True
 
-    # --- Incremental node management ---
-
     def _add_node(self, node: tuple) -> bool:
-        """Add a single node to the topology. Returns True if newly added."""
         if node in self._open_idx_map:
             return False
         idx = len(self._open_cells)
@@ -105,7 +74,6 @@ class BeliefMap:
         self._open_idx_map[node] = idx
         self._neighbours[node] = []
         self.n_nodes = len(self._open_cells)
-        # Extend arrays
         self._b_flat = np.append(self._b_flat, 0.0).astype(np.float32)
         self._safety = np.append(self._safety, 1.0).astype(np.float32)
         if len(self._open_cells) == 1:
@@ -115,19 +83,7 @@ class BeliefMap:
         self._topology_dirty = True
         return True
 
-
-
     def init_full_topology(self, world_prm_graph: dict):
-        """Build a completely uniform, wall-agnostic belief topology.
-
-        To prevent the ghost from having implicit knowledge of the map's layout,
-        the belief map is completely decoupled from the navigation PRM graph.
-        We build a pure, uniform grid of nodes spaced 1.0 units apart across
-        the entire map. This ensures probability diffuses equally in all
-        directions, completely blind to obstacles.
-        """
-        from scipy.spatial import cKDTree
-
         BELIEF_GRID_STEP = 0.8
         grid_nodes = []
         y = BELIEF_GRID_STEP / 2.0
@@ -155,7 +111,6 @@ class BeliefMap:
                 self._safety = np.concatenate([self._safety, np.ones(len(grid_nodes), dtype=np.float32)])
                 self._open_arr = np.vstack([self._open_arr, new_nodes_arr])
 
-        # Connect grid nodes to their neighbours (8-way connectivity)
         CONNECT_RADIUS = BELIEF_GRID_STEP * 1.5
         if len(self._open_arr) > 0:
             tree = cKDTree(self._open_arr)
@@ -218,81 +173,45 @@ class BeliefMap:
         self._normalise()
         self._payload_dirty = True
 
-
-    def observe_clear(self, ghost_pos: tuple, pacman_pos=None):
+    def observe_clear(self, visible_idxs: set, impassable_nodes: list, pacman_pos=None):
         self._ensure_initialised()
         if self._open_arr.size == 0:
             return
             
-        MAX_VISION = 15.0
-        g_arr = np.array(ghost_pos, dtype=np.float32)
-        dists = np.hypot(self._open_arr[:, 0] - g_arr[0], self._open_arr[:, 1] - g_arr[1])
-        close_mask = dists <= MAX_VISION
-        if not np.any(close_mask):
-            return
+        if visible_idxs:
+            idxs = np.array(list(visible_idxs), dtype=np.int32)
+            if pacman_pos is not None:
+                pac_idx = self._closest_node(pacman_pos)
+                idxs = idxs[idxs != pac_idx]
+            self._b_flat[idxs] = 0.0
             
-        close_nodes = self._open_arr[close_mask]
-        close_idxs = np.where(close_mask)[0]
-        
-        # 1. First, check which nearby nodes are actually walls
-        is_passable = self.world.batch_is_passable(close_nodes[:, 1], close_nodes[:, 0], radius=0.1)
-        
-        # 2. For nodes that are PASSABLE, check line-of-sight to clear them
-        passable_nodes = close_nodes[is_passable]
-        passable_idxs = close_idxs[is_passable]
-        
-        if len(passable_nodes) > 0:
-            is_los = self.world.batch_line_of_sight(ghost_pos, np.column_stack((passable_nodes[:, 1], passable_nodes[:, 0])), radius=0.0)
+        disabled_any = False
+        for node in impassable_nodes:
+            if node not in self._disabled_wall_nodes:
+                self._disabled_wall_nodes.add(node)
+                disabled_any = True
+                old_nbrs = self._neighbours.get(node, [])
+                self._neighbours[node] = []
+                for nbr in old_nbrs:
+                    if node in self._neighbours[nbr]:
+                        self._neighbours[nbr].remove(node)
+                        
+        if disabled_any:
+            self._topology_dirty = True
             
-            clear_idxs = []
-            for i, vis in enumerate(is_los):
-                if vis:
-                    node = passable_nodes[i]
-                    if pacman_pos is not None and abs(node[0] - pacman_pos[0]) < 1.0 and abs(node[1] - pacman_pos[1]) < 1.0:
-                        continue
-                    clear_idxs.append(passable_idxs[i])
-                    
-            if clear_idxs:
-                self._b_flat[clear_idxs] = 0.0
-                
-        # 3. For nodes that are IMPASSABLE (walls), permanently remove their edges to block diffusion
-        impassable_nodes = close_nodes[~is_passable]
-        impassable_idxs = close_idxs[~is_passable]
-        
-        if len(impassable_nodes) > 0:
-            if not hasattr(self, '_disabled_wall_nodes'):
-                self._disabled_wall_nodes = set()
-                
-            disabled_any = False
-            for i, node_arr in enumerate(impassable_nodes):
-                node = (float(node_arr[0]), float(node_arr[1]))
-                if node not in self._disabled_wall_nodes:
-                    self._disabled_wall_nodes.add(node)
-                    disabled_any = True
-                    # Remove edges from this node and to this node
-                    old_nbrs = self._neighbours.get(node, [])
-                    self._neighbours[node] = []
-                    for nbr in old_nbrs:
-                        if node in self._neighbours[nbr]:
-                            self._neighbours[nbr].remove(node)
-            
-            if disabled_any:
-                self._topology_dirty = True
         self._normalise()
 
-    def diffuse(self, ghost_pos: tuple):
+    def diffuse(self, ghost_pos: tuple, known_pellets: set = None, known_power: set = None):
         if self._topology_dirty:
             self._compute_topology()
             self._topology_dirty = False
         self._ensure_initialised()
         self.frames_since_sighting = min(self.frames_since_sighting + 1, 9999)
         if self.n_nodes > 0:
-            self._uniform_diffuse()
-            if self.last_known_pos is not None:
-                self._momentum_diffuse()
+            self._predictive_diffuse(known_pellets, known_power)
             self._normalise()
 
-    def merge(self, sender_gid: int, payload: dict, frame: int):     #P(c | self, sender) = P(c | self)^(1−conf) x P(c | sender)^conf
+    def merge(self, sender_gid: int, payload: dict, frame: int):
         self._ensure_initialised()
         sender_fss = payload.get("fss", 9999)
         cells: dict = payload.get("cells", {})
@@ -302,11 +221,8 @@ class BeliefMap:
         n = self.n_nodes
         s_flat = np.full(n, COMPRESS_THRESHOLD / 2.0, dtype=np.float32)
         
-        idxs = []
-        vals = []
+        idxs, vals = [], []
         for pt, v in cells.items():
-            # If sender mentions a node we haven't seen yet, skip it
-            # (we can't reason about topology we don't know)
             idx = self._open_idx_map.get(pt)
             if idx is not None:
                 idxs.append(idx)
@@ -333,7 +249,6 @@ class BeliefMap:
         self._ensure_initialised()
         if not self._payload_dirty and self._payload_cache is not None:
             return self._payload_cache
-        #vectorized: extract indices and values above threshold in one shot
         above = self._b_flat >= COMPRESS_THRESHOLD
         if not above.any():
             cells = {}
@@ -356,14 +271,14 @@ class BeliefMap:
 
     def probability_at(self, pos: tuple) -> float:
         self._ensure_initialised()
-        idx = self._closest_node(pos)
-        if idx >= 0:
-            return float(self._b_flat[idx])
+        r, c = int(round(pos[0])), int(round(pos[1]))
+        if 0 <= r < self.rows and 0 <= c < self.cols:
+            return float(self._b_grid[r, c])
         return 0.0
 
     def as_flat_list(self) -> list[float]:
         self._ensure_initialised()
-        return self._b_flat.tolist()
+        return self._b_grid.flatten().tolist()
 
     def update_safety_map(self, known_agents: dict, current_frame: int, powered: bool = False, hunt_mode: str = "blend"):
         new_snapshot = {gid: pos for gid, pos in known_agents.items() if pos != "UNKNOWN"}
@@ -381,7 +296,7 @@ class BeliefMap:
         n_open = self.n_nodes
         if n_open == 0:
             return
-        known_positions: list[tuple] = []
+        known_positions = []
         n_unknown = 0
         for gid, pos in known_agents.items():
             if pos == "UNKNOWN":
@@ -391,19 +306,18 @@ class BeliefMap:
             age = current_frame - self._ghost_last_seen.get(gid, current_frame)
             weight = math.exp(-age / STALENESS_DECAY)
             known_positions.append((gr, gc, weight))
+            
         sigma = HUNT_SIGMA if powered else DANGER_SIGMA
         cutoff_steps = int(3.0 * sigma)
         scores = np.zeros(self.n_nodes, dtype=np.float32)
         proximal = np.zeros(self.n_nodes, dtype=np.float32)
-        starts = []
-        weights = []
+        starts, weights = [], []
         for gr, gc, weight in known_positions:
             idx = self._closest_node((gr, gc))
             if idx >= 0:
                 starts.append(idx)
                 weights.append(weight)
         
-        # Batch all ghost indices into a single multi-source Dijkstra call
         if starts and self._graph.shape[0] > 0:
             dist_matrix = csgraph.dijkstra(self._graph, directed=False, indices=starts, unweighted=False, limit=cutoff_steps)
             if dist_matrix.ndim == 1:
@@ -437,11 +351,21 @@ class BeliefMap:
                 self._safety[:n_open] = c_norm
             else:
                 self._safety[:n_open] = ((1.0 - HUNT_CROWD_WEIGHT) * p_norm + HUNT_CROWD_WEIGHT * c_norm)
+                
+        self._safety_grid.fill(0.0)
+        rs = np.clip(np.round(self._open_arr[:, 0]).astype(np.int32), 0, self.rows - 1)
+        cs = np.clip(np.round(self._open_arr[:, 1]).astype(np.int32), 0, self.cols - 1)
+        self._safety_grid[rs, cs] = self._safety[:n_open]
+        
+        for r, c in self._disabled_wall_nodes:
+            ri, ci = int(round(r)), int(round(c))
+            if 0 <= ri < self.rows and 0 <= ci < self.cols:
+                self._safety_grid[ri, ci] = 0.0
 
     def safety_at(self, pos: tuple) -> float:
-        idx = self._closest_node(pos)
-        if idx >= 0 and idx < len(self._safety):
-            return float(self._safety[idx])
+        r, c = int(round(pos[0])), int(round(pos[1]))
+        if 0 <= r < self.rows and 0 <= c < self.cols:
+            return float(self._safety_grid[r, c])
         return 0.0
 
     def safest_cells(self, n: int = 5) -> list[tuple]:
@@ -467,7 +391,17 @@ class BeliefMap:
                     best = node
         return best
 
+    def safety_as_flat_list(self) -> list[float]:
+        return self._safety_grid.flatten().tolist()
 
+    def safety_payload(self) -> dict:
+        cells = {}
+        for r in range(self.rows):
+            for c in range(self.cols):
+                s = float(self._safety_grid[r, c])
+                if s < 0.95:
+                    cells[(r, c)] = round(s, 4)
+        return cells
 
     def _compute_topology(self):
         n = len(self._open_cells)
@@ -491,18 +425,39 @@ class BeliefMap:
                 self._nbr_idx[i, :len(idxs)] = idxs
         self._nbr_count = np.array(nbr_count_list, dtype=np.int32)
         
-        row_idx = []
-        col_idx = []
-        data_list = []
-        nodes = self._open_cells
+        self._nbr_dist = np.zeros_like(self._nbr_idx, dtype=np.float32)
+        self._nbr_dr = np.zeros_like(self._nbr_idx, dtype=np.float32)
+        self._nbr_dc = np.zeros_like(self._nbr_idx, dtype=np.float32)
+        
+        r_arr = self._open_arr[:, 0]
+        c_arr = self._open_arr[:, 1]
+        
+        row_idx, col_idx, data_list = [], [], []
         for i, idxs in enumerate(nbr_idx_list):
-            n1 = nodes[i]
             for j in idxs:
-                n2 = nodes[j]
-                dist = math.hypot(n1[0] - n2[0], n1[1] - n2[1])
+                dist = math.hypot(r_arr[i] - r_arr[j], c_arr[i] - c_arr[j])
                 row_idx.append(i)
                 col_idx.append(j)
                 data_list.append(dist)
+                
+        for k in range(self._nbr_idx.shape[1]):
+            nbrs = self._nbr_idx[:, k]
+            valid = nbrs >= 0
+            if not np.any(valid): continue
+            
+            nr = np.zeros(self.n_nodes, dtype=np.float32)
+            nc = np.zeros(self.n_nodes, dtype=np.float32)
+            nr[valid] = r_arr[nbrs[valid]]
+            nc[valid] = c_arr[nbrs[valid]]
+            
+            d_r = nr - r_arr
+            d_c = nc - c_arr
+            dist = np.hypot(d_r, d_c)
+            
+            self._nbr_dr[valid, k] = np.where(dist[valid] > 0, d_r[valid] / dist[valid], 0.0)
+            self._nbr_dc[valid, k] = np.where(dist[valid] > 0, d_c[valid] / dist[valid], 0.0)
+            self._nbr_dist[valid, k] = dist[valid]
+
         if data_list:
             data = np.array(data_list, dtype=np.float32)
             self._graph = sp.csr_matrix((data, (row_idx, col_idx)), shape=(n, n))
@@ -527,6 +482,13 @@ class BeliefMap:
                 self._b_flat[:] = 1.0 / n
         self._initialised = True
 
+    def _sync_flat_to_grid(self):
+        if self.n_nodes > 0:
+            self._b_grid.fill(0.0)
+            rs = np.clip(np.round(self._open_arr[:, 0]).astype(np.int32), 0, self.rows - 1)
+            cs = np.clip(np.round(self._open_arr[:, 1]).astype(np.int32), 0, self.cols - 1)
+            np.add.at(self._b_grid, (rs, cs), self._b_flat[:self.n_nodes])
+
     def _normalise(self):
         if self.n_nodes == 0:
             return
@@ -536,51 +498,65 @@ class BeliefMap:
             self._b_flat[:] = 1.0 / n
         else:
             self._b_flat /= total
+        self._sync_flat_to_grid()
         self._payload_dirty = True
 
-    def _uniform_diffuse(self):
-        if self.n_nodes == 0 or self._nbr_idx.shape[1] == 0:
-            return     
-        outflow = self._b_flat * ALPHA_UNIFORM
-        counts = self._nbr_count
-        share = np.zeros_like(outflow)
-        valid_mask = counts > 0
-        share[valid_mask] = outflow[valid_mask] / counts[valid_mask]
-        self._b_flat -= outflow
-        for i in range(self._nbr_idx.shape[1]):
-            nbrs = self._nbr_idx[:, i]
-            valid_nbrs = nbrs >= 0
-            np.add.at(self._b_flat, nbrs[valid_nbrs], share[valid_nbrs])
-        self._b_flat = np.maximum(0.0, self._b_flat)
+    def _pellets_changed(self, known_pellets, known_power):
+        if not hasattr(self, '_last_known_pellets'): return True
+        p_set = set(known_pellets) if known_pellets else set()
+        pow_set = set(known_power) if known_power else set()
+        return self._last_known_pellets != p_set or self._last_known_power != pow_set
 
-    def _momentum_diffuse(self):
-        if self.last_known_pos is None or self.last_known_dir == (0, 0):
-            return
+    def _update_pellet_score(self, known_pellets, known_power):
+        self._last_known_pellets = set(known_pellets) if known_pellets else set()
+        self._last_known_power = set(known_power) if known_power else set()
+        self._pellet_score = np.zeros(self.n_nodes, dtype=np.float32)
+        if self.n_nodes == 0: return
+        all_p = list(self._last_known_pellets) + list(self._last_known_power)
+        if not all_p: return
+        p_arr = np.array(all_p, dtype=np.float32)
+        tree = cKDTree(p_arr)
+        dists, _ = tree.query(self._open_arr)
+        self._pellet_score = np.exp(-dists / 5.0)
+
+    def _predictive_diffuse(self, known_pellets, known_power):
         if self.n_nodes == 0 or self._nbr_idx.shape[1] == 0:
             return
-        strength = ALPHA_MOMENTUM * math.exp(-self.frames_since_sighting / MOMENTUM_DECAY)
-        if strength < 1e-4:
-            return
-        dr, dc = self.last_known_dir
-        r = self._open_arr[:, 0]
-        c = self._open_arr[:, 1]
-        push = self._b_flat * strength
-        fwd_mask = np.zeros(self._nbr_idx.shape, dtype=bool)
-        for j in range(self._nbr_idx.shape[1]):
-            nbr_idx = self._nbr_idx[:, j]
-            valid = nbr_idx >= 0
-            nr = self._open_arr[nbr_idx[valid], 0]
-            nc = self._open_arr[nbr_idx[valid], 1]
-            alignment = (nr - r[valid]) * dr + (nc - c[valid]) * dc
-            fwd_mask[valid, j] = alignment > 0
-        fwd_counts = fwd_mask.sum(axis=1)
-        has_fwd = fwd_counts > 0
-        share = np.zeros_like(push)
-        valid_push = has_fwd & (self._b_flat >= 1e-4)
-        share[valid_push] = push[valid_push] / fwd_counts[valid_push]
-        self._b_flat[valid_push] -= push[valid_push]
-        for j in range(self._nbr_idx.shape[1]):
-            valid_receivers = valid_push & fwd_mask[:, j]
-            receivers = self._nbr_idx[valid_receivers, j]
-            np.add.at(self._b_flat, receivers, share[valid_receivers])
+            
+        outflow = self._b_flat * (ALPHA_UNIFORM + ALPHA_MOMENTUM)
+        W = np.zeros_like(self._nbr_idx, dtype=np.float32)
+        valid_mask = self._nbr_idx >= 0
+        
+        W[valid_mask] = 1.0 / np.maximum(self._nbr_dist[valid_mask], 0.1)
+        
+        nbrs_safe = np.zeros_like(W)
+        nbrs_safe[valid_mask] = self._safety[self._nbr_idx[valid_mask]]
+        W[valid_mask] *= (nbrs_safe[valid_mask] ** 2)
+        
+        if self.last_known_pos is not None and self.last_known_dir != (0, 0):
+            dr, dc = self.last_known_dir
+            alignment = self._nbr_dr * dr + self._nbr_dc * dc
+            momentum_str = math.exp(-self.frames_since_sighting / MOMENTUM_DECAY)
+            mom_factor = 1.0 + momentum_str * (np.maximum(0.1, alignment + 1.0) - 1.0)
+            W[valid_mask] *= mom_factor[valid_mask]
+            
+        if not hasattr(self, '_pellet_score') or self._pellets_changed(known_pellets, known_power):
+            self._update_pellet_score(known_pellets, known_power)
+            
+        if hasattr(self, '_pellet_score'):
+            p_score = self._pellet_score[self._nbr_idx[valid_mask]]
+            W[valid_mask] *= (1.0 + 0.5 * p_score)
+            
+        W_sum = W.sum(axis=1, keepdims=True)
+        W_sum = np.where(W_sum > 0, W_sum, 1.0)
+        W /= W_sum
+        
+        shares = outflow[:, np.newaxis] * W
+        self._b_flat -= outflow
+        
+        for k in range(self._nbr_idx.shape[1]):
+            valid = self._nbr_idx[:, k] >= 0
+            receivers = self._nbr_idx[valid, k]
+            np.add.at(self._b_flat, receivers, shares[valid, k])
+            
         self._b_flat = np.maximum(0.0, self._b_flat)

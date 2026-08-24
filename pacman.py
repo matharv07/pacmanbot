@@ -280,6 +280,9 @@ class Player:
                         target_eaten = True
             path_exhausted = not self._route
             needs_replan = (path_exhausted or ghost_emergency or power_changed or target_eaten or self._route_age > 15)
+            # Throttle expensive replanning — skip unless emergency or enough time passed
+            if needs_replan and not ghost_emergency and not path_exhausted and self._route_age < 4:
+                needs_replan = False
             if needs_replan:
                 target, path = self._pick_target(ghosts)
                 self._route = path

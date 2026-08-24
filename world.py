@@ -481,12 +481,8 @@ class World:
             if yx_p not in self.prm_nodes:
                 self.prm_nodes.append(yx_p)
                 
-        for p in self.safe_area:
-            # pacman.py snaps player start to ints, so we must inject the exact integer coordinates
-            yx_p = (float(int(p[1])), float(int(p[0])))
-            if yx_p not in self.prm_nodes:
-                self.prm_nodes.append(yx_p)
-                
+        # Removed safe_area injection: pathfinder dynamically connects queries to PRM,
+        # and n_samples + pellets already provide a dense >800 node roadmap.
         # Lock precision to float32 so dictionary hashing matches numpy array queries from ghosts
         nodes_arr = np.array(self.prm_nodes, dtype=np.float32)
         self.prm_nodes = [tuple(row) for row in nodes_arr]

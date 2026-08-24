@@ -45,8 +45,10 @@ UNKNOWN           = -1
 MEMORY_FRAMES     = 10
 HEARTBEAT_EVERY   = 5
 HEARTBEAT_TIMEOUT = 25
-RESYNC_EVERY      = 50
+RESYNC_EVERY      = 100
 OSCILLATION_WINDOW = 8   #position history length to prevent oscillations
+LIDAR_SWEEP_EVERY  = 2   #lidar sweep + LOS checks every N frames
+BELIEF_DIFFUSE_EVERY = 3 #belief map diffusion every N frames
 
 _ANGLES = np.linspace(0, 2*math.pi, RAY_COUNT, endpoint=False)
 _DX = np.cos(_ANGLES) * 0.5
@@ -103,6 +105,8 @@ class Ghost:
         self._tail_pacman_remaining = 0         #post-pop number of ghosts that will be tailing
         self._personal_map_cache = None         #cached personal map; invalidated on observation changes
         self._personal_map_dirty = True
+        self._last_lidar_frame = -999
+        self._cached_lidar_diffs = []
 
     @property
     def personal_map(self):
@@ -155,7 +159,13 @@ class Ghost:
         if self.dead:
             return newly_discovered, stale_refreshed
         self._check_liveness(all_ghosts)
-        diffs, newly_discovered, stale_refreshed = self._update_lidar_memory(all_ghosts, player_pos, powered)
+        # Throttle expensive lidar sweep to every LIDAR_SWEEP_EVERY frames
+        if self.frame - self._last_lidar_frame >= LIDAR_SWEEP_EVERY:
+            self._last_lidar_frame = self.frame
+            diffs, newly_discovered, stale_refreshed = self._update_lidar_memory(all_ghosts, player_pos, powered)
+            self._cached_lidar_diffs = diffs
+        else:
+            diffs = []
         if self.frame % HEARTBEAT_EVERY == 0:
             diffs.append(("heartbeat", self.gid, int(self.y), int(self.x), self.frame))
         self._broadcast(diffs, all_ghosts)
@@ -447,6 +457,8 @@ class Ghost:
 
     def _lidar_sweep(self, all_ghosts, player_pos, powered=False):
         visible_prm = []
+        visible_belief_idxs = set()
+        impassable_belief_nodes = []
         prm_arr = getattr(self.world, 'prm_nodes_arr', None)
         if prm_arr is not None and len(prm_arr) > 0:
             dx = prm_arr[:, 1] - self.x
@@ -456,8 +468,31 @@ class Ghost:
             if np.any(valid_mask):
                 valid_nodes = prm_arr[valid_mask]
                 valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
-                is_los = self.world.batch_line_of_sight((self.x, self.y), valid_targets, radius=0.4)
+                is_los = self.world.batch_line_of_sight((self.x, self.y), valid_targets, radius=0.4, step_size=0.5)
                 visible_prm = [tuple(n) for n, vis in zip(valid_nodes, is_los) if vis]
+
+        bm_arr = getattr(self.belief_map, '_open_arr', None)
+        if bm_arr is not None and len(bm_arr) > 0:
+            dx = bm_arr[:, 1] - self.x
+            dy = bm_arr[:, 0] - self.y
+            dist = np.hypot(dx, dy)
+            valid_mask = dist <= MAX_RAY_DIST
+            if np.any(valid_mask):
+                valid_nodes = bm_arr[valid_mask]
+                valid_idxs = np.where(valid_mask)[0]
+                valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
+                is_pass = self.world.batch_is_passable(valid_targets[:, 0], valid_targets[:, 1], radius=0.1)
+                
+                passable_targets = valid_targets[is_pass]
+                passable_idxs = valid_idxs[is_pass]
+                if len(passable_targets) > 0:
+                    is_los = self.world.batch_line_of_sight((self.x, self.y), passable_targets, radius=0.0, step_size=0.5)
+                    visible_belief_idxs.update(passable_idxs[is_los])
+                    
+                impassable_nodes = valid_nodes[~is_pass]
+                if len(impassable_nodes) > 0:
+                    impassable_belief_nodes.extend([tuple(n) for n in impassable_nodes])
+
         directions = np.column_stack((_DX, _DY))
         hit_x, hit_y = self.world.batch_raycast((self.x, self.y), directions, max_dist=MAX_RAY_DIST)
         lidar_hits = set(zip(np.round(hit_y, 2), np.round(hit_x, 2)))
@@ -470,7 +505,7 @@ class Ghost:
             dist = np.hypot(dx, dy)
             valid = pellets_arr[dist <= MAX_RAY_DIST]
             if len(valid) > 0:
-                is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0)
+                is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0, step_size=0.5)
                 for p, v in zip(valid, is_los):
                     if v and tuple(p) not in self.known_pellets:
                         self.known_pellets.add(tuple(p))
@@ -483,7 +518,7 @@ class Ghost:
             dist = np.hypot(dx, dy)
             valid = power_arr[dist <= MAX_RAY_DIST]
             if len(valid) > 0:
-                is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0)
+                is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0, step_size=0.5)
                 for p, v in zip(valid, is_los):
                     if v and tuple(p) not in self.known_power_pellets:
                         self.known_power_pellets.add(tuple(p))
@@ -511,7 +546,7 @@ class Ghost:
             if np.any(valid_mask):
                 valid_gids = np.array(alive_gids)[valid_mask]
                 valid_targets = targets[valid_mask]
-                is_los = self.world.batch_line_of_sight((self.x, self.y), valid_targets, radius=0.4)
+                is_los = self.world.batch_line_of_sight((self.x, self.y), valid_targets, radius=0.4, step_size=0.5)
                 los_gids = valid_gids[is_los]
             else:
                 los_gids = []
@@ -525,7 +560,7 @@ class Ghost:
         pacman_diff = None
         pr, pc = player_pos
         pac_d = math.hypot(pr - self.y, pc - self.x)
-        if pac_d <= MAX_RAY_DIST and self.world.line_of_sight((self.x, self.y), (pc, pr), radius=0.4):
+        if pac_d <= MAX_RAY_DIST and self.world.line_of_sight((self.x, self.y), (pc, pr), radius=0.4, step_size=0.5):
             if self.known_pacman != (pr, pc) or self.pacman_powered != powered:
                 self.known_pacman = (pr, pc)
                 if powered and not self.pacman_powered:
@@ -543,10 +578,10 @@ class Ghost:
                 self.pacman_last_seen = self.frame 
                 self.known_pacman = None
                 pacman_diff = ("pacman_lost", kr, kc, self.frame)
-        return lidar_hits, visible_prm, agent_diffs, pacman_diff, pellet_diffs
+        return lidar_hits, visible_prm, agent_diffs, pacman_diff, pellet_diffs, visible_belief_idxs, impassable_belief_nodes
 
     def _update_lidar_memory(self, all_ghosts, player_pos, powered=False):
-        lidar_hits, visible_prm, agent_diffs, pacman_diff, pellet_diffs = self._lidar_sweep(all_ghosts, player_pos, powered)
+        lidar_hits, visible_prm, agent_diffs, pacman_diff, pellet_diffs, visible_belief_idxs, impassable_belief_nodes = self._lidar_sweep(all_ghosts, player_pos, powered)
         diffs = []
         newly_discovered = 0
         stale_refreshed = 0.0
@@ -586,9 +621,11 @@ class Ghost:
             _, kr, kc, _ = pacman_diff
             self.belief_map.observe_lost((float(kr), float(kc)))
             
-        self.belief_map.diffuse((float(self.y), float(self.x)))
+        # Throttle belief diffusion to every BELIEF_DIFFUSE_EVERY frames
+        if self.frame % BELIEF_DIFFUSE_EVERY == 0:
+            self.belief_map.diffuse((float(self.y), float(self.x)), self.known_pellets, self.known_power_pellets)
         pac_pos = (float(pr), float(pc)) if pacman_in_los else None
-        self.belief_map.observe_clear((float(self.y), float(self.x)), pac_pos)
+        self.belief_map.observe_clear(visible_belief_idxs, impassable_belief_nodes, pac_pos)
         
         # Cleanup eaten pellets from memory
         self.known_pellets = {p for p in self.known_pellets if p in getattr(self.world, 'pellets', [])}
@@ -624,10 +661,11 @@ class Ghost:
 
     def _send_full_sync(self, target_ghost):
         sync_diffs = []
-        # sync missing lidar hits (very naive full sync, could be optimized)
-        for pt in self.lidar_memory:
-            if pt not in target_ghost.lidar_memory:
-                sync_diffs.append(("wall_hit", pt))
+        # sync missing lidar hits — use set difference and cap to prevent message flood
+        missing_walls = self.lidar_memory - target_ghost.lidar_memory
+        SYNC_WALL_CAP = 200
+        for pt in list(missing_walls)[:SYNC_WALL_CAP]:
+            sync_diffs.append(("wall_hit", pt))
         # sync prm timestamps
         for n, last_seen in self.prm_last_seen.items():
             if last_seen != -1:

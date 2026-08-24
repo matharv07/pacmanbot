@@ -67,7 +67,7 @@ def astar(world, start, goal):
     
     best_dist = math.inf
     if hasattr(world, 'line_of_sight'):
-        if world.line_of_sight((start[1], start[0]), (goal[1], goal[0]), radius=0.4):
+        if world.line_of_sight((start[1], start[0]), (goal[1], goal[0]), radius=0.4, step_size=0.5):
             best_dist = _euclidean(start, goal)
             
     best_i, best_j = None, None
@@ -111,13 +111,29 @@ def dijkstra_multi(world, start, targets):
     sd, si = all_conns[0]
     results = {}
     
+    # Pre-calculate batch LOS for targets within 15 units
+    direct_los = {t: False for t in target_set}
+    if hasattr(world, 'batch_line_of_sight') and target_set:
+        target_arr = np.array(target_set)
+        start_xy = (start[1], start[0])
+        dx = target_arr[:, 1] - start_xy[0]
+        dy = target_arr[:, 0] - start_xy[1]
+        dist = np.hypot(dx, dy)
+        close_mask = dist <= 15.0
+        if np.any(close_mask):
+            close_targets = target_arr[close_mask]
+            target_xy = np.column_stack((close_targets[:, 1], close_targets[:, 0]))
+            los_res = world.batch_line_of_sight(start_xy, target_xy, radius=0.4, step_size=0.5)
+            close_indices = np.where(close_mask)[0]
+            for i, is_los in zip(close_indices, los_res):
+                direct_los[target_set[i]] = is_los
+    
     for idx, t in enumerate(target_set):
         gd, gi = all_conns[idx + 1]
         best_dist = math.inf
         
-        if hasattr(world, 'line_of_sight'):
-            if world.line_of_sight((start[1], start[0]), (t[1], t[0]), radius=0.4):
-                best_dist = _euclidean(start, t)
+        if direct_los[t]:
+            best_dist = _euclidean(start, t)
                 
         if len(si) > 0 and len(gi) > 0:
             apsp_sub = world.apsp[np.ix_(si, gi)]
