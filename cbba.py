@@ -173,8 +173,8 @@ class CBBA_Agent:
             else:
                 pair = (prev_pos, tgt)
                 if pair not in getattr(self, '_astar_cache', {}):
-                    path_to_tgt = astar(ghost.world, prev_pos, tgt)
-                    d = float(len(path_to_tgt) - 1) if path_to_tgt else math.inf
+                    res = dijkstra_multi(ghost.world, prev_pos, [tgt])
+                    d = res[tgt][0] if tgt in res else math.inf
                     if not hasattr(self, '_astar_cache'):
                         self._astar_cache = {}
                     self._astar_cache[pair] = d

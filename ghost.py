@@ -48,7 +48,7 @@ HEARTBEAT_TIMEOUT = 25
 RESYNC_EVERY      = 100
 OSCILLATION_WINDOW = 8   #position history length to prevent oscillations
 LIDAR_SWEEP_EVERY  = 2   #lidar sweep + LOS checks every N frames
-BELIEF_DIFFUSE_EVERY = 3 #belief map diffusion every N frames
+BELIEF_DIFFUSE_EVERY = 1 #belief map diffusion every N frames
 
 _ANGLES = np.linspace(0, 2*math.pi, RAY_COUNT, endpoint=False)
 _DX = np.cos(_ANGLES) * 0.5
@@ -150,6 +150,18 @@ class Ghost:
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False, speed_mult=1.0):
         self.frame += 1
+        if player_pos:
+            if not hasattr(self, '_prev_player_pos'):
+                self._prev_player_pos = player_pos
+                self._player_dir = (0, 0)
+            else:
+                dy = player_pos[0] - self._prev_player_pos[0]
+                dx = player_pos[1] - self._prev_player_pos[1]
+                n = math.hypot(dx, dy)
+                if n > 0.01:
+                    self._player_dir = (dy/n, dx/n)
+                self._prev_player_pos = player_pos
+                
         if getattr(self, 'pacman_power_timer', 0) > 0:
             self.pacman_power_timer -= 1
             if self.pacman_power_timer <= 0:
@@ -481,7 +493,7 @@ class Ghost:
                 valid_nodes = bm_arr[valid_mask]
                 valid_idxs = np.where(valid_mask)[0]
                 valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
-                is_pass = self.world.batch_is_passable(valid_targets[:, 0], valid_targets[:, 1], radius=0.1)
+                is_pass = self.world.batch_is_passable(valid_targets[:, 0], valid_targets[:, 1], radius=0.0)
                 
                 passable_targets = valid_targets[is_pass]
                 passable_idxs = valid_idxs[is_pass]

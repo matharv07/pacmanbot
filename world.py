@@ -149,6 +149,7 @@ class World:
             return grid.astype(bool)
             
         self._grid_0_0 = ~rasterize_collided(0.0)
+        self._grid_0_3 = ~rasterize_collided(0.3)
         self._grid_0_4 = ~rasterize_collided(0.4)
 
     def batch_is_passable(self, px, py, radius=0):
@@ -162,6 +163,8 @@ class World:
             
             if abs(radius - 0.4) < 1e-4:
                 grid = self._grid_0_4
+            elif abs(radius - 0.3) < 1e-4:
+                grid = self._grid_0_3
             elif radius < 1e-4:
                 grid = self._grid_0_0
             else:
