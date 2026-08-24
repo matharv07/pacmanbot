@@ -126,23 +126,29 @@ class Ghost:
             pmap[rs[valid], cs[valid]] = 1
                 
         # Fill in empty spaces from PRM visibility
-        for n, last_seen in self.prm_last_seen.items():
-            if last_seen != -1:
-                r, c = int(n[0]), int(n[1])
-                if 0 <= r < rows and 0 <= c < cols and pmap[r, c] == -1:
-                    pmap[r, c] = 0
+        valid_prm = [n for n, last in self.prm_last_seen.items() if last != -1]
+        if valid_prm:
+            arr = np.array(valid_prm, dtype=np.int32)
+            rs = arr[:, 0]
+            cs = arr[:, 1]
+            valid = (rs >= 0) & (rs < rows) & (cs >= 0) & (cs < cols)
+            rs_valid, cs_valid = rs[valid], cs[valid]
+            empty_mask = pmap[rs_valid, cs_valid] == -1
+            pmap[rs_valid[empty_mask], cs_valid[empty_mask]] = 0
                     
         # Mark known pellets
-        for px, py in self.known_pellets:
-            r, c = int(py), int(px)
-            if 0 <= r < rows and 0 <= c < cols:
-                pmap[r, c] = 2
+        if self.known_pellets:
+            arr = np.array(list(self.known_pellets), dtype=np.int32)
+            rs, cs = arr[:, 1], arr[:, 0]
+            valid = (rs >= 0) & (rs < rows) & (cs >= 0) & (cs < cols)
+            pmap[rs[valid], cs[valid]] = 2
                 
         # Mark known power pellets
-        for px, py in self.known_power_pellets:
-            r, c = int(py), int(px)
-            if 0 <= r < rows and 0 <= c < cols:
-                pmap[r, c] = 3
+        if self.known_power_pellets:
+            arr = np.array(list(self.known_power_pellets), dtype=np.int32)
+            rs, cs = arr[:, 1], arr[:, 0]
+            valid = (rs >= 0) & (rs < rows) & (cs >= 0) & (cs < cols)
+            pmap[rs[valid], cs[valid]] = 3
         
         self._personal_map_cache = pmap
         self._personal_map_dirty = False
@@ -640,15 +646,23 @@ class Ghost:
             _, kr, kc, _ = pacman_diff
             self.belief_map.observe_lost((float(kr), float(kc)))
             
-        # Throttle belief diffusion to every BELIEF_DIFFUSE_EVERY frames
-        if self.frame % BELIEF_DIFFUSE_EVERY == 0:
+        # Throttle belief diffusion to every BELIEF_DIFFUSE_EVERY frames and stagger by ghost ID
+        if (self.frame + self.gid) % BELIEF_DIFFUSE_EVERY == 0:
             self.belief_map.diffuse((float(self.y), float(self.x)), self.known_pellets, self.known_power_pellets)
         pac_pos = (float(pr), float(pc)) if pacman_in_los else None
         self.belief_map.observe_clear(visible_belief_idxs, impassable_belief_nodes, pac_pos)
         
         # Cleanup eaten pellets from memory
-        self.known_pellets = {p for p in self.known_pellets if p in getattr(self.world, 'pellets', [])}
-        self.known_power_pellets = {p for p in self.known_power_pellets if p in getattr(self.world, 'power_pellets', [])}
+        world_pellets = getattr(self.world, 'pellet_set', None)
+        if world_pellets is None:
+            world_pellets = set(getattr(self.world, 'pellets', []))
+            
+        world_power_pellets = getattr(self.world, 'power_pellet_set', None)
+        if world_power_pellets is None:
+            world_power_pellets = set(getattr(self.world, 'power_pellets', []))
+            
+        self.known_pellets = {p for p in self.known_pellets if p in world_pellets}
+        self.known_power_pellets = {p for p in self.known_power_pellets if p in world_power_pellets}
         
         return diffs, newly_discovered, stale_refreshed
 

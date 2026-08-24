@@ -23,7 +23,7 @@ class CBBA_Agent:
         self.z: dict = {}       #task winners
         self.s: dict = {}       #last sync frames
         self._task_map: dict = {}
-        self._last_auction: int = -1
+        self._last_auction: int = -gid  # Stagger initial auction frames
         self._dist_cache: dict = {}   #(pos) -> distance, cached per-auction
         self._astar_cache: dict = {}  #persists across auctions
 
@@ -42,7 +42,8 @@ class CBBA_Agent:
                     changed = True
         if changed:
             self._cascade_release()
-        if frame - self._last_auction >= AUCTION_EVERY or not self.bundle:
+        # Strictly stagger and throttle to prevent auction spam when bundle is empty
+        if (frame + self.gid) % AUCTION_EVERY == 0 and frame != self._last_auction:
             self._last_auction = frame
             tasks, dists = generate_tasks(ghost, frame)                
             self._task_map = {_task_key(t): t for t in tasks}

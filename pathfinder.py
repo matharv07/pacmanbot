@@ -14,38 +14,80 @@ def _connect_temp_nodes_batch(world, nodes_list):
     if not hasattr(world, '_conn_cache'):
         world._conn_cache = {}
         
-    for origin in nodes_list:
+    misses = []
+    results_map = {}
+    
+    for i, origin in enumerate(nodes_list):
         origin_tup = (round(origin[0], 2), round(origin[1], 2))
         if origin_tup in world._conn_cache:
-            results.append(world._conn_cache[origin_tup])
-            continue
-            
-        dy = prm_arr[:, 0] - origin[0]
-        dx = prm_arr[:, 1] - origin[1]
-        dist = np.hypot(dx, dy)
-        valid_mask = dist <= 10.0
-        
-        valid_indices = np.where(valid_mask)[0]
-        if len(valid_indices) > 0:
-            valid_nodes = prm_arr[valid_indices]
-            valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
-            
-            if hasattr(world, 'batch_line_of_sight'):
-                los = world.batch_line_of_sight(origin, valid_targets, radius=0.4)
-            else:
-                los = np.array([world.line_of_sight(origin, (t[0], t[1]), radius=0.4) for t in valid_targets])
-                
-            clear_indices = valid_indices[los]
-            clear_dists = dist[clear_indices]
-            res = (clear_dists, clear_indices)
+            results_map[i] = world._conn_cache[origin_tup]
         else:
-            res = (np.array([]), np.array([], dtype=int))
+            misses.append((i, origin, origin_tup))
             
-        world._conn_cache[origin_tup] = res
-        results.append(res)
+    if misses:
+        all_p1s = []
+        all_p2s = []
+        all_dists = []
+        all_indices = []
+        miss_offsets = []
+        current_offset = 0
         
+        for i, origin, origin_tup in misses:
+            dy = prm_arr[:, 0] - origin[0]
+            dx = prm_arr[:, 1] - origin[1]
+            dist = np.hypot(dx, dy)
+            valid_mask = dist <= 10.0
+            
+            valid_indices = np.where(valid_mask)[0]
+            if len(valid_indices) > 0:
+                valid_nodes = prm_arr[valid_indices]
+                valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
+                
+                p1_arr = np.full((len(valid_targets), 2), origin, dtype=np.float32)
+                all_p1s.append(p1_arr)
+                all_p2s.append(valid_targets)
+                all_dists.append(dist[valid_indices])
+                all_indices.append(valid_indices)
+                
+                miss_offsets.append((i, origin_tup, current_offset, current_offset + len(valid_targets)))
+                current_offset += len(valid_targets)
+            else:
+                miss_offsets.append((i, origin_tup, current_offset, current_offset))
+                
+        if current_offset > 0:
+            p1s = np.vstack(all_p1s)
+            p2s = np.vstack(all_p2s)
+            dists = np.concatenate(all_dists)
+            indices = np.concatenate(all_indices)
+            
+            if hasattr(world, 'batch_line_of_sight_pairs'):
+                los = world.batch_line_of_sight_pairs(p1s, p2s, radius=0.4, step_size=0.5)
+            elif hasattr(world, 'batch_line_of_sight'):
+                # Fallback if pairs isn't available
+                los = np.zeros(len(p1s), dtype=bool)
+                for start, p1 in zip(range(0, len(p1s), current_offset), all_p1s):
+                    # Inefficient fallback
+                    pass
+            else:
+                los = np.ones(len(p1s), dtype=bool)
+                
+        for i, origin_tup, start, end in miss_offsets:
+            if start == end:
+                res = (np.array([]), np.array([], dtype=int))
+            else:
+                l_mask = los[start:end]
+                clear_dists = dists[start:end][l_mask]
+                clear_indices = indices[start:end][l_mask]
+                res = (clear_dists, clear_indices)
+            
+            world._conn_cache[origin_tup] = res
+            results_map[i] = res
+            
     if len(world._conn_cache) > 20000:
         world._conn_cache.clear()
+        
+    for i in range(len(nodes_list)):
+        results.append(results_map[i])
         
     return results
 

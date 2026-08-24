@@ -1,0 +1,48 @@
+         4187881 function calls (4180958 primitive calls) in 10.871 seconds
+
+   Ordered by: cumulative time
+   List reduced from 381 to 40 due to restriction <40>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      100    0.115    0.001   10.869    0.109 /home/atharv/xTerra/pacmanbot/worker.py:130(step)
+     1702    0.308    0.000    8.179    0.005 /home/atharv/xTerra/pacmanbot/ghost.py:157(update)
+      852    0.074    0.000    4.855    0.006 /home/atharv/xTerra/pacmanbot/ghost.py:608(_update_lidar_memory)
+      852    0.316    0.000    1.884    0.002 /home/atharv/xTerra/pacmanbot/ghost.py:476(_lidar_sweep)
+      852    0.450    0.001    1.803    0.002 /home/atharv/xTerra/pacmanbot/beliefmap.py:328(diffuse)
+      283    0.001    0.000    1.213    0.004 /home/atharv/xTerra/pacmanbot/reward.py:155(shaping)
+      283    0.002    0.000    1.212    0.004 /home/atharv/xTerra/pacmanbot/reward.py:147(potential)
+    34617    1.181    0.000    1.181    0.000 {built-in method numpy.array}
+      283    0.006    0.000    1.174    0.004 /home/atharv/xTerra/pacmanbot/reward.py:110(_phi_explore)
+     1419    0.104    0.000    1.160    0.001 /home/atharv/xTerra/pacmanbot/ghost.py:111(personal_map)
+     5419    0.387    0.000    1.112    0.000 /home/atharv/xTerra/pacmanbot/world.py:209(batch_line_of_sight)
+     1702    0.318    0.000    1.062    0.001 /home/atharv/xTerra/pacmanbot/beliefmap.py:450(update_safety_map)
+      852    0.845    0.001    0.937    0.001 /home/atharv/xTerra/pacmanbot/beliefmap.py:743(_compute_diffusion_weights)
+    13823    0.610    0.000    0.752    0.000 /home/atharv/xTerra/pacmanbot/world.py:157(batch_is_passable)
+      852    0.315    0.000    0.694    0.001 /home/atharv/xTerra/pacmanbot/beliefmap.py:241(observe_clear)
+     1648    0.106    0.000    0.686    0.000 /home/atharv/xTerra/pacmanbot/pathfinder.py:8(_connect_temp_nodes_batch)
+      973    0.080    0.000    0.686    0.001 /home/atharv/xTerra/pacmanbot/pathfinder.py:145(dijkstra_multi)
+      600    0.075    0.000    0.658    0.001 /home/atharv/xTerra/pacmanbot/pacman.py:237(update)
+     1264    0.235    0.000    0.513    0.000 /home/atharv/xTerra/pacmanbot/world.py:239(batch_line_of_sight_pairs)
+      398    0.015    0.000    0.473    0.001 /home/atharv/xTerra/pacmanbot/allocator.py:151(generate_tasks)
+     1702    0.053    0.000    0.416    0.000 /home/atharv/xTerra/pacmanbot/ghost.py:732(_process_messages)
+   378852    0.393    0.000    0.393    0.000 {built-in method builtins.round}
+    58921    0.064    0.000    0.388    0.000 /home/atharv/.local/lib/python3.10/site-packages/numpy/core/fromnumeric.py:53(_wrapfunc)
+     1702    0.018    0.000    0.384    0.000 /home/atharv/xTerra/pacmanbot/cbba.py:34(step)
+      852    0.345    0.000    0.345    0.000 /home/atharv/xTerra/pacmanbot/ghost.py:664(<setcomp>)
+     6257    0.075    0.000    0.333    0.000 /home/atharv/xTerra/pacmanbot/world.py:309(resolve_collision)
+      201    0.009    0.000    0.325    0.002 /home/atharv/xTerra/pacmanbot/pacman.py:186(_pick_target)
+      675    0.008    0.000    0.312    0.000 /home/atharv/xTerra/pacmanbot/pathfinder.py:102(astar)
+      244    0.142    0.001    0.308    0.001 /home/atharv/xTerra/pacmanbot/beliefmap.py:687(_update_pellet_score)
+     2480    0.028    0.000    0.276    0.000 /home/atharv/xTerra/pacmanbot/beliefmap.py:665(_normalise)
+      100    0.004    0.000    0.263    0.003 /home/atharv/xTerra/pacmanbot/worker.py:98(observe)
+      921    0.110    0.000    0.260    0.000 /home/atharv/xTerra/pacmanbot/beliefmap.py:351(merge)
+    26560    0.067    0.000    0.230    0.000 /home/atharv/.local/lib/python3.10/site-packages/numpy/core/fromnumeric.py:71(_wrapreduction)
+     3064    0.025    0.000    0.226    0.000 /home/atharv/.local/lib/python3.10/site-packages/scipy/sparse/_compressed.py:29(__init__)
+    36172    0.223    0.000    0.223    0.000 {method 'reduce' of 'numpy.ufunc' objects}
+     3297    0.022    0.000    0.221    0.000 /home/atharv/xTerra/pacmanbot/ghost.py:669(_broadcast)
+     2480    0.031    0.000    0.221    0.000 /home/atharv/xTerra/pacmanbot/beliefmap.py:658(_sync_flat_to_grid)
+     6368    0.156    0.000    0.212    0.000 /home/atharv/xTerra/pacmanbot/world.py:103(_points_to_segments_dist_sq)
+      283    0.049    0.000    0.211    0.001 /home/atharv/xTerra/pacmanbot/obs.py:45(build_spatial)
+      852    0.192    0.000    0.211    0.000 /home/atharv/xTerra/pacmanbot/world.py:270(batch_raycast)
+
+

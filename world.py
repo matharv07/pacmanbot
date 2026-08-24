@@ -75,6 +75,8 @@ class World:
         """Rebuild cached pellet/power arrays after any pellet list change."""
         self.pellets_arr = np.array(self.pellets, dtype=np.float32) if self.pellets else np.empty((0, 2), dtype=np.float32)
         self.power_pellets_arr = np.array(self.power_pellets, dtype=np.float32) if self.power_pellets else np.empty((0, 2), dtype=np.float32)
+        self.pellet_set = set(self.pellets)
+        self.power_pellet_set = set(self.power_pellets)
 
     def _compile_obstacles(self):
         """Compiles obstacle primitives into a high performance numpy tensor for vectorized ops."""
@@ -211,18 +213,59 @@ class World:
         dx = p2s[:, 0] - p1[0]
         dy = p2s[:, 1] - p1[1]
         dist = np.hypot(dx, dy)
-        max_dist = np.max(dist)
-        if max_dist == 0:
-            return np.full(len(p2s), self.is_passable(p1[0], p1[1], radius))
-        n_steps = max(2, int(math.ceil(max_dist / step_size)))
-        fracs = np.linspace(0, 1.0, n_steps)[:, np.newaxis]
-        step_dists = fracs * max_dist
-        valid_steps = step_dists <= dist
-        px = p1[0] + fracs * dx
-        py = p1[1] + fracs * dy
-        passable = self.batch_is_passable(px, py, radius)
-        passable = passable | (~valid_steps)
-        return np.all(passable, axis=0)
+        
+        n_steps_arr = np.maximum(2, np.ceil(dist / step_size).astype(int))
+        total_steps = np.sum(n_steps_arr)
+        
+        indices = np.repeat(np.arange(len(p2s)), n_steps_arr)
+        
+        ones = np.ones(total_steps, dtype=int)
+        start_idx = np.cumsum(n_steps_arr) - n_steps_arr
+        ones[start_idx] = 1 - np.roll(n_steps_arr, 1)
+        ones[0] = 0
+        local_idx = np.cumsum(ones)
+        
+        fracs = local_idx / (n_steps_arr[indices] - 1)
+        
+        px_flat = p1[0] + fracs * dx[indices]
+        py_flat = p1[1] + fracs * dy[indices]
+        
+        passable_flat = self.batch_is_passable(px_flat, py_flat, radius)
+        
+        fails = ~passable_flat
+        fail_counts = np.bincount(indices, weights=fails, minlength=len(p2s))
+        return fail_counts == 0
+
+    def batch_line_of_sight_pairs(self, p1s, p2s, radius=0, step_size=0.2):
+        if len(p1s) == 0:
+            return np.array([], dtype=bool)
+        p1s = np.array(p1s)
+        p2s = np.array(p2s)
+        dx = p2s[:, 0] - p1s[:, 0]
+        dy = p2s[:, 1] - p1s[:, 1]
+        dist = np.hypot(dx, dy)
+        
+        n_steps_arr = np.maximum(2, np.ceil(dist / step_size).astype(int))
+        total_steps = np.sum(n_steps_arr)
+        
+        indices = np.repeat(np.arange(len(p1s)), n_steps_arr)
+        
+        ones = np.ones(total_steps, dtype=int)
+        start_idx = np.cumsum(n_steps_arr) - n_steps_arr
+        ones[start_idx] = 1 - np.roll(n_steps_arr, 1)
+        ones[0] = 0
+        local_idx = np.cumsum(ones)
+        
+        fracs = local_idx / (n_steps_arr[indices] - 1)
+        
+        px_flat = p1s[indices, 0] + fracs * dx[indices]
+        py_flat = p1s[indices, 1] + fracs * dy[indices]
+        
+        passable_flat = self.batch_is_passable(px_flat, py_flat, radius)
+        
+        fails = ~passable_flat
+        fail_counts = np.bincount(indices, weights=fails, minlength=len(p1s))
+        return fail_counts == 0
 
     def batch_raycast(self, origin, directions, max_dist=10.0):
         if len(self.compiled_segments) == 0:
@@ -366,9 +409,11 @@ class World:
                 return ~grid_cv.astype(bool)
 
             # Carve openings to connect all regions
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
             for _ in range(200):
                 grid = get_conn_grid(0.35)
-                labeled_array, num_features = scipy.ndimage.label(grid, structure=np.ones((3,3)))
+                num_labels, labeled_array = cv2.connectedComponents(grid.astype(np.uint8), connectivity=8)
+                num_features = num_labels - 1
                 
                 if num_features <= 1:
                     break
@@ -381,13 +426,13 @@ class World:
                 if len(valid_components) <= 1:
                     break
                     
-                mask_largest = (labeled_array == largest_component)
-                mask_other = np.isin(labeled_array, valid_components) & ~mask_largest
+                mask_largest = (labeled_array == largest_component).astype(np.uint8)
+                mask_other = (np.isin(labeled_array, valid_components) & (labeled_array != largest_component)).astype(np.uint8)
                 
-                dilated_largest = scipy.ndimage.binary_dilation(mask_largest, iterations=15)
-                dilated_other = scipy.ndimage.binary_dilation(mask_other, iterations=15)
+                dilated_largest = cv2.dilate(mask_largest, kernel)
+                dilated_other = cv2.dilate(mask_other, kernel)
                 
-                boundary = dilated_largest & dilated_other & (labeled_array == 0)
+                boundary = (dilated_largest > 0) & (dilated_other > 0) & (labeled_array == 0)
                 boundary_pts = np.argwhere(boundary)
                 
                 if len(boundary_pts) == 0:
@@ -422,7 +467,8 @@ class World:
             
             # Re-evaluate final connected space
             grid = get_conn_grid(0.35)
-            labeled_array, num_features = scipy.ndimage.label(grid, structure=np.ones((3,3)))
+            num_labels, labeled_array = cv2.connectedComponents(grid.astype(np.uint8), connectivity=8)
+            num_features = num_labels - 1
             
             if num_features > 0:
                 component_sizes = np.bincount(labeled_array.ravel())

@@ -202,7 +202,10 @@ class Player:
                 if len(path) >= 2:
                     return best_ghost_target, list(path[1:])
                     
-        targets = [(t[1], t[0]) for t in self.world.pellets + self.world.power_pellets]
+        all_targets = [(t[1], t[0]) for t in self.world.pellets + self.world.power_pellets]
+        # Pre-filter to closest 15 targets by manhattan distance to reduce dijkstra_multi overhead
+        all_targets.sort(key=lambda t: abs(t[0] - start[0]) + abs(t[1] - start[1]))
+        targets = all_targets[:15]
         dists = pathfinder.dijkstra_multi(self.world, start, targets)
         
         best_score = float('inf')
