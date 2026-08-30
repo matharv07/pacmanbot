@@ -15,7 +15,7 @@ UNKNOWN = -1
 MAX_H = 33
 MAX_W = 41
 MAX_GHOSTS   = 7
-SPATIAL_CH   = 16       #number of spatial channels (see channel map below)
+SPATIAL_CH   = 16        #number of spatial channels (see channel map below)
 GLOBAL_SPATIAL_CH = 11   #number of channels in the omniscient global state
 VEC_DIM      = 104
 CRITIC_VEC_DIM = MAX_GHOSTS * VEC_DIM + MAX_GHOSTS
@@ -55,24 +55,21 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int = None, cols: int = 
     out[1] = (p == PELLET)
     out[2] = (p == POWER)
     out[3] = (p == UNKNOWN)
-    
     #channel 4: belief map — project flat probability onto grid via PRM nodes
     bm = ghost.belief_map
     if hasattr(bm, '_open_arr') and len(bm._open_arr) > 0:
         r_arr = bm._open_arr[:, 0].astype(np.int32)
         c_arr = bm._open_arr[:, 1].astype(np.int32)
-        
         if hasattr(bm, '_b_flat') and bm._initialised:
             valid = (r_arr >= 0) & (r_arr < rows) & (c_arr >= 0) & (c_arr < cols) & (np.arange(len(r_arr)) < len(bm._b_flat))
             np.maximum.at(out[4], (r_arr[valid], c_arr[valid]), bm._b_flat[valid])
-        
         #channel 5: safety map — project flat safety onto grid via PRM nodes
         if hasattr(bm, '_safety'):
             valid = (r_arr >= 0) & (r_arr < rows) & (c_arr >= 0) & (c_arr < cols) & (np.arange(len(r_arr)) < len(bm._safety))
             np.maximum.at(out[5], (r_arr[valid], c_arr[valid]), bm._safety[valid])
-    
     #gaussian blob position encoding — preserves sub-cell precision for continuous coordinates
     _BLOB_SIGMA = 0.6
+
     def _place_blob(channel, fy, fx):
         """Place a small Gaussian blob at continuous position (fy, fx) on the given channel."""
         cr, cc = int(fy), int(fx)
@@ -97,7 +94,6 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int = None, cols: int = 
             r, c = pos
             if 0 <= r < rows and 0 <= c < cols:
                 _place_blob(out[ch], float(r), float(c))
-    
     #channel 14: staleness from prm_last_seen dict
     stale_ch = np.ones((rows, cols), dtype=np.float32)  # default max staleness
     if ghost.prm_last_seen:
@@ -105,15 +101,11 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int = None, cols: int = 
         last_seen = np.array(list(ghost.prm_last_seen.values()))
         ri = nodes[:, 0].astype(np.int32)
         ci = nodes[:, 1].astype(np.int32)
-        
         valid = (ri >= 0) & (ri < rows) & (ci >= 0) & (ci < cols)
         v_ri, v_ci, v_ls = ri[valid], ci[valid], last_seen[valid]
-        
         seen_mask = v_ls >= 0
         stale_vals = np.clip(ghost.frame - v_ls[seen_mask], 0, 200) / 200.0
-        
         stale_ch[v_ri[seen_mask], v_ci[seen_mask]] = stale_vals
-    
     out[14] = stale_ch
     out[15] = recent_noms[:rows, :cols]
     return out
@@ -169,6 +161,12 @@ def build_valid_mask(ghost, rows: int = None, cols: int = None) -> np.ndarray:
         rows, cols = ghost.personal_map.shape
     p = ghost.personal_map
     mask = (p != WALL)
+    if hasattr(ghost, 'cbba_agent') and hasattr(ghost.cbba_agent, '_unreachable_cache'):
+        for pos, timeout_frame in ghost.cbba_agent._unreachable_cache.items():
+            if timeout_frame > ghost.frame:
+                r, c = int(pos[0]), int(pos[1])
+                if 0 <= r < rows and 0 <= c < cols:
+                    mask[r, c] = False
     return mask
 
 def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int) -> list:

@@ -10,29 +10,42 @@ LT              = 3
 LAMBDA          = 0.99   #time decay factor
 
 def _task_key(task: Task) -> tuple:
-    return (int(task.task_type), task.target_pos, getattr(task, 'owner', -1))
+    return (int(task.task_type), task.target_pos, getattr(task, 'owner', -1), task.created_frame)
 
 class CBBA_Agent:
     def __init__(self, gid: int, lt: int = LT, lamda: float = LAMBDA):
         self.gid = gid
         self.lt = lt
         self.lamda = lamda
-        self.bundle: list = []  #tasks in agent's bundle
-        self.path: list = []    #agent's ordered tasks for execution
-        self.y: dict = {}       #winning bids
-        self.z: dict = {}       #task winners
-        self.s: dict = {}       #last sync frames
+        self.bundle: list = []          #tasks in agent's bundle
+        self.path: list = []            #agent's ordered tasks for execution
+        self.y: dict = {}               #winning bids
+        self.z: dict = {}               #task winners
+        self.s: dict = {}               #last sync frames
         self._task_map: dict = {}
         self._last_auction: int = -gid  # Stagger initial auction frames
-        self._dist_cache: dict = {}   #(pos) -> distance, cached per-auction
-        self._astar_cache: dict = {}  #persists across auctions
+        self._dist_cache: dict = {}     #(pos) -> distance, cached per-auction
+        self._astar_cache: dict = {}    #persists across auctions
+        self._unreachable_cache: dict = {} #(pos) -> timeout_frame
 
     def reset_caches(self):
         self._dist_cache.clear()
         self._astar_cache.clear()
 
+    def mark_unreachable(self, target_pos: tuple, frame: int):
+        self._unreachable_cache[target_pos] = frame + 150  # 5 seconds penalty
+
     def step(self, ghost, frame: int) -> Optional[Task]:
         changed = False
+        for pos, timeout in list(self._unreachable_cache.items()):
+            if frame > timeout:
+                del self._unreachable_cache[pos]
+        for key in set(self.y.keys()) | set(self.z.keys()) | set(self._task_map.keys()):
+            if frame - key[3] > 60:
+                self.y.pop(key, None)
+                self.z.pop(key, None)
+                self._task_map.pop(key, None)
+                changed = True
         for key in list(self.z.keys()):
             winner = self.z[key]
             if winner is not None and winner != self.gid:
@@ -42,7 +55,6 @@ class CBBA_Agent:
                     changed = True
         if changed:
             self._cascade_release()
-        # Strictly stagger and throttle to prevent auction spam when bundle is empty
         if (frame + self.gid) % AUCTION_EVERY == 0 and frame != self._last_auction:
             self._last_auction = frame
             tasks, dists = generate_tasks(ghost, frame)                
@@ -65,19 +77,18 @@ class CBBA_Agent:
                 task = self._task_map.get(key)
                 if task is None:
                     #reconstruct task from consensus if we didn't evaluate it locally
-                    task_type, target_pos, owner = key
+                    task_type, target_pos, owner, created_frame = key
                     score = self.y.get(key, 0.0)
-                    task = Task(task_type=task_type, target_pos=target_pos, score=score, owner=owner)
+                    task = Task(task_type=task_type, target_pos=target_pos, score=score, owner=owner, created_frame=created_frame)
                 if task and task.score > best_score:
                     best_score = task.score
                     best_task = task
         return best_task
 
-    def get_consensus_payload(self) -> dict:    #forwards consensus instead of raw tasks
+    def get_consensus_payload(self) -> dict:  #forwards consensus instead of raw tasks
         return {"y": dict(self.y), "z": dict(self.z), "s": dict(self.s)}
 
-    def receive_consensus(self, sender_gid: int, y_k: dict, z_k: dict, s_k: dict, frame: int) -> bool:
-        #snapshot before updating to pass into _table1
+    def receive_consensus(self, sender_gid: int, y_k: dict, z_k: dict, s_k: dict, frame: int) -> bool:  #snapshot before updating to pass into _table1
         s_i_snapshot = dict(self.s)
         self.s[sender_gid] = max(self.s.get(sender_gid, -1), frame)
         for agent_id, ts in s_k.items():
@@ -147,6 +158,8 @@ class CBBA_Agent:
         task = self._task_map.get(key)
         if task is None:
             return 0.0, 0
+        if self._unreachable_cache.get(task.target_pos, -1) > ghost.frame:
+            return 0.0, 0
         s_old = self._path_score(self.path, ghost)
         best_gain = -math.inf
         best_n = 0
@@ -178,6 +191,8 @@ class CBBA_Agent:
                     d = res[tgt][0] if tgt in res else math.inf
                     if not hasattr(self, '_astar_cache'):
                         self._astar_cache = {}
+                    if len(self._astar_cache) > 2000:
+                        self._astar_cache.clear()
                     self._astar_cache[pair] = d
                 d = self._astar_cache[pair]
             cumulative += d

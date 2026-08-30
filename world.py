@@ -72,14 +72,12 @@ class World:
         self.power_pellets_arr = np.empty((0, 2), dtype=np.float32)
 
     def _update_pellet_arrays(self):
-        """Rebuild cached pellet/power arrays after any pellet list change."""
         self.pellets_arr = np.array(self.pellets, dtype=np.float32) if self.pellets else np.empty((0, 2), dtype=np.float32)
         self.power_pellets_arr = np.array(self.power_pellets, dtype=np.float32) if self.power_pellets else np.empty((0, 2), dtype=np.float32)
         self.pellet_set = set(self.pellets)
         self.power_pellet_set = set(self.power_pellets)
 
     def _compile_obstacles(self):
-        """Compiles obstacle primitives into a high performance numpy tensor for vectorized ops."""
         segs = []
         for obs in self.obstacles:
             if isinstance(obs, Capsule):
@@ -101,7 +99,6 @@ class World:
             self._l2_safe = np.where(self._mask, 1.0, l2)
 
     def _points_to_segments_dist_sq(self, px, py):
-        """Vectorized point-to-segment squared distance. px, py are (M,) arrays."""
         if len(self.compiled_segments) == 0:
             return np.full((len(px), 0), np.inf), np.empty((1, 0)) 
         px = px[:, np.newaxis] #(M, 1)
@@ -162,7 +159,6 @@ class World:
             cx = (px / res).astype(np.int32)
             cy = (py / res).astype(np.int32)
             valid = (cx >= 0) & (cx < cols) & (cy >= 0) & (cy < rows)
-            
             if abs(radius - 0.4) < 1e-4:
                 grid = self._grid_0_4
             elif abs(radius - 0.3) < 1e-4:
@@ -170,17 +166,14 @@ class World:
             elif radius < 1e-4:
                 grid = self._grid_0_0
             else:
-                grid = None
-                
+                grid = None                
             if grid is not None:
                 ans = np.zeros_like(px, dtype=bool)
                 ans[valid] = grid[cy[valid], cx[valid]]
                 return ans
-
         out_of_bounds = (px - radius < 0) | (px + radius > self.width) | (py - radius < 0) | (py + radius > self.height)
         if len(self.compiled_segments) == 0:
             return ~out_of_bounds
-        
         px_flat = px.ravel()
         py_flat = py.ravel()
         collided = np.zeros(len(px_flat), dtype=bool)
@@ -190,7 +183,6 @@ class World:
             py_c = py_flat[i:i+chunk_size]
             dist_sq, r_seg = self._points_to_segments_dist_sq(px_c, py_c)
             collided[i:i+chunk_size] = np.any(dist_sq <= (r_seg + radius)**2, axis=1)
-        
         ans_flat = ~(out_of_bounds.ravel() | collided)
         return ans_flat.reshape(px.shape)
 
@@ -213,25 +205,18 @@ class World:
         dx = p2s[:, 0] - p1[0]
         dy = p2s[:, 1] - p1[1]
         dist = np.hypot(dx, dy)
-        
         n_steps_arr = np.maximum(2, np.ceil(dist / step_size).astype(int))
         total_steps = np.sum(n_steps_arr)
-        
         indices = np.repeat(np.arange(len(p2s)), n_steps_arr)
-        
         ones = np.ones(total_steps, dtype=int)
         start_idx = np.cumsum(n_steps_arr) - n_steps_arr
         ones[start_idx] = 1 - np.roll(n_steps_arr, 1)
         ones[0] = 0
         local_idx = np.cumsum(ones)
-        
         fracs = local_idx / (n_steps_arr[indices] - 1)
-        
         px_flat = p1[0] + fracs * dx[indices]
         py_flat = p1[1] + fracs * dy[indices]
-        
         passable_flat = self.batch_is_passable(px_flat, py_flat, radius)
-        
         fails = ~passable_flat
         fail_counts = np.bincount(indices, weights=fails, minlength=len(p2s))
         return fail_counts == 0
@@ -244,25 +229,18 @@ class World:
         dx = p2s[:, 0] - p1s[:, 0]
         dy = p2s[:, 1] - p1s[:, 1]
         dist = np.hypot(dx, dy)
-        
         n_steps_arr = np.maximum(2, np.ceil(dist / step_size).astype(int))
         total_steps = np.sum(n_steps_arr)
-        
         indices = np.repeat(np.arange(len(p1s)), n_steps_arr)
-        
         ones = np.ones(total_steps, dtype=int)
         start_idx = np.cumsum(n_steps_arr) - n_steps_arr
         ones[start_idx] = 1 - np.roll(n_steps_arr, 1)
         ones[0] = 0
         local_idx = np.cumsum(ones)
-        
         fracs = local_idx / (n_steps_arr[indices] - 1)
-        
         px_flat = p1s[indices, 0] + fracs * dx[indices]
         py_flat = p1s[indices, 1] + fracs * dy[indices]
-        
         passable_flat = self.batch_is_passable(px_flat, py_flat, radius)
-        
         fails = ~passable_flat
         fail_counts = np.bincount(indices, weights=fails, minlength=len(p1s))
         return fail_counts == 0
@@ -381,7 +359,7 @@ class World:
                     points.append((x, y))
                 self.obstacles.append(CurvedWall(points, thickness))
             self._compile_obstacles()
-            # rasterize and flood fill to find connected safe space
+            #rasterize and flood fill to find connected safe space
             eval_res = 0.25
             eval_cols = int(self.width / eval_res)
             eval_rows = int(self.height / eval_res)
@@ -413,35 +391,26 @@ class World:
             for _ in range(200):
                 grid = get_conn_grid(0.35)
                 num_labels, labeled_array = cv2.connectedComponents(grid.astype(np.uint8), connectivity=8)
-                num_features = num_labels - 1
-                
+                num_features = num_labels - 1   
                 if num_features <= 1:
                     break
-                    
                 component_sizes = np.bincount(labeled_array.ravel())
                 component_sizes[0] = 0
                 largest_component = component_sizes.argmax()
-                
                 valid_components = np.where(component_sizes >= 15)[0]
                 if len(valid_components) <= 1:
                     break
-                    
                 mask_largest = (labeled_array == largest_component).astype(np.uint8)
                 mask_other = (np.isin(labeled_array, valid_components) & (labeled_array != largest_component)).astype(np.uint8)
-                
                 dilated_largest = cv2.dilate(mask_largest, kernel)
                 dilated_other = cv2.dilate(mask_other, kernel)
-                
                 boundary = (dilated_largest > 0) & (dilated_other > 0) & (labeled_array == 0)
                 boundary_pts = np.argwhere(boundary)
-                
                 if len(boundary_pts) == 0:
                     break
-                    
                 pt = boundary_pts[random.randint(0, len(boundary_pts)-1)]
                 bx = pt[1] * eval_res + eval_res / 2
                 by = pt[0] * eval_res + eval_res / 2
-                
                 best_capsule, best_obs, best_dist = None, None, float('inf')
                 for obs in self.obstacles[4:]:
                     capsules_to_check = obs.capsules if isinstance(obs, CurvedWall) else [obs]
@@ -457,19 +426,15 @@ class World:
                             best_dist = d
                             best_capsule = c
                             best_obs = obs
-                            
                 if best_capsule and best_obs:
                     if isinstance(best_obs, CurvedWall) and best_capsule in best_obs.capsules:
                         best_obs.capsules.remove(best_capsule)
                     elif isinstance(best_obs, Capsule) and best_obs in self.obstacles:
                         self.obstacles.remove(best_obs)
                     self._compile_obstacles()
-            
-            # Re-evaluate final connected space
             grid = get_conn_grid(0.35)
             num_labels, labeled_array = cv2.connectedComponents(grid.astype(np.uint8), connectivity=8)
             num_features = num_labels - 1
-            
             if num_features > 0:
                 component_sizes = np.bincount(labeled_array.ravel())
                 component_sizes[0] = 0
@@ -482,6 +447,14 @@ class World:
                     py_valid = py[valid_mask]
                     self.safe_area = list(zip(px_valid, py_valid))
                     break
+                else:
+                    print(f"Failed area check: {component_sizes[largest_component]} < {target_area_eval}")
+            else:
+                print(f"Failed num_features: {num_features}")
+            if attempt >= 50:
+                print("Max attempts reached! Returning fallback safe area.")
+                self.safe_area = [(self.width/2, self.height/2)]
+                break
         #filter safe area for pellets (poisson diskish approximation)
         random.shuffle(self.safe_area)
         grid_size = 1.1
@@ -524,23 +497,15 @@ class World:
         x_cands = np.random.uniform(0.5, self.width - 0.5, size=n_samples * 5)
         y_cands = np.random.uniform(0.5, self.height - 0.5, size=n_samples * 5)
         passable = self.batch_is_passable(x_cands, y_cands, radius=0.4)
-        # Yield PRM nodes in (y, x) format for the intelligence stack
-        self.prm_nodes = list(zip(y_cands[passable][:n_samples], x_cands[passable][:n_samples]))
-        
+        self.prm_nodes = list(zip(y_cands[passable][:n_samples], x_cands[passable][:n_samples]))        
         for p in self.pellets + self.power_pellets:
             yx_p = (float(p[1]), float(p[0]))
             if yx_p not in self.prm_nodes:
                 self.prm_nodes.append(yx_p)
-                
-        # Removed safe_area injection: pathfinder dynamically connects queries to PRM,
-        # and n_samples + pellets already provide a dense >800 node roadmap.
-        # Lock precision to float32 so dictionary hashing matches numpy array queries from ghosts
         nodes_arr = np.array(self.prm_nodes, dtype=np.float32)
         self.prm_nodes = [tuple(row) for row in nodes_arr]
-        
         self.prm_graph = {n: [] for n in self.prm_nodes}
         if not self.prm_nodes: return
-        
         import scipy.spatial
         tree = scipy.spatial.cKDTree(nodes_arr)
         pairs = list(tree.query_pairs(r=7.0))
@@ -548,13 +513,12 @@ class World:
             p1_idx, p2_idx = zip(*pairs)
             p1_idx, p2_idx = np.array(p1_idx), np.array(p2_idx)
             p1, p2 = nodes_arr[p1_idx], nodes_arr[p2_idx]
-            # nodes are (y, x), so index 1 is x, index 0 is y
+            #nodes are (y, x), so index 1 is x, index 0 is y
             dx, dy = p2[:, 1] - p1[:, 1], p2[:, 0] - p1[:, 0]
             dist = np.hypot(dx, dy)
             valid = dist > 0.01
             p1_idx, p2_idx = p1_idx[valid], p2_idx[valid]
             p1, dx, dy, dist = p1[valid], dx[valid], dy[valid], dist[valid]
-            
             if len(dist) > 0:
                 step_size = 0.4
                 max_steps = max(2, int(np.ceil(dist.max() / step_size)))
@@ -563,8 +527,6 @@ class World:
                 py = p1[:, 0] + dy * fracs
                 pass_mat = self.batch_is_passable(px.flatten(), py.flatten(), radius=0.4)
                 pass_mat = pass_mat.reshape((max_steps, len(p1)))
-                
-                # A line is valid if all interpolated points along it are passable
                 los_valid = np.all(pass_mat, axis=0)
                 for k, is_valid in enumerate(los_valid):
                     if is_valid:

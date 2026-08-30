@@ -47,9 +47,7 @@ class GhostActor(nn.Module):
         self.res1 = ResBlock(64, 128)
         self.res2 = ResBlock(128, 128)
         self.res3 = ResBlock(128, 128)
-        self.vec_mlp = nn.Sequential(nn.Linear(vec_dim, 256), nn.LayerNorm(256), nn.GELU(),
-                                     nn.Linear(256, 256), nn.LayerNorm(256), nn.GELU(),
-                                     nn.Linear(256, 128), nn.LayerNorm(128), nn.GELU())
+        self.vec_mlp = nn.Sequential(nn.Linear(vec_dim, 256), nn.LayerNorm(256), nn.GELU(), nn.Linear(256, 256), nn.LayerNorm(256), nn.GELU(), nn.Linear(256, 128), nn.LayerNorm(128), nn.GELU())
         #vector context modulates spatial features
         self.film = FiLM(128, 128)
         #1×1 conv to logit map

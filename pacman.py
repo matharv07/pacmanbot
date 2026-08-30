@@ -104,7 +104,6 @@ def load_rl_model():
         RL_ACTOR.eval()
         print("RL Model loaded successfully.")
         return True
-
     except Exception as e:
         print(f"Failed to load RL Model: {e}")
         RL_MODE = False
@@ -112,7 +111,9 @@ def load_rl_model():
 
 def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = N_POWER, random_spawn: bool = False):
     world = World(cols, rows, resolution=0.5)
-    world.generate(n_obstacles=25)
+    area_ratio = (rows * cols) / (33 * 41)
+    n_obs = max(2, int(25 * area_ratio))
+    world.generate(n_obstacles=n_obs)
     grid = np.full((rows, cols), WALL, dtype=np.int8)
     grid_y, grid_x = np.mgrid[0:rows, 0:cols]
     px = (grid_x.ravel() * 1.0) + 0.5
@@ -137,8 +138,6 @@ def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = N_POWER, ran
         pr, pc = pr[valid], pc[valid]
         valid_mask = (grid[pr, pc] == EMPTY) | (grid[pr, pc] == PELLET)
         grid[pr[valid_mask], pc[valid_mask]] = POWER
-        
-    # Resync continuous world lists to the finalized snapped grid
     world.pellets = []
     world.power_pellets = []
     for r in range(rows):
@@ -146,7 +145,6 @@ def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = N_POWER, ran
             if grid[r][c] == PELLET: world.pellets.append((float(c) + 0.5, float(r) + 0.5))
             elif grid[r][c] == POWER: world.power_pellets.append((float(c) + 0.5, float(r) + 0.5))
     world._update_pellet_arrays()
-    
     pr, pc = int(world.safe_area[0][1]), int(world.safe_area[0][0])
     return grid, (pr, pc), world
 
@@ -180,13 +178,10 @@ class Player:
         self.next_dir = d
 
     def _get_ghost_maps(self, ghosts):
-        """Geodesic distance maps from each living ghost — unused in current pipeline."""
         return []
 
-    def _pick_target(self, ghosts):
-        """PRM continuous scoring to pick the best pellet (or ghost when powered) target."""
+    def _pick_target(self, ghosts):     #PRM continuous scoring to pick the best pellet (or ghost when powered) target
         import pathfinder
-        
         start = (self.y, self.x)
         if self.powered:
             best_ghost_dist = float('inf')
@@ -201,26 +196,22 @@ class Player:
                 path = pathfinder.astar(self.world, start, best_ghost_target)
                 if len(path) >= 2:
                     return best_ghost_target, list(path[1:])
-                    
         all_targets = [(t[1], t[0]) for t in self.world.pellets + self.world.power_pellets]
-        # Pre-filter to closest 15 targets by manhattan distance to reduce dijkstra_multi overhead
+        #pre-filter to closest 15 targets by manhattan distance to reduce dijkstra_multi overhead
         all_targets.sort(key=lambda t: abs(t[0] - start[0]) + abs(t[1] - start[1]))
         targets = all_targets[:15]
         dists = pathfinder.dijkstra_multi(self.world, start, targets)
-        
         best_score = float('inf')
         best_target = None
         best_path = []
         for tgt, (dist, path) in dists.items():
             if dist == math.inf: continue
-            
             danger = 0.0
             for g in ghosts.values():
                 if not g.dead:
                     gd = abs(tgt[0] - g.y) + abs(tgt[1] - g.x)
                     if gd < 4:
                         danger += (4 - gd) * 15.0
-            
             orig_tgt = (tgt[1], tgt[0])
             weight = 0.5 if orig_tgt in self.world.power_pellets else 1.5
             score = dist * weight + danger
@@ -228,10 +219,8 @@ class Player:
                 best_score = score
                 best_target = orig_tgt
                 best_path = path[1:]
-                
         if not best_target and targets:
             best_target = (targets[0][1], targets[0][0])
-            
         return best_target, best_path
 
     def update(self, ghosts):
@@ -283,7 +272,6 @@ class Player:
                         target_eaten = True
             path_exhausted = not self._route
             needs_replan = (path_exhausted or ghost_emergency or power_changed or target_eaten or self._route_age > 15)
-            # Throttle expensive replanning — skip unless emergency or enough time passed
             if needs_replan and not ghost_emergency and not path_exhausted and self._route_age < 4:
                 needs_replan = False
             if needs_replan:
@@ -295,7 +283,6 @@ class Player:
             #pop waypoints we've reached
             while self._route and abs(self.y - self._route[0][0]) < 0.4 and abs(self.x - self._route[0][1]) < 0.4:
                 self._route.pop(0)
-            #get desired heading from next waypoint
             if self._route:
                 wp_r, wp_c = self._route[0]
                 dr = wp_r - self.y
@@ -351,7 +338,6 @@ class Player:
             scores = interests + hysteresis - ray_penalties
             best_idx = np.argmax(scores)
             best_vx, best_vy = ray_vx_arr[best_idx], ray_vy_arr[best_idx]
-            #implementing momentum based low pass filter - while verifying if its safe to prevent wall clipping
             target_vy = best_vy * self.max_speed * speed_mult
             target_vx = best_vx * self.max_speed * speed_mult
             smooth_vy = self.vy * 0.7 + target_vy * 0.3
@@ -374,11 +360,9 @@ class Player:
                 self.vy = smooth_vy
                 self.vx = smooth_vx
             else:
-                #if momentum pushes us into a wall, drop momentum and use safe steering output instantly
                 self.vy = target_vy
                 self.vx = target_vx
         if not self.stationary:
-            #substepped continuous collision detection (CCD)
             if self.world and hasattr(self.world, 'resolve_collision'):
                 self.path_this_frame = [(self.x, self.y)]
                 steps = max(1, int(math.ceil(math.hypot(self.vx, self.vy) / 0.2)))
@@ -390,7 +374,6 @@ class Player:
                     self.x, self.y = self.world.resolve_collision(self.x, self.y, self.radius, max_iters=3)
                     self.path_this_frame.append((self.x, self.y))
             else:
-                #simple collision: check corners of bounding box
                 nr = self.y + self.vy
                 nc = self.x + self.vx
                 r_rad, c_rad = self.radius, self.radius
@@ -629,7 +612,6 @@ class Game:
             for gid, ghost in list(self.ghosts.items()):
                 if ghost.dead:
                     continue
-                # add 0.15 tolerance to account for ghost's visual y-2 offset and continuous off-center steering
                 collision_radius = self.player.radius + ghost.radius + 0.15
                 collided = False
                 p_path = getattr(self.player, 'path_this_frame', [(self.player.x, self.player.y)])
@@ -662,6 +644,7 @@ class Game:
                 if collided:
                     if self.player.powered:
                         ghost.kill()
+                        del self.ghosts[gid]
                         self.player.score += 200
                     else:
                         self.player.die()
@@ -722,21 +705,14 @@ class Game:
                 ghost = next(iter(self.ghosts.values()))
             else:
                 return
-        ox = WIDTH
-        
-        # Prevent continuous points from spilling over into the HUD
+        ox = WIDTH        
         old_clip = self.screen.get_clip()
         self.screen.set_clip(pygame.Rect(ox, 0, WIDTH, ROWS * CELL))
-        
         pygame.draw.rect(self.screen, BLACK, (ox, 0, WIDTH, ROWS * CELL))
-        
-
-        # 1. draw Lidar Wall Hits (Point Cloud - Bright)
         if len(ghost.lidar_memory) > 0:
             if not hasattr(self, '_lidar_surf'):
                 self._lidar_surf = pygame.Surface((WIDTH, ROWS * CELL), pygame.SRCALPHA)
-                self._lidar_count = 0
-                
+                self._lidar_count = 0        
             if len(ghost.lidar_memory) != self._lidar_count:
                 self._lidar_surf.fill((0, 0, 0, 0))
                 for py, px in ghost.lidar_memory:
@@ -745,18 +721,12 @@ class Game:
                     pygame.draw.rect(self._lidar_surf, (150, 150, 255), (hit_x, hit_y, 2, 2))
                 self._lidar_count = len(ghost.lidar_memory)
             self.screen.blit(self._lidar_surf, (ox, 0))
-            
-        # 2. draw Known Pellets
         if hasattr(ghost, 'known_pellets'):
             for px, py in ghost.known_pellets:
                 pygame.draw.circle(self.screen, WHITE, (int(ox + px * CELL), int(py * CELL)), 2)
-                
-        # 3. draw Known Power Pellets
         if hasattr(ghost, 'known_power_pellets'):
             for px, py in ghost.known_power_pellets:
                 pygame.draw.circle(self.screen, WHITE, (int(ox + px * CELL), int(py * CELL)), 5)
-            
-        # 4. fog-of-war: all belief topology nodes (including wall-area grid nodes)
         bm = ghost.belief_map
         if bm._open_cells:
             if not hasattr(self, '_prm_cache') or getattr(self, '_prm_cache_n', 0) != bm.n_nodes:
@@ -765,8 +735,6 @@ class Game:
                     pygame.draw.rect(self._prm_cache, (30, 30, 30), (int(n[1] * CELL), int(n[0] * CELL), 4, 4))
                 self._prm_cache_n = bm.n_nodes
             self.screen.blit(self._prm_cache, (ox, 0))
-                
-        # 5. continuous Belief Heatmap on PRM nodes
         bm = ghost.belief_map
         if bm._initialised and bm._open_cells:
             probs = bm._b_flat.tolist()
@@ -778,8 +746,6 @@ class Game:
                     if p < 0.001:
                         continue
                     t = min(1.0, p / max_p)
-                    
-                    # Discretize t into 32 levels to heavily hit the cache
                     t_idx = int(t * 31)
                     if t_idx not in self._heat_cache:
                         t_d = t_idx / 31.0
@@ -791,11 +757,8 @@ class Game:
                         surf = pygame.Surface((s_r*2, s_r*2), pygame.SRCALPHA)
                         pygame.draw.circle(surf, (red, green, blue, alpha), (s_r, s_r), s_r)
                         self._heat_cache[t_idx] = (surf, s_r)
-                        
                     surf, s_r = self._heat_cache[t_idx]
                     self.screen.blit(surf, (ox + int(c * CELL) - s_r, int(r * CELL) - s_r))
-                    
-        # 6. CBBA task targets
         active_task = ghost.cbba_agent.get_active_task()
         if active_task is not None:
             tr, tc = active_task.target_pos
@@ -804,14 +767,10 @@ class Game:
             pygame.draw.circle(self.screen, (255, 255, 0), (tx, ty), CELL // 2 + 2, 2)
             pygame.draw.line(self.screen, (255, 255, 0), (tx - 4, ty - 4), (tx + 4, ty + 4), 2)
             pygame.draw.line(self.screen, (255, 255, 0), (tx - 4, ty + 4), (tx + 4, ty - 4), 2)
-            
-        # 7. communication radius circle
         from ghost import RADIUS as _COMM_RADIUS
         cx = ox + int(ghost.x * CELL)
         cy = int(ghost.y * CELL)
         pygame.draw.circle(self.screen, (60, 60, 120), (cx, cy), int(_COMM_RADIUS * CELL), 1)
-        
-        # 8. known agents
         for gid, pos in ghost.known_agents.items():
             if pos == "UNKNOWN": continue
             gr, gc = pos
@@ -821,11 +780,7 @@ class Game:
             pygame.draw.circle(self.screen, c_col, (ax, ay), CELL // 2 - 2)
             label = self.small.render(str(gid), True, WHITE)
             self.screen.blit(label, (ax - 4, ay - 6))
-            
-        # 9. ghost sprite
         ghost.draw(self.screen, scale=CELL, offset_x=ox)
-        
-        # 10. known pacman
         if ghost.known_pacman:
             pr, pc = ghost.known_pacman
             px = ox + int(pc * CELL)
@@ -834,10 +789,7 @@ class Game:
             pygame.draw.circle(self.screen, pac_col, (px, py), CELL // 2 - 2)
             label = self.small.render("P", True, BLACK)
             self.screen.blit(label, (px - 4, py - 6))
-            
-        # 11. HUD label
-        self.screen.set_clip(old_clip)  # Restore clip rect so HUD is not clipped!
-        
+        self.screen.set_clip(old_clip)
         mode = "POWERED" if ghost.pacman_powered else ("HUNT" if ghost.known_pacman else "SEARCH")
         fb = " [FALLBACK]" if ghost.in_fallback_mode else ""
         txt = self.small.render(f"Ghost {self.debug_ghost_id} [{mode}{fb}]  [0-6 to switch]", True, WHITE)

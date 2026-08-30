@@ -13,11 +13,7 @@ class LSTMMovementPredictor(nn.Module):
         super().__init__()
         self.lstm = nn.LSTMCell(input_dim, hidden_dim)
         self.ln = nn.LayerNorm(hidden_dim)
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_dim, 16),
-            nn.ReLU(),
-            nn.Linear(16, 2)
-        )
+        self.fc = nn.Sequential(nn.Linear(hidden_dim, 16), nn.ReLU(), nn.Linear(16, 2))
         with torch.no_grad():
             self.fc[-1].weight.fill_(0)
             self.fc[-1].bias.fill_(0)
@@ -35,7 +31,7 @@ ALPHA_MOMENTUM     = 0.15
 MOMENTUM_DECAY     = 15
 TAU_RECENCY        = 60
 MIN_CONFIDENCE     = 0.02
-LOS_CERTAINTY      = 0.99
+LOS_CERTAINTY      = 1.0
 LOST_SPREAD        = 0.60
 COMPRESS_THRESHOLD = 0.0005
 
@@ -60,26 +56,21 @@ class BeliefMap:
         self.last_known_dir: tuple = (0, 0)
         self.frames_since_sighting: int = 9999
         self._pacman_start: Optional[tuple] = pacman_start
-
         self._open_cells: list = []
         self._neighbours: dict = {}
         self._open_idx_map: dict = {}
         self.n_nodes = 0
         self._open_arr = np.empty((0, 2), dtype=np.float32)
         self._b_flat = np.zeros(0, dtype=np.float32)
-
         self._topology_dirty = True
         self._nbr_idx = np.empty((0, 0), dtype=np.int32)
         self._nbr_count = np.empty((0,), dtype=np.int32)
         self._graph = sp.csr_matrix((0, 0), dtype=np.float32)
-
         self._safety = np.ones(0, dtype=np.float32)
         self._safety_grid = np.ones((self.rows, self.cols), dtype=np.float32)
         self._b_grid = np.zeros((self.rows, self.cols), dtype=np.float32)
-
         if pacman_start is not None:
             self._add_node(pacman_start)
-            
         self._last_ghost_snapshot: dict = {}
         self._ghost_last_seen: dict[int, int] = {}
         self._disabled_wall_nodes: set = set()
@@ -87,7 +78,6 @@ class BeliefMap:
         self._last_powered: bool = False
         self._payload_cache: dict | None = None
         self._payload_dirty: bool = True
-
         self.lstm_predictor = LSTMMovementPredictor()
         self.lstm_hx = torch.zeros(1, 32)
         self.lstm_cx = torch.zeros(1, 32)
@@ -126,7 +116,6 @@ class BeliefMap:
                     grid_nodes.append(node)
                 x += BELIEF_GRID_STEP
             y += BELIEF_GRID_STEP
-
         if grid_nodes:
             new_nodes_arr = np.array(grid_nodes, dtype=np.float32)
             if self._b_flat is None or len(self._b_flat) == 0:
@@ -138,7 +127,6 @@ class BeliefMap:
                 self._b_flat = np.concatenate([self._b_flat, np.zeros(len(grid_nodes), dtype=np.float32)])
                 self._safety = np.concatenate([self._safety, np.ones(len(grid_nodes), dtype=np.float32)])
                 self._open_arr = np.vstack([self._open_arr, new_nodes_arr])
-
         CONNECT_RADIUS = BELIEF_GRID_STEP * 1.5
         if len(self._open_arr) > 0:
             self._tree = cKDTree(self._open_arr)
@@ -149,8 +137,8 @@ class BeliefMap:
                 ni, nj = self._open_cells[i], self._open_cells[j]
                 self._neighbours[ni].append(nj)
                 self._neighbours[nj].append(ni)
-
         self._topology_dirty = True
+        self._walkable_mask = np.ones(self.n_nodes, dtype=bool)
 
     def _closest_node(self, pos: tuple):
         if not self._open_cells: return -1
@@ -180,23 +168,14 @@ class BeliefMap:
             self._b_flat[idx] += total * LOS_CERTAINTY
         self.last_known_pos = pacman_pos
         self.last_known_dir = pacman_dir
-        
         if pacman_dir != (0, 0):
             with torch.no_grad():
                 idx = self._closest_node(pacman_pos)
                 local_safe = float(self._safety[idx]) if idx >= 0 else 1.0
                 local_pellet = float(self._pellet_score[idx]) if (idx >= 0 and hasattr(self, '_pellet_score')) else 0.0
                 is_powered = 1.0 if getattr(self, '_last_powered', False) else 0.0
-                
-                x = torch.tensor([[
-                    pacman_dir[0], pacman_dir[1],
-                    is_powered,
-                    local_safe,
-                    local_pellet
-                ]], dtype=torch.float32)
-                
+                x = torch.tensor([[pacman_dir[0], pacman_dir[1], is_powered, local_safe, local_pellet]], dtype=torch.float32)
                 base_dir = torch.tensor([[pacman_dir[0], pacman_dir[1]]], dtype=torch.float32)
-                
                 pred, self.lstm_hx, self.lstm_cx = self.lstm_predictor(x, self.lstm_hx, self.lstm_cx, base_dir)
                 p = pred[0].numpy()
                 n = np.linalg.norm(p)
@@ -204,7 +183,6 @@ class BeliefMap:
                     self.predicted_dir = (float(p[0]/n), float(p[1]/n))
                 else:
                     self.predicted_dir = pacman_dir
-
         self.frames_since_sighting = 0
         self._normalise()
         self._payload_dirty = True
@@ -212,8 +190,8 @@ class BeliefMap:
     def observe_lost(self, last_pos: tuple):
         self._ensure_initialised()
         idx = self._closest_node(last_pos)
-        if idx < 0: return
-        
+        if idx < 0: 
+            return
         outgoing = self._b_flat[idx] * LOST_SPREAD
         node = self._open_cells[idx]
         neighbours = self._neighbours.get(node, [])
@@ -242,10 +220,8 @@ class BeliefMap:
         self._ensure_initialised()
         if self._open_arr.size == 0:
             return
-            
         if not hasattr(self, '_explored_nodes'):
             self._explored_nodes = set()
-            
         if visible_idxs:
             self._explored_nodes.update(visible_idxs)
             idxs = np.array(list(visible_idxs), dtype=np.int32)
@@ -269,19 +245,25 @@ class BeliefMap:
                         end = self._graph.indptr[idx+1]
                         for p in range(start, end):
                             if self._graph.indices[p] == other_idx:
-                                self._graph.data[p] = 9999.0
-                                
+                                self._graph.data[p] = 9999.0                        
         disabled_any = False
         for node in impassable_nodes:
             if node not in self._disabled_wall_nodes:
                 self._disabled_wall_nodes.add(node)
+                idx = self._open_idx_map.get(node)
+                if idx is not None:
+                    self._b_flat[idx] = 0.0
+                    if not hasattr(self, '_disabled_wall_idxs'):
+                        self._disabled_wall_idxs = []
+                    self._disabled_wall_idxs.append(idx)
+                    if hasattr(self, '_walkable_mask'):
+                        self._walkable_mask[idx] = False
                 old_nbrs = self._neighbours.get(node, [])
                 self._neighbours[node] = []
                 for nbr in old_nbrs:
                     if node in self._neighbours[nbr]:
                         self._neighbours[nbr].remove(node)
                     _disable_edge(node, nbr)
-                        
         if hasattr(self, 'world') and hasattr(self.world, 'batch_line_of_sight') and visible_idxs:
             if not hasattr(self, '_checked_edges'):
                 self._checked_edges = set()
@@ -293,8 +275,7 @@ class BeliefMap:
                     edge = (u, v) if u < v else (v, u)
                     if edge not in self._checked_edges:
                         edges_to_check.append(edge)
-                        self._checked_edges.add(edge)
-                        
+                        self._checked_edges.add(edge)                
             if edges_to_check:
                 p1s = np.array([(u[1], u[0]) for u, _ in edges_to_check], dtype=np.float32)
                 p2s = np.array([(v[1], v[0]) for _, v in edges_to_check], dtype=np.float32)
@@ -322,8 +303,40 @@ class BeliefMap:
                                 if u in self._neighbours.get(v, []):
                                     self._neighbours[v].remove(u)
                                 _disable_edge(u, v)
-                            
         self._normalise()
+
+    def sync_walls(self, personal_map: np.ndarray):
+        if self.n_nodes == 0 or self._open_arr.size == 0:
+            return
+        r_idx = np.clip(np.floor(self._open_arr[:, 0]).astype(int), 0, personal_map.shape[0]-1)
+        c_idx = np.clip(np.floor(self._open_arr[:, 1]).astype(int), 0, personal_map.shape[1]-1)
+        wall_mask = personal_map[r_idx, c_idx] == 1
+        wall_indices = np.where(wall_mask)[0]
+        new_walls = []
+        for i in wall_indices:
+            node = self._open_cells[i]
+            if node not in self._disabled_wall_nodes:
+                new_walls.append(node)
+        if new_walls:
+            self.observe_clear(set(), new_walls)
+        if hasattr(self, '_nbr_idx') and self._nbr_idx.shape[0] > 0:
+            for i in range(self.n_nodes):
+                u = self._open_cells[i]
+                if u in self._disabled_wall_nodes:
+                    continue
+                r1, c1 = int(math.floor(u[0])), int(math.floor(u[1]))
+                for k in range(self._nbr_idx.shape[1]):
+                    j = self._nbr_idx[i, k]
+                    if j >= 0:
+                        v = self._open_cells[j]
+                        r2, c2 = int(math.floor(v[0])), int(math.floor(v[1]))
+                        if r1 != r2 and c1 != c2: # Diagonal edge
+                            if personal_map[r1, c2] == 1 or personal_map[r2, c1] == 1:
+                                self._nbr_idx[i, k] = -1
+                                rev_k = np.where(self._nbr_idx[j] == i)[0]
+                                if len(rev_k) > 0:
+                                    self._nbr_idx[j, rev_k[0]] = -1
+                                self._W_dirty = True
 
     def diffuse(self, ghost_pos: tuple, known_pellets: set = None, known_power: set = None):
         if self._topology_dirty:
@@ -334,18 +347,21 @@ class BeliefMap:
         if self.n_nodes > 0:
             if not hasattr(self, '_pellet_dists') or self._pellets_changed(known_pellets, known_power):
                 self._update_pellet_score(known_pellets, known_power)
-                
+            roi_threshold = 1e-10
+            self._b_flat[self._b_flat < roi_threshold] = 0.0
             W = self._compute_diffusion_weights()
             valid_mask = self._valid_mask
             receivers = self._nbr_idx[valid_mask]
-            
             for _ in range(4):
                 outflow = self._b_flat * (ALPHA_UNIFORM + ALPHA_MOMENTUM)
                 shares = outflow[:, np.newaxis] * W
                 self._b_flat -= outflow
                 weights = shares[valid_mask]
                 self._b_flat += np.bincount(receivers, weights=weights, minlength=self.n_nodes)
+            self._b_flat[self._b_flat < roi_threshold] = 0.0
             self._b_flat = np.maximum(0.0, self._b_flat)
+            if hasattr(self, '_walkable_mask'):
+                self._b_flat[~self._walkable_mask] = 0.0
             self._normalise()
 
     def merge(self, sender_gid: int, payload: dict, frame: int):
@@ -354,7 +370,6 @@ class BeliefMap:
         cells: dict = payload.get("cells", {})
         if not cells or self.n_nodes == 0:
             return
-            
         delta_fss = self.frames_since_sighting - sender_fss
         if delta_fss > 0:
             confidence = 1.0 - math.exp(-delta_fss / 5.0)
@@ -362,45 +377,36 @@ class BeliefMap:
             confidence = 0.1
         else:
             confidence = 0.0
-            
         if confidence == 0.0:
             return
-            
         n = self.n_nodes
         s_flat = np.zeros(n, dtype=np.float32)
-        
         idxs, vals = [], []
         for pt, v in cells.items():
             idx = self._open_idx_map.get(pt)
             if idx is not None:
                 idxs.append(idx)
                 vals.append(v)
-                
         if idxs:
             s_flat[idxs] = vals
-            
         s_total = float(s_flat.sum())
         if s_total < 1e-9:
             return
         s_flat /= s_total
-        
         self._b_flat = (1.0 - confidence) * self._b_flat + confidence * s_flat
         lkp = payload.get("lkp")
         if lkp is not None and sender_fss < self.frames_since_sighting:
             self.last_known_pos        = tuple(lkp)
             self.last_known_dir        = tuple(payload.get("lkd", (0, 0)))
-            
             p_dir = payload.get("p_dir", (0, 0))
             if p_dir != (0, 0):
                 self.predicted_dir = tuple(p_dir)
-                
             hx = payload.get("hx")
             cx = payload.get("cx")
             if hx is not None and cx is not None:
                 import torch
                 self.lstm_hx = torch.tensor(hx, dtype=torch.float32)
                 self.lstm_cx = torch.tensor(cx, dtype=torch.float32)
-                
             self.frames_since_sighting = sender_fss
         self._normalise()
 
@@ -448,7 +454,7 @@ class BeliefMap:
         return self._b_grid.flatten().tolist()
 
     def update_safety_map(self, known_agents: dict, current_frame: int, powered: bool = False, hunt_mode: str = "blend"):
-        new_snapshot = {gid: pos for gid, pos in known_agents.items() if pos != "UNKNOWN"}
+        new_snapshot = {gid: (int(pos[0]), int(pos[1])) for gid, pos in known_agents.items() if pos != "UNKNOWN"}
         positions_changed = (new_snapshot != self._last_ghost_snapshot)
         mode_changed = (powered != self._last_powered)
         due = (current_frame - self._last_safety_frame >= SAFETY_RECOMPUTE_EVERY)
@@ -473,7 +479,6 @@ class BeliefMap:
             age = current_frame - self._ghost_last_seen.get(gid, current_frame)
             weight = math.exp(-age / STALENESS_DECAY)
             known_positions.append((gr, gc, weight))
-            
         sigma = HUNT_SIGMA if powered else DANGER_SIGMA
         cutoff_steps = int(3.0 * sigma)
         scores = np.zeros(self.n_nodes, dtype=np.float32)
@@ -484,7 +489,6 @@ class BeliefMap:
             if idx >= 0:
                 starts.append(idx)
                 weights.append(weight)
-        
         if starts and self._graph.shape[0] > 0:
             dist_matrix = csgraph.dijkstra(self._graph, directed=False, indices=starts, unweighted=False, limit=cutoff_steps)
             if dist_matrix.ndim == 1:
@@ -496,9 +500,7 @@ class BeliefMap:
                 scores[mask_flat] += contrib_vals
                 if powered:
                     proximal[mask_flat] = np.maximum(proximal[mask_flat], contrib_vals)
-
         self._danger = scores.copy()
-        
         if not powered:
             prior = PRIOR_UNIFORM_WT / max(n_open, 1)
             flat_unknown = n_unknown * (UNSEEN_GHOST_PRIOR / max(n_open, 1))
@@ -520,16 +522,12 @@ class BeliefMap:
                 self._safety[:n_open] = c_norm
             else:
                 self._safety[:n_open] = ((1.0 - HUNT_CROWD_WEIGHT) * p_norm + HUNT_CROWD_WEIGHT * c_norm)
-                
+        if hasattr(self, '_walkable_mask'):
+            self._safety[~self._walkable_mask] = 0.0
         self._safety_grid.fill(0.0)
         rs = np.clip(np.round(self._open_arr[:, 0]).astype(np.int32), 0, self.rows - 1)
         cs = np.clip(np.round(self._open_arr[:, 1]).astype(np.int32), 0, self.cols - 1)
         self._safety_grid[rs, cs] = self._safety[:n_open]
-        
-        for r, c in self._disabled_wall_nodes:
-            ri, ci = int(round(r)), int(round(c))
-            if 0 <= ri < self.rows and 0 <= ci < self.cols:
-                self._safety_grid[ri, ci] = 0.0
 
     def safety_at(self, pos: tuple) -> float:
         r, c = int(round(pos[0])), int(round(pos[1]))
@@ -579,51 +577,39 @@ class BeliefMap:
             self._nbr_count = np.zeros(0, dtype=np.int32)
             self._graph = sp.csr_matrix((0, 0), dtype=np.float32)
             return
-            
         nbr_idx_list = []
         for cell in self._open_cells:
             nbrs = self._neighbours.get(cell, [])
             n_idx = [self._open_idx_map.get(nb) for nb in nbrs]
             nbr_idx_list.append([i for i in n_idx if i is not None])
-            
         nbr_count_list = [len(idxs) for idxs in nbr_idx_list]
         max_nbrs = max(nbr_count_list) if nbr_count_list else 0
-        
         self._nbr_idx = np.full((n, max(max_nbrs, 1)), -1, dtype=np.int32)
         row_idx, col_idx = [], []
-        
         for i, idxs in enumerate(nbr_idx_list):
             if idxs:
                 self._nbr_idx[i, :len(idxs)] = idxs
                 row_idx.extend([i] * len(idxs))
                 col_idx.extend(idxs)
-                
         self._nbr_count = np.array(nbr_count_list, dtype=np.int32)
-        
         self._nbr_dist = np.zeros_like(self._nbr_idx, dtype=np.float32)
         self._nbr_dr = np.zeros_like(self._nbr_idx, dtype=np.float32)
         self._nbr_dc = np.zeros_like(self._nbr_idx, dtype=np.float32)
-        
         r_arr = self._open_arr[:, 0]
         c_arr = self._open_arr[:, 1]
-        
         for k in range(self._nbr_idx.shape[1]):
             nbrs = self._nbr_idx[:, k]
             valid = nbrs >= 0
             if not np.any(valid): continue
-            
             nr = r_arr[nbrs[valid]]
             nc = c_arr[nbrs[valid]]
-            
             d_r = nr - r_arr[valid]
             d_c = nc - c_arr[valid]
             dist = np.hypot(d_r, d_c)
-            
             safe_dist = np.where(dist > 0, dist, 1.0)
             self._nbr_dr[valid, k] = np.where(dist > 0, d_r / safe_dist, 0.0)
             self._nbr_dc[valid, k] = np.where(dist > 0, d_c / safe_dist, 0.0)
             self._nbr_dist[valid, k] = dist
-            
         if len(row_idx) > 0:
             row_idx = np.array(row_idx, dtype=np.int32)
             col_idx = np.array(col_idx, dtype=np.int32)
@@ -632,8 +618,7 @@ class BeliefMap:
             data = np.hypot(d_r, d_c)
             self._graph = sp.csr_matrix((data, (row_idx, col_idx)), shape=(n, n))
         else:
-            self._graph = sp.csr_matrix((n, n), dtype=np.float32)
-            
+            self._graph = sp.csr_matrix((n, n), dtype=np.float32)    
         self._graph_version = getattr(self, '_graph_version', 0) + 1
         self._W_dirty = True
 
@@ -641,7 +626,6 @@ class BeliefMap:
         if self._topology_dirty:
             self._compute_topology()
             self._topology_dirty = False
-            
         if self._initialised:
             return
         if self._pacman_start is not None and self._pacman_start in self._open_idx_map:
@@ -665,14 +649,19 @@ class BeliefMap:
     def _normalise(self):
         if self.n_nodes == 0:
             return
-            
+        if hasattr(self, '_disabled_wall_idxs') and self._disabled_wall_idxs:
+            self._b_flat[self._disabled_wall_idxs] = 0.0
         if np.isnan(self._b_flat).any():
             self._b_flat = np.nan_to_num(self._b_flat, nan=0.0)
-            
         total = float(self._b_flat.sum())
         if total < 1e-12:
-            n = self.n_nodes
-            self._b_flat[:] = 1.0 / n
+            self._b_flat[:] = 0.0
+            if hasattr(self, '_walkable_mask'):
+                valid_count = self._walkable_mask.sum()
+                if valid_count > 0:
+                    self._b_flat[self._walkable_mask] = 1.0 / valid_count
+            else:
+                self._b_flat[:] = 1.0 / self.n_nodes
         else:
             self._b_flat /= total
         self._sync_flat_to_grid()
@@ -687,15 +676,13 @@ class BeliefMap:
     def _update_pellet_score(self, known_pellets, known_power):
         new_pellets = set(known_pellets) if known_pellets else set()
         new_power = set(known_power) if known_power else set()
-        
         current_graph_version = getattr(self, '_graph_version', 0)
         current_explored_len = len(getattr(self, '_explored_nodes', set()))
         if hasattr(self, '_last_known_pellets') and hasattr(self, '_pellet_dists'):
             if self._last_known_pellets == new_pellets and self._last_known_power == new_power:
                 if getattr(self, '_last_pellet_graph_version', -1) == current_graph_version:
                     if getattr(self, '_last_explored_len', -1) == current_explored_len:
-                        return # Cached!
-
+                        return
         self._last_known_pellets = new_pellets
         self._last_known_power = new_power
         self._last_pellet_graph_version = current_graph_version
@@ -706,28 +693,21 @@ class BeliefMap:
         if self.n_nodes == 0: return
         all_p = list(self._last_known_pellets) + list(self._last_known_power)
         if not all_p: return
-        
         starts = self._closest_nodes_batch(all_p)
         starts = [idx for idx in starts if idx >= 0]
-                
         if hasattr(self, '_explored_nodes') and self.n_nodes > 0:
             unexplored = set(range(self.n_nodes)) - self._explored_nodes
             starts.extend(list(unexplored))
-                
         if starts and getattr(self, '_graph', None) is not None and self._graph.shape[0] > 0:
             starts = list(set(starts))
             n = self._graph.shape[0]
-            
             indptr = self._graph.indptr
             indices = self._graph.indices
             data = self._graph.data
-            
             new_indptr = np.append(indptr, indptr[-1] + len(starts))
             new_indices = np.append(indices, starts)
             new_data = np.append(data, np.zeros(len(starts), dtype=np.float32))
-            
             aug_graph = sp.csr_matrix((new_data, new_indices, new_indptr), shape=(n+1, n+1))
-            
             min_dists = csgraph.dijkstra(aug_graph, directed=True, indices=n)[:n]
             min_dists[np.isinf(min_dists)] = 9999.0
             self._pellet_dists = min_dists
@@ -746,26 +726,20 @@ class BeliefMap:
             self._valid_mask = self._nbr_idx >= 0
             self._base_W[self._valid_mask] = 1.0 / np.maximum(self._nbr_dist[self._valid_mask], 0.1)
             self._W_dirty = False
-            
         W = self._base_W.copy()
         valid_mask = self._valid_mask
-        
         if hasattr(self, '_danger'):
             my_danger = self._danger[:, np.newaxis]
             nbr_danger = self._danger[self._nbr_idx]
             nbr_danger = np.where(valid_mask, nbr_danger, my_danger)
             delta_danger = my_danger - nbr_danger
             W[valid_mask] *= np.exp(delta_danger[valid_mask] * 0.8)
-        
         if self.last_known_pos is not None and self.predicted_dir != (0, 0):
             dr, dc = self.predicted_dir
             alignment = self._nbr_dr * dr + self._nbr_dc * dc
             momentum_str = math.exp(-self.frames_since_sighting / MOMENTUM_DECAY)
-            mom_factor = np.where(alignment > 0, 
-                                  1.0 + momentum_str * (alignment * 3.0), 
-                                  1.0 + momentum_str * (alignment * 0.9))
+            mom_factor = np.where(alignment > 0, 1.0 + momentum_str * (alignment * 5.0), np.maximum(0.01, 1.0 + momentum_str * (alignment * 0.95)))
             W[valid_mask] *= mom_factor[valid_mask]
-            
         if hasattr(self, '_pellet_dists'):
             my_dists = self._pellet_dists[:, np.newaxis]
             nbr_dists = self._pellet_dists[self._nbr_idx]
@@ -773,7 +747,6 @@ class BeliefMap:
             delta_pellet = my_dists - nbr_dists
             delta_pellet = np.clip(delta_pellet, -50.0, 50.0)
             W[valid_mask] *= np.exp(delta_pellet[valid_mask] * 0.5)
-            
         W_sum = W.sum(axis=1, keepdims=True)
         W_sum = np.where(W_sum > 0, W_sum, 1.0)
         W /= W_sum

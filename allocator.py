@@ -24,7 +24,6 @@ PELLET  = 2
 POWER   = 3
 UNKNOWN = -1
 
-#Setup decay constants for CBBA
 HUNT_SCALE    = 14.0
 CONVERT_SCALE = 8.0
 SAFE_RADIUS   = 8       #min safe power pacman distance
@@ -53,7 +52,7 @@ class Task:
 def _dist_score(d: float, scale: float) -> float:   #normalize the distances received from dijkstra
     return math.exp(-d/scale) if d != math.inf and d >= 0 else 0.0
 
-def _score_hunt(ghost, dists: dict) -> list[Task]:
+def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
     if ghost.pacman_powered:
         return []
     target = ghost.known_pacman or ghost.last_lost_pacman
@@ -68,18 +67,17 @@ def _score_hunt(ghost, dists: dict) -> list[Task]:
         return []    
     tasks = []
     score = _dist_score(dist, HUNT_SCALE)
-    tasks.append(Task(task_type=TaskType.HUNT, target_pos=target,
-                      score=score, owner=ghost.gid))
+    tasks.append(Task(task_type=TaskType.HUNT, target_pos=target, score=score, created_frame=frame, owner=ghost.gid))
     for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
         cr, cc = float(pr + dr*4), float(pc + dc*4)
         if ghost.world and ghost.world.is_passable(cc, cr, radius=0.4):
             cutoff_info = dists.get((cr, cc))
             if cutoff_info and cutoff_info[0] != math.inf:
                 cutoff_score = _dist_score(cutoff_info[0], HUNT_SCALE) * 0.85
-                tasks.append(Task(task_type=TaskType.DYNAMIC, target_pos=(cr, cc), score=cutoff_score, owner=ghost.gid))
+                tasks.append(Task(task_type=TaskType.DYNAMIC, target_pos=(cr, cc), score=cutoff_score, created_frame=frame, owner=ghost.gid))
     return tasks
 
-def _score_convert(ghost, dists: dict) -> List[Task]:
+def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
     tasks: list[Task] = []
     if not hasattr(ghost, 'known_power_pellets'): return tasks
     for pos in ghost.known_power_pellets:
@@ -91,7 +89,7 @@ def _score_convert(ghost, dists: dict) -> List[Task]:
         if dist == math.inf:
             continue
         score = _dist_score(dist, CONVERT_SCALE) + 2.0
-        tasks.append(Task(task_type=TaskType.CONVERT, target_pos=yx_pos, score=score))
+        tasks.append(Task(task_type=TaskType.CONVERT, target_pos=yx_pos, score=score, created_frame=frame))
     return tasks
 
 def _find_flee_pos(ghost, pacman_pos: tuple) -> Optional[tuple]:
@@ -134,9 +132,7 @@ def _score_explore(ghost, frame: int) -> List[Task]:
             ages[node] = frame + UNKNOWN_BONUS
         else:
             ages[node] = frame - last_seen_frame
-            
     sorted_nodes = sorted(ages.items(), key=lambda item: item[1], reverse=True)
-    
     tasks: list = []
     for pos, age in sorted_nodes[:EXPLORE_TOP_K]:
         score = 1.0 - math.exp(-age / RECENCY_SCALE)
@@ -145,7 +141,7 @@ def _score_explore(ghost, frame: int) -> List[Task]:
             for key in ghost.cbba_agent.bundle:
                 if key[1] == pos:
                     score += 0.5
-        tasks.append(Task(task_type=TaskType.EXPLORE, target_pos=pos, score=score))
+        tasks.append(Task(task_type=TaskType.EXPLORE, target_pos=pos, score=score, created_frame=frame))
     return tasks
 
 def generate_tasks(ghost, frame: int) -> tuple[List[Task], dict]:
@@ -178,8 +174,8 @@ def generate_tasks(ghost, frame: int) -> tuple[List[Task], dict]:
             tasks.append(evade_track)
         tasks.extend(explore_tasks)
     else:
-        tasks.extend(_score_hunt(ghost, dists))
-        tasks.extend(_score_convert(ghost, dists))
+        tasks.extend(_score_hunt(ghost, dists, frame))
+        tasks.extend(_score_convert(ghost, dists, frame))
         tasks.extend(explore_tasks)
     for t in tasks:
         if t.created_frame == 0:
