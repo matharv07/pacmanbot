@@ -763,7 +763,7 @@ def train():
             if len(buf_rewards[e]) == 0:
                 continue
             obs = vec_env.current_obs[e]
-            gids, sp, ve, vm, ht, global_sp, grid_shape = obs
+            gids, sp, ve, vm, ht, hs, global_sp, grid_shape = obs
             if len(gids) > 0:
                 boot_n_ghosts.append(len(gids))
                 sp_padded = _pad_spatial(sp, target_h=stage.rows, target_w=stage.cols)
