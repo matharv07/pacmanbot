@@ -202,7 +202,7 @@ def _pad_spatial(arr, target_h=MAX_H, target_w=MAX_W):
 
 def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
     try:
-        env = Env(env_id, num_ghosts=n_ghosts, grid_rows=rows, grid_cols=cols, n_power=n_power)
+        env = Env(env_id, num_ghosts=n_ghosts, world_height=float(rows), world_width=float(cols), n_power=n_power)
         env.static_pacman = static_pacman
         obs = env.reset()
         conn.send(obs)           #send initial observation
@@ -228,8 +228,8 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
             conn.send(obs)
         elif cmd == "set_curriculum":
             rows, cols, n_ghosts, n_power, static_pacman = data
-            env.grid_rows = rows
-            env.grid_cols = cols
+            env.world_height = float(rows)
+            env.world_width = float(cols)
             env.num_ghosts = n_ghosts
             env.n_power = n_power
             env.static_pacman = static_pacman
