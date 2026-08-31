@@ -17,18 +17,29 @@ import collections
 
 @dataclass(frozen=True)
 class Stage:
-    rows: int
-    cols: int
+    world_height: float
+    world_width: float
+    obs_resolution: float
     n_ghosts: int
     n_power: int
     advance_return: float
     min_updates: int
 
-STAGES = [Stage(rows=7,  cols=9,  n_ghosts=2, n_power=2,  advance_return=42.0, min_updates=150),
-    Stage(rows=13, cols=17, n_ghosts=3, n_power=6,  advance_return=40.0, min_updates=350),
-    Stage(rows=21, cols=27, n_ghosts=5, n_power=14, advance_return=28.0, min_updates=360),
-    Stage(rows=27, cols=33, n_ghosts=6, n_power=24, advance_return=22.0, min_updates=400),
-    Stage(rows=33, cols=41, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0)]
+    @property
+    def rows(self) -> int:
+        return int(self.world_height * self.obs_resolution)
+        
+    @property
+    def cols(self) -> int:
+        return int(self.world_width * self.obs_resolution)
+
+STAGES = [
+    Stage(world_height=7,  world_width=9,  obs_resolution=1.0, n_ghosts=2, n_power=2,  advance_return=42.0, min_updates=150),
+    Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=3, n_power=6,  advance_return=40.0, min_updates=350),
+    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=14, advance_return=28.0, min_updates=360),
+    Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=24, advance_return=22.0, min_updates=400),
+    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0)
+]
 
 ADVANCE_WINDOW = 150   #rolling window of updates achieving return threshold required to clear a stage
 

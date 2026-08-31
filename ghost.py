@@ -48,18 +48,29 @@ HEARTBEAT_TIMEOUT = 25
 RESYNC_EVERY      = 100
 OSCILLATION_WINDOW = 8   #position history length to prevent oscillations
 LIDAR_SWEEP_EVERY  = 2   #lidar sweep + LOS checks every N frames
-BELIEF_DIFFUSE_EVERY = 1 #belief map diffusion every N frames
+BELIEF_DIFFUSE_EVERY = 3 #belief map diffusion every N frames
 
 _ANGLES = np.linspace(0, 2*math.pi, RAY_COUNT, endpoint=False)
 _DX = np.cos(_ANGLES) * 0.5
 _DY = np.sin(_ANGLES) * 0.5
 
+def find_closest_pellet(p, world_obj, is_power=False):
+    # O(1) lookup to recover original float64 tuple from float32 array row
+    cache_key = '_power_lookup' if is_power else '_pellet_lookup'
+    lookup = getattr(world_obj, cache_key, None)
+    if lookup is None:
+        source_list = getattr(world_obj, 'power_pellets' if is_power else 'pellets', [])
+        lookup = {(round(pt[0], 2), round(pt[1], 2)): pt for pt in source_list}
+        setattr(world_obj, cache_key, lookup)
+        
+    k = (round(p[0], 2), round(p[1], 2))
+    return lookup.get(k)
+
 class Ghost:
     def __init__(self, gid, grid, pos, color, player_start, world=None):
         self.gid = gid
-        self.grid = grid
-        self.grid_arr = np.array(grid, dtype=np.int8)
         self.world = world
+        self.color = color
         self.radius = 0.4
         self.x, self.y = float(pos[1]), float(pos[0])
         self.prev_x, self.prev_y = self.x, self.y
@@ -71,11 +82,10 @@ class Ghost:
         self.in_fallback_mode = False
         self.move_every = 1
         self.last_dir = random.choice(DIRS)
-        rows = len(grid)
-        cols = len(grid[0])
-        self.lidar_memory = set()
+        self.last_dir = random.choice(DIRS)
         self.known_pellets = set()
         self.known_power_pellets = set()
+        self.lidar_memory = set()
         self.prm_last_seen = {n: -1 for n in getattr(world, 'prm_nodes', [])}
         self.frame = 0
         self.message_queue = []
@@ -103,48 +113,6 @@ class Ghost:
         self._proximity_channel_target = None
         self._last_synced_map: dict[int, np.ndarray] = {}   # per-peer snapshot for delta sync
         self._tail_pacman_remaining = 0         #post-pop number of ghosts that will be tailing
-        self._personal_map_cache = None         #cached personal map; invalidated on observation changes
-        self._personal_map_dirty = True
-        self._last_lidar_frame = -999
-        self._cached_lidar_diffs = []
-
-    @property
-    def personal_map(self):
-        if not self._personal_map_dirty and self._personal_map_cache is not None:
-            return self._personal_map_cache
-        rows = len(self.grid)
-        cols = len(self.grid[0])
-        pmap = np.full((rows, cols), -1, dtype=np.int8)
-        if self.lidar_memory:
-            pts = np.array(list(self.lidar_memory), dtype=np.float32)
-            rs = pts[:, 0].astype(np.int32)
-            cs = pts[:, 1].astype(np.int32)
-            valid = (rs >= 0) & (rs < rows) & (cs >= 0) & (cs < cols)
-            pmap[rs[valid], cs[valid]] = 1
-        valid_prm = [n for n, last in self.prm_last_seen.items() if last != -1]
-        if valid_prm:
-            arr = np.array(valid_prm, dtype=np.int32)
-            rs = arr[:, 0]
-            cs = arr[:, 1]
-            valid = (rs >= 0) & (rs < rows) & (cs >= 0) & (cs < cols)
-            rs_valid, cs_valid = rs[valid], cs[valid]
-            empty_mask = pmap[rs_valid, cs_valid] == -1
-            pmap[rs_valid[empty_mask], cs_valid[empty_mask]] = 0
-        if self.known_pellets:
-            arr = np.array(list(self.known_pellets), dtype=np.int32)
-            rs, cs = arr[:, 1], arr[:, 0]
-            valid = (rs >= 0) & (rs < rows) & (cs >= 0) & (cs < cols)
-            pmap[rs[valid], cs[valid]] = 2
-        if self.known_power_pellets:
-            arr = np.array(list(self.known_power_pellets), dtype=np.int32)
-            rs, cs = arr[:, 1], arr[:, 0]
-            valid = (rs >= 0) & (rs < rows) & (cs >= 0) & (cs < cols)
-            pmap[rs[valid], cs[valid]] = 3
-        self._personal_map_cache = pmap
-        self._personal_map_dirty = False
-        if hasattr(self, 'belief_map') and hasattr(self.belief_map, 'sync_walls'):
-            self.belief_map.sync_walls(pmap)
-        return pmap
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False, speed_mult=1.0):
         self.frame += 1
@@ -168,10 +136,8 @@ class Ghost:
         if self.dead:
             return newly_discovered, stale_refreshed
         self._check_liveness(all_ghosts)
-        if self.frame - self._last_lidar_frame >= LIDAR_SWEEP_EVERY:
-            self._last_lidar_frame = self.frame
+        if self.frame % LIDAR_SWEEP_EVERY == 0:
             diffs, newly_discovered, stale_refreshed = self._update_lidar_memory(all_ghosts, player_pos, powered)
-            self._cached_lidar_diffs = diffs
         else:
             diffs = []
         if self.frame % HEARTBEAT_EVERY == 0:
@@ -189,11 +155,15 @@ class Ghost:
         active_task = self.cbba_agent.step(self, self.frame)
         if active_task and self.pacman_powered and active_task.task_type == TaskType.HUNT:
             active_task = None
-        if active_task is not None and (int(self.y), int(self.x)) == active_task.target_pos:
-            key = (int(active_task.task_type), active_task.target_pos, getattr(active_task, 'owner', -1))
-            if key in self.cbba_agent.path: self.cbba_agent.path.remove(key)
-            if key in self.cbba_agent.bundle: self.cbba_agent.bundle.remove(key)
-            active_task = None
+        #use tolerance-based comparison — target_pos is float, int() cast never matches
+        if active_task is not None:
+            tpr, tpc = active_task.target_pos
+            if abs(self.y - tpr) < 0.5 and abs(self.x - tpc) < 0.5:
+                rounded_pos = (round(float(tpr), 2), round(float(tpc), 2))
+                key = (int(active_task.task_type), rounded_pos, getattr(active_task, 'owner', -1))
+                if key in self.cbba_agent.path: self.cbba_agent.path.remove(key)
+                if key in self.cbba_agent.bundle: self.cbba_agent.bundle.remove(key)
+                active_task = None
         desired_vx = 0.0
         desired_vy = 0.0
         moved = False
@@ -253,21 +223,26 @@ class Ghost:
                         dr = max(-1, min(1, dr))
                         dc = max(-1, min(1, dc))
                         if abs(dr) + abs(dc) > 0:
-                            tr = max(0, min(len(self.grid)-1, pr + dr * 4))
-                            tc = max(0, min(len(self.grid[0])-1, pc + dc * 4))
+                            tr = pr + dr * 4
+                            tc = pc + dc * 4
                     active_task = type('DummyTask', (), {'target_pos': (int(tr), int(tc)), 'task_type': -1})()
         #power pellet grab override
         if not moved and (not self.known_pacman or self.pacman_powered or dist_pac > CHASE_RADIUS):
             r, c = int(self.y), int(self.x)
             best_power = None
             best_pd = float('inf')
-            for dr in range(-3, 4):
-                for dc in range(-3, 4):
-                    nr, nc = r + dr, c + dc
-                    if 0 <= nr < len(self.grid) and 0 <= nc < len(self.grid[0]) and self.grid[nr][nc] == POWER:
-                        pd = math.hypot((nr+0.5)-self.y, (nc+0.5)-self.x)
+            power_arr = getattr(self.world, 'power_pellets_arr', None)
+            if power_arr is not None and len(power_arr) > 0:
+                # power_arr stores (x, y)
+                dist = np.hypot(power_arr[:, 0] - self.x, power_arr[:, 1] - self.y)
+                valid_mask = dist < 3.5
+                if np.any(valid_mask):
+                    valid_idx = np.where(valid_mask)[0]
+                    for idx in valid_idx:
+                        px, py = power_arr[idx]
+                        pd = math.hypot(py - self.y, px - self.x)
                         if pd < GRAB_DIST and pd < best_pd:
-                            best_power = (nr+0.5, nc+0.5)
+                            best_power = (py, px)
                             best_pd = pd
             if best_power is not None:
                 dx, dy = best_power[1] - self.x, best_power[0] - self.y
@@ -306,12 +281,22 @@ class Ghost:
         #normal task execution
         if not moved and active_task is not None:
             target = active_task.target_pos
-            if getattr(self, '_committed_target', None) != target or not getattr(self, '_committed_path', []):
+            replan = False
+            prev_target = getattr(self, '_committed_target', None)
+            if not getattr(self, '_committed_path', []):
+                replan = True
+            elif prev_target != target:
+                if self.frame - getattr(self, '_last_replan_frame', -999) > 10:
+                    replan = True
+                elif prev_target and math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 3.0:
+                    replan = True
+            if replan:
                 from pathfinder import astar
                 full_path = astar(self.world, (float(self.y), float(self.x)), target)
                 if len(full_path) >= 2:
                     self._committed_path = full_path[1:]
                     self._committed_target = target
+                    self._last_replan_frame = self.frame
                 else:
                     self._committed_path = []
             if hasattr(self, '_committed_path') and self._committed_path:
@@ -342,43 +327,43 @@ class Ghost:
                 if cur_speed > 0:
                     desired_vx = self.vx / cur_speed
                     desired_vy = self.vy / cur_speed
-        #context steering and momentum
-        best_score = -float('inf')
+        #context steering and momentum — cached every 3 frames to reduce jitter/CPU load
+        _STEER_CACHE_TTL = 3
         best_vx, best_vy = desired_vx, desired_vy
         if desired_vx != 0.0 or desired_vy != 0.0:
-            num_rays = 16
-            current_speed = self.max_speed * speed_mult
-            cur_speed_mag = math.hypot(self.vx, self.vy) + 1e-6
-            cur_vx_norm = self.vx / cur_speed_mag
-            cur_vy_norm = self.vy / cur_speed_mag
-            angles = np.linspace(0, 2*math.pi, num_rays, endpoint=False)
-            ray_vx_arr = np.cos(angles)
-            ray_vy_arr = np.sin(angles)
-            check_dist_max = current_speed * 1.5 + self.radius
-            n_steps = max(2, int(math.ceil(check_dist_max / 0.2)))
-            fracs = np.linspace(1/n_steps, 1.0, n_steps)
-            cc_grid = self.x + np.outer(ray_vx_arr, fracs) * check_dist_max
-            cr_grid = self.y + np.outer(ray_vy_arr, fracs) * check_dist_max
-            if self.world and hasattr(self.world, 'batch_is_passable'):
+            prev_desired = getattr(self, '_prev_desired', (0.0, 0.0))
+            desired_changed = (abs(desired_vx - prev_desired[0]) > 0.05 or abs(desired_vy - prev_desired[1]) > 0.05)
+            cache_stale = (self.frame - getattr(self, '_steer_cache_frame', -999)) >= _STEER_CACHE_TTL
+            if desired_changed or cache_stale:
+                num_rays = 16
+                current_speed = self.max_speed * speed_mult
+                cur_speed_mag = math.hypot(self.vx, self.vy) + 1e-6
+                cur_vx_norm = self.vx / cur_speed_mag
+                cur_vy_norm = self.vy / cur_speed_mag
+                angles = np.linspace(0, 2*math.pi, num_rays, endpoint=False)
+                ray_vx_arr = np.cos(angles)
+                ray_vy_arr = np.sin(angles)
+                check_dist_max = current_speed * 1.5 + self.radius
+                n_steps = max(2, int(math.ceil(check_dist_max / 0.2)))
+                fracs = np.linspace(1/n_steps, 1.0, n_steps)
+                cc_grid = self.x + np.outer(ray_vx_arr, fracs) * check_dist_max
+                cr_grid = self.y + np.outer(ray_vy_arr, fracs) * check_dist_max
                 passable = self.world.batch_is_passable(cc_grid.flatten(), cr_grid.flatten(), self.radius).reshape((num_rays, n_steps))
+                hit_mask = ~passable
+                hit_indices = np.argmax(hit_mask, axis=1)
+                has_hit = np.any(hit_mask, axis=1)
+                hit_fracs = (hit_indices + 1) / n_steps
+                ray_penalties = np.where(has_hit, 1000.0 / hit_fracs, 0.0)
+                interests = 1.5 * (ray_vx_arr * desired_vx + ray_vy_arr * desired_vy)
+                hysteresis = 0.3 * (ray_vx_arr * cur_vx_norm + ray_vy_arr * cur_vy_norm)
+                scores = interests + hysteresis - ray_penalties
+                best_idx = int(np.argmax(scores))
+                best_vx, best_vy = float(ray_vx_arr[best_idx]), float(ray_vy_arr[best_idx])
+                self._steer_cache = (best_vx, best_vy)
+                self._steer_cache_frame = self.frame
+                self._prev_desired = (desired_vx, desired_vy)
             else:
-                r_c = cr_grid.astype(int)
-                c_c = cc_grid.astype(int)
-                valid = (r_c >= 0) & (r_c < len(self.grid)) & (c_c >= 0) & (c_c < len(self.grid[0]))
-                safe_r = np.where(valid, r_c, 0)
-                safe_c = np.where(valid, c_c, 0)
-                cells = self.grid_arr[safe_r, safe_c]
-                passable = valid & (cells != WALL)
-            hit_mask = ~passable
-            hit_indices = np.argmax(hit_mask, axis=1)
-            has_hit = np.any(hit_mask, axis=1)
-            hit_fracs = (hit_indices + 1) / n_steps
-            ray_penalties = np.where(has_hit, 1000.0 / hit_fracs, 0.0)
-            interests = 1.5 * (ray_vx_arr * desired_vx + ray_vy_arr * desired_vy)
-            hysteresis = 0.3 * (ray_vx_arr * cur_vx_norm + ray_vy_arr * cur_vy_norm)
-            scores = interests + hysteresis - ray_penalties
-            best_idx = np.argmax(scores)
-            best_vx, best_vy = ray_vx_arr[best_idx], ray_vy_arr[best_idx]
+                best_vx, best_vy = getattr(self, '_steer_cache', (desired_vx, desired_vy))
         target_vy = best_vy * self.max_speed * speed_mult
         target_vx = best_vx * self.max_speed * speed_mult
         smooth_vy = self.vy * 0.7 + target_vy * 0.3
@@ -403,40 +388,43 @@ class Ghost:
             self.vy = target_vy
             self.vx = target_vx
         self.path_this_frame = [(self.x, self.y)]
-        if self.world and hasattr(self.world, 'resolve_collision'):
-            steps = max(1, int(math.ceil(math.hypot(self.vx, self.vy) / 0.2)))
-            if steps > 0:
-                step_vx = self.vx / steps
-                step_vy = self.vy / steps
-                for _ in range(steps):
-                    self.x += step_vx
-                    self.y += step_vy
-                    self.x, self.y = self.world.resolve_collision(self.x, self.y, self.radius, max_iters=3)
-                    self.path_this_frame.append((self.x, self.y))
-        else:
-            self.x += self.vx
-            self.y += self.vy
-            self.x = max(self.radius, min(len(self.grid[0]) - self.radius, self.x))
-            self.y = max(self.radius, min(len(self.grid) - self.radius, self.y))
-        r, c = int(self.y), int(self.x)
-        if 0 <= r < len(self.grid) and 0 <= c < len(self.grid[0]):
-            if self.grid[r][c] == POWER:
-                self.grid[r][c] = PELLET
-                self.grid_arr[r, c] = PELLET
-                pt = (float(c) + 0.5, float(r) + 0.5)
-                if getattr(self, 'world', None):
-                    if pt in self.world.power_pellets:
-                        self.world.power_pellets.remove(pt)
-                    if pt not in self.world.pellets:
-                        self.world.pellets.append(pt)
-                    if hasattr(self.world, '_update_pellet_arrays'):
-                        self.world._update_pellet_arrays()
-                p_tup = pt
-                self.known_power_pellets = {p for p in self.known_power_pellets if int(p[0]) != c or int(p[1]) != r}
-                if p_tup not in self.known_pellets:
-                    self.known_pellets.add(p_tup)
-                    self._broadcast([("pellet", p_tup)], all_ghosts)
-        self.pos_history.append((self.y, self.x))
+        steps = max(1, int(math.ceil(math.hypot(self.vx, self.vy) / 0.2)))
+        if steps > 0:
+            step_vx = self.vx / steps
+            step_vy = self.vy / steps
+            for _ in range(steps):
+                self.x += step_vx
+                self.y += step_vy
+                self.x, self.y = self.world.resolve_collision(self.x, self.y, self.radius, max_iters=3)
+                self.path_this_frame.append((self.x, self.y))
+        power_arr = getattr(self.world, 'power_pellets_arr', None)
+        if power_arr is not None and len(power_arr) > 0:
+            dist = np.hypot(power_arr[:, 0] - self.x, power_arr[:, 1] - self.y)
+            close_idx = np.where(dist < self.radius + 0.5)[0]
+            if len(close_idx) > 0:
+                for idx in close_idx:
+                    arr_xy = power_arr[idx]   # (x, y) as float32
+                    # tolerance-based removal to handle float32 vs float64 mismatch
+                    pt = None
+                    for pp in list(self.world.power_pellets):
+                        if abs(pp[0] - float(arr_xy[0])) < 0.02 and abs(pp[1] - float(arr_xy[1])) < 0.02:
+                            pt = pp
+                            break
+                    if pt is None:
+                        pt = (float(arr_xy[0]), float(arr_xy[1]))
+                    if getattr(self, 'world', None):
+                        if pt in self.world.power_pellets:
+                            self.world.power_pellets.remove(pt)
+                        if pt not in self.world.pellets:
+                            self.world.pellets.append(pt)
+                        if hasattr(self.world, '_update_pellet_arrays'):
+                            self.world._update_pellet_arrays()
+                    self.known_power_pellets.discard(pt)
+                    if pt not in self.known_pellets:
+                        self.known_pellets.add(pt)
+                    # broadcast both events: power_eaten (removes from others' known_power_pellets)
+                    # and pellet (adds to others' known_pellets)
+                    self._broadcast([("power_eaten", pt), ("pellet", pt)], all_ghosts)
         self._check_oscillation()
         return newly_discovered, stale_refreshed
 
@@ -466,6 +454,16 @@ class Ghost:
                     self._broadcast([("agent_lost", gid)], all_ghosts)
 
     def _lidar_sweep(self, all_ghosts, player_pos, powered=False):
+        directions = np.column_stack((_DX, _DY))
+        if hasattr(self.world, 'batch_raycast'):
+            hit_x, hit_y = self.world.batch_raycast((self.x, self.y), directions, max_dist=15.0)
+            if len(hit_x) > 0:
+                hits = set(zip(np.round(hit_y, 1), np.round(hit_x, 1)))
+                new_walls = hits - self.lidar_memory
+                if new_walls:
+                    self.lidar_memory.update(new_walls)
+                    wall_diffs = [("wall", w) for w in new_walls]
+                    self._broadcast(wall_diffs, all_ghosts)
         visible_prm = []
         visible_belief_idxs = set()
         impassable_belief_nodes = []
@@ -505,9 +503,6 @@ class Ghost:
                         impassable_nodes = valid_nodes[~is_pass]
                         if len(impassable_nodes) > 0:
                             impassable_belief_nodes.extend([tuple(n) for n in impassable_nodes])
-        directions = np.column_stack((_DX, _DY))
-        hit_x, hit_y = self.world.batch_raycast((self.x, self.y), directions, max_dist=MAX_RAY_DIST)
-        lidar_hits = set(zip(np.round(hit_y, 2), np.round(hit_x, 2)))
         pellet_diffs = []
         pellets_arr = getattr(self.world, 'pellets_arr', None)
         if pellets_arr is not None and len(pellets_arr) > 0:
@@ -518,9 +513,13 @@ class Ghost:
             if len(valid) > 0:
                 is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0, step_size=0.5)
                 for p, v in zip(valid, is_los):
-                    if v and tuple(p) not in self.known_pellets:
-                        self.known_pellets.add(tuple(p))
-                        pellet_diffs.append(("pellet", tuple(p)))
+                    if v:
+                        pt = find_closest_pellet(p, self.world, is_power=False)
+                        if pt is None:
+                            pt = tuple(p)
+                        if pt not in self.known_pellets:
+                            self.known_pellets.add(pt)
+                            pellet_diffs.append(("pellet", pt))
         power_arr = getattr(self.world, 'power_pellets_arr', None)
         if power_arr is not None and len(power_arr) > 0:
             dx = power_arr[:, 0] - self.x
@@ -530,9 +529,13 @@ class Ghost:
             if len(valid) > 0:
                 is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0, step_size=0.5)
                 for p, v in zip(valid, is_los):
-                    if v and tuple(p) not in self.known_power_pellets:
-                        self.known_power_pellets.add(tuple(p))
-                        pellet_diffs.append(("power", tuple(p)))
+                    if v:
+                        pt = find_closest_pellet(p, self.world, is_power=True)
+                        if pt is None:
+                            pt = tuple(p)
+                        if pt not in self.known_power_pellets:
+                            self.known_power_pellets.add(pt)
+                            pellet_diffs.append(("power", pt))
         agent_diffs = []
         alive_ghosts = []
         alive_gids = []
@@ -590,20 +593,14 @@ class Ghost:
                 self.pacman_last_seen = self.frame 
                 self.known_pacman = None
                 pacman_diff = ("pacman_lost", kr, kc, self.frame)
-        return lidar_hits, visible_prm, agent_diffs, pacman_diff, pellet_diffs, visible_belief_idxs, impassable_belief_nodes
+        return [], visible_prm, agent_diffs, pacman_diff, pellet_diffs, visible_belief_idxs, impassable_belief_nodes
 
     def _update_lidar_memory(self, all_ghosts, player_pos, powered=False):
-        lidar_hits, visible_prm, agent_diffs, pacman_diff, pellet_diffs, visible_belief_idxs, impassable_belief_nodes = self._lidar_sweep(all_ghosts, player_pos, powered)
+        _, visible_prm, agent_diffs, pacman_diff, pellet_diffs, visible_belief_idxs, impassable_belief_nodes = self._lidar_sweep(all_ghosts, player_pos, powered)
         diffs = []
         newly_discovered = 0
         stale_refreshed = 0.0
-        self._personal_map_dirty = True      #invalidate cached personal_map
         diffs.extend(pellet_diffs)
-        for pt in lidar_hits:
-            if pt not in self.lidar_memory:
-                newly_discovered += 1
-                self.lidar_memory.add(pt)
-                diffs.append(("wall_hit", pt))        
         for n in visible_prm:
             last = self.prm_last_seen.get(n, -1)
             if last != -1:
@@ -641,7 +638,6 @@ class Ghost:
         self.known_pellets.intersection_update(world_pellets)
         self.known_power_pellets.intersection_update(world_power_pellets)
         self._last_visible_belief_idxs = visible_belief_idxs
-        self._last_impassable_belief_nodes = impassable_belief_nodes
         return diffs, newly_discovered, stale_refreshed
 
     def _broadcast(self, diffs, all_ghosts, msg_id=None, hop=0):
@@ -672,19 +668,26 @@ class Ghost:
 
     def _send_full_sync(self, target_ghost):
         sync_diffs = []
-        missing_walls = self.lidar_memory - target_ghost.lidar_memory
-        SYNC_WALL_CAP = 200
-        for pt in list(missing_walls)[:SYNC_WALL_CAP]:
-            sync_diffs.append(("wall_hit", pt))
         for n, last_seen in self.prm_last_seen.items():
             if last_seen != -1:
                 sync_diffs.append(("prm_refresh", n))
+        tgt_pellets = getattr(target_ghost, 'known_pellets', None)
+        if tgt_pellets is None: tgt_pellets = set()
         for p in self.known_pellets:
-            if p not in getattr(target_ghost, 'known_pellets', set()):
+            if p not in tgt_pellets:
                 sync_diffs.append(("pellet", p))
+                
+        tgt_power = getattr(target_ghost, 'known_power_pellets', None)
+        if tgt_power is None: tgt_power = set()
         for p in self.known_power_pellets:
-            if p not in getattr(target_ghost, 'known_power_pellets', set()):
+            if p not in tgt_power:
                 sync_diffs.append(("power", p))        
+                
+        tgt_lidar = getattr(target_ghost, 'lidar_memory', None)
+        if tgt_lidar is None: tgt_lidar = set()
+        for w in self.lidar_memory:
+            if w not in tgt_lidar:
+                sync_diffs.append(("wall", w))
         for gid, pos in self.known_agents.items():
             if pos == "UNKNOWN":
                 sync_diffs.append(("agent_lost", gid))
@@ -711,12 +714,7 @@ class Ghost:
             relay_diffs = []
             for diff in msg["diffs"]:
                 dtype = diff[0]
-                if dtype == "wall_hit":
-                    _, pt = diff
-                    if pt not in self.lidar_memory:
-                        self.lidar_memory.add(pt)
-                        relay_diffs.append(diff)
-                elif dtype == "prm_refresh":
+                if dtype == "prm_refresh":
                     _, n = diff
                     if self.prm_last_seen.get(n, -1) < self.frame - MEMORY_FRAMES:
                         self.prm_last_seen[n] = self.frame
@@ -738,6 +736,16 @@ class Ghost:
                     _, p = diff
                     if p not in self.known_power_pellets and p not in self.known_pellets:
                         self.known_power_pellets.add(p)
+                        relay_diffs.append(diff)
+                elif dtype == "power_eaten":
+                    _, p = diff
+                    # A teammate converted a power pellet — purge from our known_power_pellets
+                    self.known_power_pellets.discard(p)
+                    relay_diffs.append(diff)
+                elif dtype == "wall":
+                    _, w = diff
+                    if w not in self.lidar_memory:
+                        self.lidar_memory.add(w)
                         relay_diffs.append(diff)
                 elif dtype == "agent_lost":
                     _, gid = diff

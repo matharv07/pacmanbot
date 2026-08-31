@@ -418,7 +418,7 @@ def train():
     print("VecEnv initialized. Starting training...")
     t0 = time.time()
 
-    def ppo_worker(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_act, b_olp, b_adv, b_ret, lam_bc, anneal_frac, mean_ret, mean_pac, episodes, total_steps, t_rollout, t0_ref, bc_prob, realized_merge_rate, ret_rms):
+    def ppo_worker(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_act, b_spd, b_olp, b_adv, b_ret, lam_bc, anneal_frac, mean_ret, mean_pac, episodes, total_steps, t_rollout, t0_ref, bc_prob, realized_merge_rate, ret_rms):
         t_ppo_start = time.time()
         metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "approx_kl": 0, "clip_fraction": 0, "n_batches": 0}    
         N_total = b_sp.shape[0]
@@ -476,12 +476,14 @@ def train():
                             chunk_idx = idx[start_i:end_i]
                             weight = len(chunk_idx) / n_idx
                             mb_sp  = b_sp[chunk_idx]
+                            mb_gsp_ids = b_gsp_ids[chunk_idx]
                             mb_ve  = b_ve[chunk_idx]
                             mb_cve = b_cve[chunk_idx]
-                            mb_gsp_ids = b_gsp_ids[chunk_idx]
                             mb_vm  = b_vm[chunk_idx]
                             mb_ht  = b_ht[chunk_idx]
+                            mb_hs  = b_hs[chunk_idx]
                             mb_act = b_act[chunk_idx]
+                            mb_spd = b_spd[chunk_idx]
                             mb_olp = b_olp[chunk_idx]
                             mb_adv = b_adv[chunk_idx]
                             mb_ret = b_ret[chunk_idx]
@@ -492,7 +494,7 @@ def train():
                                 print(f"  ⚠️  Action index OOB: max={mb_act.max().item()} >= H*W={_hw}, clamping")
                                 push_discord_warning(f"⚠️ Action OOB at update {update}: max_act={mb_act.max().item()}, H*W={_hw}, sp={tuple(mb_sp.shape)}")
                                 mb_act = mb_act.clamp(max=_hw - 1)
-                            new_lp, ent, pool, vec, flat_logits = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act)
+                            new_lp, ent, pool, vec, flat_logits, speed_params = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act, mb_spd)
                             unique_ids, inv_idx = torch.unique(mb_gsp_ids, return_inverse=True)
                             mb_gsp_unique = b_gsp_unique[unique_ids]
                             mb_c_pool = critic.encode_spatial(mb_gsp_unique)
@@ -515,7 +517,17 @@ def train():
                                 fl_bc     = flat_logits[valid_bc].clamp(min=-1e4)
                                 log_pi    = F.log_softmax(fl_bc, dim=-1)
                                 bc        = -(ht_prob * log_pi).sum(dim=-1).mean()
-                                bc        = bc * bc_valid_frac
+                                
+                                #speed BC loss using Beta distribution log-prob
+                                #mb_hs is the target heuristic speed
+                                #speed_params is (alpha, beta) of the predicted Beta
+                                #we can maximize log-prob of target speed:
+                                target_speed = mb_hs[valid_bc].clamp(1e-4, 1.0 - 1e-4)
+                                alpha = speed_params[valid_bc, 0]
+                                beta = speed_params[valid_bc, 1]
+                                dist_speed = torch.distributions.Beta(alpha, beta)
+                                bc_speed = -dist_speed.log_prob(target_speed).mean()
+                                bc = (bc + bc_speed * 0.2) * bc_valid_frac
                             else:
                                 bc = torch.tensor(0.0, device=DEVICE)
                             loss_actor = a_loss - ENT_COEF * ent.mean() + lam_bc * bc
@@ -588,7 +600,9 @@ def train():
         buf_cve       = [[] for _ in range(NUM_ENVS)]
         buf_mask      = [[] for _ in range(NUM_ENVS)]
         buf_htarget   = [[] for _ in range(NUM_ENVS)]
+        buf_hspeed    = [[] for _ in range(NUM_ENVS)]
         buf_actions   = [[] for _ in range(NUM_ENVS)]
+        buf_speeds    = [[] for _ in range(NUM_ENVS)]
         buf_logprobs  = [[] for _ in range(NUM_ENVS)]
         buf_values    = [[] for _ in range(NUM_ENVS)]
         buf_rewards   = [[] for _ in range(NUM_ENVS)]
@@ -609,7 +623,7 @@ def train():
             active_n_ghosts = []  #how many ghosts per active env
             for e in range(NUM_ENVS):
                 obs = vec_env.current_obs[e]
-                gids, sp, ve, vm, ht, global_sp, grid_shape = obs
+                gids, sp, ve, vm, ht, hs, global_sp, grid_shape = obs
                 n_g = len(gids)
                 env_n_ghosts.append(n_g)
                 if n_g == 0:
@@ -621,7 +635,9 @@ def train():
                     buf_cve[e].append(np.empty((0, CRITIC_VEC_DIM), dtype=np.float32))
                     buf_mask[e].append(np.empty((0, MAX_H, MAX_W), dtype=bool))
                     buf_htarget[e].append(np.empty((0, MAX_H, MAX_W), dtype=np.float32))
+                    buf_hspeed[e].append(np.empty((0, 1), dtype=np.float32))
                     buf_actions[e].append(np.empty((0, K_NOMINATIONS), dtype=np.int64))
+                    buf_speeds[e].append(np.empty((0, 1), dtype=np.float32))
                     buf_logprobs[e].append(np.empty((0,), dtype=np.float32))
                     continue
                 #Pad trimmed observations to current stage size for CNN
@@ -656,6 +672,7 @@ def train():
                 buf_cve[e].append(cve_batch)
                 buf_mask[e].append(vm_padded.astype(bool))
                 buf_htarget[e].append(ht_padded)
+                buf_hspeed[e].append(hs)
                 buf_gids[e].append(gids)
             #run a single batched forward pass for all ghosts across all envs
             if batch_sp:
@@ -670,15 +687,17 @@ def train():
                 n_total = t_sp.shape[0]
                 while True:
                     try:
-                        idx_chunks, lp_chunks, sc_chunks = [], [], []
+                        idx_chunks, lp_chunks, sc_chunks, spd_chunks, spd_lp_chunks = [], [], [], [], []
                         with torch.inference_mode():
                             for ci in range(0, n_total, _eff_infer_chunk):
                                 ce = min(ci + _eff_infer_chunk, n_total)
-                                c_idx, c_lp, c_scores, _, _ = actor_rollout(
+                                c_idx, c_lp, c_scores, _, _, c_speed, c_speed_lp = actor_rollout(
                                     t_sp[ci:ce], t_ve[ci:ce], t_vm[ci:ce], K=K_NOMINATIONS)
                                 idx_chunks.append(c_idx)
                                 lp_chunks.append(c_lp)
                                 sc_chunks.append(c_scores)
+                                spd_chunks.append(c_speed)
+                                spd_lp_chunks.append(c_speed_lp)
                             val_all = _critic_value(critic_rollout, t_gsp_unique, t_cve, active_n_ghosts)
                             val_all = ret_rms(val_all, unnorm=True)
                         break  #success
@@ -694,6 +713,8 @@ def train():
                 idx_t = torch.cat(idx_chunks, dim=0)
                 lp_t  = torch.cat(lp_chunks, dim=0)
                 sc_t  = torch.cat(sc_chunks, dim=0)
+                spd_t = torch.cat(spd_chunks, dim=0)
+                spd_lp_t = torch.cat(spd_lp_chunks, dim=0)
 
                 offset = 0
                 for e in range(NUM_ENVS):
@@ -705,15 +726,18 @@ def train():
                     e_idx = idx_t[offset:offset + n_g].cpu().numpy()
                     e_sc  = sc_t[offset:offset + n_g].cpu().numpy()
                     e_lp  = lp_t[offset:offset + n_g].cpu().numpy()
+                    e_spd = spd_t[offset:offset + n_g].cpu().numpy()
+                    e_spd_lp = spd_lp_t[offset:offset + n_g].cpu().numpy()
                     e_val = val_all[offset:offset + n_g].cpu().numpy()
                     env_act = {}
                     for i, gid in enumerate(gids):
                         pairs = [(int(x // stage.cols), int(x % stage.cols))
                                  for x in e_idx[i]]
-                        env_act[gid] = (pairs, e_sc[i])
+                        env_act[gid] = (pairs, e_sc[i], e_spd[i].item())
                     step_actions[e] = env_act
                     buf_actions[e].append(e_idx)
-                    buf_logprobs[e].append(e_lp.sum(axis=1))
+                    buf_speeds[e].append(e_spd)
+                    buf_logprobs[e].append(e_lp.sum(axis=1) + e_spd_lp.squeeze(-1))
                     v_dict = {gids[i]: float(e_val[i]) for i in range(n_g)}
                     buf_values[e].append(v_dict)
                     offset += n_g
@@ -787,9 +811,9 @@ def train():
                 all_last_v[e] = {gids[i]: float(v_np[offset + i]) for i in range(n_g)}
                 offset += n_g
         #flatten per-env rollouts into a single batch 
-        all_sp, all_ve, all_vm, all_ht = [], [], [], []
+        all_sp, all_ve, all_vm, all_ht, all_hs = [], [], [], [], []
         all_cve, all_gsp_ids = [], []
-        all_act, all_lp, all_adv, all_ret = [], [], [], []
+        all_act, all_spd, all_lp, all_adv, all_ret = [], [], [], [], []
         for e in range(NUM_ENVS):
             T = len(buf_rewards[e])
             if T == 0:
@@ -810,7 +834,9 @@ def train():
                     all_cve.append(buf_cve[e][t][i])
                     all_vm.append(buf_mask[e][t][i])
                     all_ht.append(buf_htarget[e][t][i])
+                    all_hs.append(buf_hspeed[e][t][i])
                     all_act.append(buf_actions[e][t][i])
+                    all_spd.append(buf_speeds[e][t][i])
                     all_lp.append(buf_logprobs[e][t][i])
                     all_adv.append(adv_dict_list[t].get(gid, 0.0))
                     all_ret.append(ret_dict_list[t].get(gid, 0.0))
@@ -824,12 +850,14 @@ def train():
         arr_cve = np.array(all_cve, dtype=np.float32)
         arr_vm  = np.array(all_vm, dtype=bool)
         arr_ht  = np.array(all_ht, dtype=np.float32)
+        arr_hs  = np.array(all_hs, dtype=np.float32)
         arr_act = np.array(all_act, dtype=np.int64)
+        arr_spd = np.array(all_spd, dtype=np.float32)
         arr_olp = np.array(all_lp, dtype=np.float32)
         arr_adv = np.array(all_adv, dtype=np.float32)
         arr_ret = np.array(all_ret, dtype=np.float32)
-        ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_act, ds_olp, ds_adv, ds_ret = train_transfer.transfer(
-            arr_sp, arr_gsp_unique, arr_gsp_ids, arr_ve, arr_cve, arr_vm, arr_ht, arr_act, arr_olp, arr_adv, arr_ret)
+        ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_olp, ds_adv, ds_ret = train_transfer.transfer(
+            arr_sp, arr_gsp_unique, arr_gsp_ids, arr_ve, arr_cve, arr_vm, arr_ht, arr_hs, arr_act, arr_spd, arr_olp, arr_adv, arr_ret)
         N_total = ds_sp.shape[0]
         #verify action indices are within spatial bounds
         _sp_hw = ds_sp.shape[-2] * ds_sp.shape[-1]
@@ -972,7 +1000,7 @@ def train():
                 print(f"  💾 Checkpoint saved: {path}")
         ret_rms.update(ds_ret)
         train_thread = threading.Thread(target=ppo_worker, args=(
-            update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_act, ds_olp, ds_adv, ds_ret,
+            update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_olp, ds_adv, ds_ret,
             lam_bc, anneal_frac, mean_ret, mean_pac, episodes, total_steps, t_rollout, t0, bc_prob, realized_merge_rate, ret_rms))
         train_thread.start()
     if train_thread is not None:

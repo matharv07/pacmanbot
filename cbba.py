@@ -120,7 +120,7 @@ class CBBA_Agent:
     def _phase1(self, ghost, tasks: list, dists: dict):
         valid_keys = {_task_key(t) for t in tasks}
         self._task_map.update({_task_key(t): t for t in tasks})
-        self._dist_cache = {pos: d for pos, (d, _) in dists.items()}
+        self._dist_cache = {(round(pos[0], 2), round(pos[1], 2)): d for pos, (d, _) in dists.items()}
         #pruning bundle & path: keeping only tasks we still own in the new task set
         new_bundle = []
         for k in self.bundle:
@@ -183,18 +183,18 @@ class CBBA_Agent:
                 continue
             tgt = task.target_pos
             if prev_pos == (ghost.y, ghost.x):
-                d = self._dist_cache.get(tgt, math.inf)
+                d = self._dist_cache.get((round(tgt[0], 2), round(tgt[1], 2)), math.inf)
             else:
-                pair = (prev_pos, tgt)
-                if pair not in getattr(self, '_astar_cache', {}):
+                cache_pair = ((round(prev_pos[0], 2), round(prev_pos[1], 2)), (round(tgt[0], 2), round(tgt[1], 2)))
+                if cache_pair not in getattr(self, '_astar_cache', {}):
                     res = dijkstra_multi(ghost.world, prev_pos, [tgt])
                     d = res[tgt][0] if tgt in res else math.inf
                     if not hasattr(self, '_astar_cache'):
                         self._astar_cache = {}
                     if len(self._astar_cache) > 2000:
                         self._astar_cache.clear()
-                    self._astar_cache[pair] = d
-                d = self._astar_cache[pair]
+                    self._astar_cache[cache_pair] = d
+                d = self._astar_cache[cache_pair]
             cumulative += d
             total += task.score * (self.lamda ** cumulative)
             prev_pos = tgt

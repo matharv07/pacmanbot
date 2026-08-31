@@ -68,7 +68,7 @@ def _connect_temp_nodes_batch(world, nodes_list):
                 res = (clear_dists, clear_indices)
             world._conn_cache[origin_tup] = res
             results_map[i] = res
-    if len(world._conn_cache) > 20000:
+    if len(world._conn_cache) > 5000:
         world._conn_cache.clear()
     for i in range(len(nodes_list)):
         results.append(results_map[i])

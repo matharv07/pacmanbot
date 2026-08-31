@@ -59,7 +59,7 @@ class RewardShaper:
             d = abs(ghost.y - target[0]) + abs(ghost.x - target[1])
         if math.isinf(d) or math.isnan(d):
             d = 999.0
-        diag = len(ghost.grid) + len(ghost.grid[0])
+        diag = math.hypot(ghost.world.width, ghost.world.height)
         if getattr(ghost, 'pacman_powered', False):
             return 0.0
         return -self.alpha * (d / diag)
@@ -80,7 +80,7 @@ class RewardShaper:
             d = abs(ghost.y - target[0]) + abs(ghost.x - target[1])
         if math.isinf(d) or math.isnan(d):
             d = 999.0
-        diag = len(ghost.grid) + len(ghost.grid[0])
+        diag = math.hypot(ghost.world.width, ghost.world.height)
         #positive potential for distance when powered -> encourages fleeing
         return self.alpha * (d / diag)
 
@@ -108,12 +108,12 @@ class RewardShaper:
         return self.beta * (1.0 - R)
 
     def _phi_explore(self, ghost) -> float:
-        #fraction of open cells known (0-1), NOT raw counts — keeps scale O(1)
-        p = ghost.personal_map
-        open_cells = np.sum(p != 1)   #exclude walls from denominator
-        total_open = max(open_cells, 1)
-        known = np.sum((p != -1) & (p != 1))   #not unknown, not wall
-        return self.gamma_ex * (known / total_open)
+        #fraction of PRM nodes explored (0-1) keeps scale O(1)
+        if not hasattr(ghost.world, 'prm_nodes') or not hasattr(ghost, 'prm_last_seen'):
+            return 0.0
+        total_nodes = max(len(ghost.world.prm_nodes), 1)
+        known = sum(1 for v in ghost.prm_last_seen.values() if v != -1)
+        return self.gamma_ex * (known / total_nodes)
 
     def _phi_belief(self, ghost) -> float:
         if not hasattr(ghost.belief_map, '_b_flat'):
@@ -137,9 +137,7 @@ class RewardShaper:
             dist = math.hypot(ghost.y - g.y, ghost.x - g.x)
             if dist < min_dist:
                 min_dist = dist
-        rows = len(ghost.grid)
-        cols = len(ghost.grid[0])
-        repulsion_radius = max(2.0, min(rows, cols) * 0.15)        
+        repulsion_radius = max(2.0, min(ghost.world.height, ghost.world.width) * 0.15)        
         if min_dist < repulsion_radius:
             return -self.gamma_ex * ((repulsion_radius - min_dist) / repulsion_radius)
         return 0.0

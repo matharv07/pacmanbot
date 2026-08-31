@@ -55,6 +55,7 @@ ORANGE = (255, 160, 30)
 DKBLUE = (10, 10, 60)
 GREY   = (80, 80, 80)
 POWERED_COLOR = (0, 120, 255)
+PURPLE = (182, 148, 255)  # lavender — used for lidar wall dots in personal map
 GHOST_COLORS  = [RED, PINK, CYAN, ORANGE, (180, 0, 180), (0, 180, 80), (220, 220, 0)]
 
 WALL   = 1
@@ -109,41 +110,44 @@ def load_rl_model():
         RL_MODE = False
         return False
 
-def generate_map(rows: int = ROWS, cols: int = COLS, n_power: int = N_POWER, random_spawn: bool = False):
-    world = World(cols, rows, resolution=0.5)
-    area_ratio = (rows * cols) / (33 * 41)
+def generate_map(world_height: float = ROWS, world_width: float = COLS, n_power: int = N_POWER, random_spawn: bool = False, obs_resolution: float = 1.0):
+    world = World(world_width, world_height, resolution=0.5)
+    area_ratio = (world_height * world_width) / (33 * 41)
     n_obs = max(2, int(25 * area_ratio))
     world.generate(n_obstacles=n_obs)
+    rows = int(world_height * obs_resolution)
+    cols = int(world_width * obs_resolution)
     grid = np.full((rows, cols), WALL, dtype=np.int8)
     grid_y, grid_x = np.mgrid[0:rows, 0:cols]
-    px = (grid_x.ravel() * 1.0) + 0.5
-    py = (grid_y.ravel() * 1.0) + 0.5
+    px = (grid_x.ravel() / obs_resolution) + (0.5 / obs_resolution)
+    py = (grid_y.ravel() / obs_resolution) + (0.5 / obs_resolution)
     dist_sq, r = world._points_to_segments_dist_sq(px, py)
     blocked = np.any(dist_sq <= (r + 0.35)**2, axis=1)
     grid_flat = np.where(blocked, WALL, EMPTY)
     grid = grid_flat.reshape((rows, cols))
     if world.pellets:
         pellets = np.array(world.pellets)
-        pr = pellets[:, 1].astype(int)
-        pc = pellets[:, 0].astype(int)
+        pr = (pellets[:, 1] * obs_resolution).astype(int)
+        pc = (pellets[:, 0] * obs_resolution).astype(int)
         valid = (pr >= 0) & (pr < rows) & (pc >= 0) & (pc < cols)
         pr, pc = pr[valid], pc[valid]
         empty_mask = grid[pr, pc] == EMPTY
         grid[pr[empty_mask], pc[empty_mask]] = PELLET
     if world.power_pellets:
         power_pellets = np.array(world.power_pellets)
-        pr = power_pellets[:, 1].astype(int)
-        pc = power_pellets[:, 0].astype(int)
+        pr = (power_pellets[:, 1] * obs_resolution).astype(int)
+        pc = (power_pellets[:, 0] * obs_resolution).astype(int)
         valid = (pr >= 0) & (pr < rows) & (pc >= 0) & (pc < cols)
         pr, pc = pr[valid], pc[valid]
         valid_mask = (grid[pr, pc] == EMPTY) | (grid[pr, pc] == PELLET)
         grid[pr[valid_mask], pc[valid_mask]] = POWER
+    #re-sync world pellets from the rasterized grid to ensure connectivity for A*
     world.pellets = []
     world.power_pellets = []
     for r in range(rows):
         for c in range(cols):
-            if grid[r][c] == PELLET: world.pellets.append((float(c) + 0.5, float(r) + 0.5))
-            elif grid[r][c] == POWER: world.power_pellets.append((float(c) + 0.5, float(r) + 0.5))
+            if grid[r][c] == PELLET: world.pellets.append(((float(c) + 0.5) / obs_resolution, (float(r) + 0.5) / obs_resolution))
+            elif grid[r][c] == POWER: world.power_pellets.append(((float(c) + 0.5) / obs_resolution, (float(r) + 0.5) / obs_resolution))
     world._update_pellet_arrays()
     pr, pc = int(world.safe_area[0][1]), int(world.safe_area[0][0])
     return grid, (pr, pc), world
@@ -394,24 +398,46 @@ class Player:
         c_min = max(0, int(self.x - self.radius))
         c_max = min(len(self.grid[0]) - 1, int(self.x + self.radius))
         collected_anything = False
-        for cr in range(r_min, r_max + 1):
-            for cc in range(c_min, c_max + 1):
-                cell = self.grid[cr][cc]
-                if cell in (PELLET, POWER):
-                    self.grid[cr][cc] = EMPTY
-                    self.score += 10 if cell == PELLET else 50
-                    pt = (float(cc) + 0.5, float(cr) + 0.5)
-                    if self.world:
-                        if cell == PELLET and pt in self.world.pellets:
-                            self.world.pellets.remove(pt)
-                            self.world._update_pellet_arrays()
-                        elif cell == POWER and pt in self.world.power_pellets:
-                            self.world.power_pellets.remove(pt)
-                            self.world._update_pellet_arrays()
-                    if cell == POWER:
-                        self.powered = True
-                        self.power_timer = 40
+        if self.world:
+            eat_radius = self.radius + 0.25
+            pellets_eaten = False
+            for pt in list(self.world.pellets):
+                if math.hypot(self.x - pt[0], self.y - pt[1]) < eat_radius:
+                    self.world.pellets.remove(pt)
+                    self.score += 10
+                    pellets_eaten = True
                     collected_anything = True
+                    r, c = int(pt[1]), int(pt[0])
+                    if 0 <= r < len(self.grid) and 0 <= c < len(self.grid[0]):
+                        self.grid[r][c] = EMPTY
+            
+            for pt in list(self.world.power_pellets):
+                if math.hypot(self.x - pt[0], self.y - pt[1]) < eat_radius:
+                    self.world.power_pellets.remove(pt)
+                    self.score += 50
+                    self.powered = True
+                    self.power_timer = 40
+                    pellets_eaten = True
+                    collected_anything = True
+                    r, c = int(pt[1]), int(pt[0])
+                    if 0 <= r < len(self.grid) and 0 <= c < len(self.grid[0]):
+                        self.grid[r][c] = EMPTY
+            
+            if pellets_eaten:
+                self.world._update_pellet_arrays()
+                if hasattr(self.world, '_pellet_lookup'): self.world._pellet_lookup = None
+                if hasattr(self.world, '_power_lookup'): self.world._power_lookup = None
+        else:
+            for cr in range(r_min, r_max + 1):
+                for cc in range(c_min, c_max + 1):
+                    cell = self.grid[cr][cc]
+                    if cell in (PELLET, POWER):
+                        self.grid[cr][cc] = EMPTY
+                        self.score += 10 if cell == PELLET else 50
+                        if cell == POWER:
+                            self.powered = True
+                            self.power_timer = 40
+                        collected_anything = True
         if collected_anything:
             self._route = []
             self._route_target = None
@@ -472,23 +498,34 @@ class Game:
         self.grid, self.player_start, self.world = generate_map()
         self.player = Player(self.grid, self.player_start, self.world)
         self.total_pellets = int(np.sum(np.isin(self.grid, (PELLET, POWER))))
-        open_cells = np.argwhere(self.grid != WALL)
-        pac_pos = np.array(self.player_start)
-        dist_pac = np.sum(np.abs(open_cells - pac_pos), axis=1)
-        min_dist_to_ghosts = np.full(len(open_cells), np.inf)
-        available = np.ones(len(open_cells), dtype=bool)
-        first_idx = np.argmax(dist_pac)
-        ghost_starts = [tuple(open_cells[first_idx])]
-        available[first_idx] = False
+        open_cells_arr = None
+        if hasattr(self.world, 'prm_nodes') and self.world.prm_nodes:
+            open_cells_arr = np.array(self.world.prm_nodes)  # shape (N, 2): (y, x)
+        if open_cells_arr is None or len(open_cells_arr) < N_GHOSTS:
+            # fallback: sample from safe_area
+            safe = getattr(self.world, 'safe_area', [])
+            if safe:
+                sampled = random.sample(safe, min(len(safe), max(N_GHOSTS * 3, 20)))
+                open_cells_arr = np.array([(pt[1], pt[0]) for pt in sampled])  # (y, x) order
+            else:
+                open_cells_arr = np.array([[self.player_start[0], self.player_start[1]]])
+        pac_yx = np.array([self.player_start[0], self.player_start[1]])
+        d_pac = np.sum(np.square(open_cells_arr - pac_yx), axis=1)
+        avail = np.ones(len(open_cells_arr), dtype=bool)
+        # keep ghost starts far from pacman AND from each other
+        first_idx = int(np.argmax(d_pac))
+        ghost_starts = [tuple(open_cells_arr[first_idx])]
+        avail[first_idx] = False
+        min_dist_to_ghosts = np.full(len(open_cells_arr), np.inf)
         for _ in range(N_GHOSTS - 1):
             last_placed = np.array(ghost_starts[-1])
-            dist_to_last = np.sum(np.abs(open_cells - last_placed), axis=1)
+            dist_to_last = np.sum(np.square(open_cells_arr - last_placed), axis=1)
             min_dist_to_ghosts = np.minimum(min_dist_to_ghosts, dist_to_last)
-            scores = np.minimum(dist_pac, min_dist_to_ghosts)
-            scores[~available] = -1
-            best_idx = np.argmax(scores)
-            ghost_starts.append(tuple(open_cells[best_idx]))
-            available[best_idx] = False
+            scores = np.minimum(d_pac, min_dist_to_ghosts)
+            scores[~avail] = -1
+            best_idx = int(np.argmax(scores))
+            ghost_starts.append(tuple(open_cells_arr[best_idx]))
+            avail[best_idx] = False
         self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i % len(GHOST_COLORS)], self.player_start, self.world) for i, pos in enumerate(ghost_starts)}
         self.state = "playing"
         self.message_timer = 0
@@ -567,15 +604,16 @@ class Game:
             if RL_ACTOR is None:
                 load_rl_model()
             if RL_ACTOR is not None:
-                from obs import build_spatial, build_vector, build_valid_mask, actions_to_tasks
+                from obs import build_spatial, build_vector, build_valid_mask, actions_to_tasks, MAX_H, MAX_W
                 alive = [gid for gid, g in self.ghosts.items() if not g.dead]
-                cbba = {gid: g.cbba_agent.get_active_task() for gid, g in self.ghosts.items()}                
+                R = min(MAX_H, len(self.grid))
+                C = min(MAX_W, len(self.grid[0]))
                 sp, ve, vm = [], [], []
                 for gid in alive:
                     g = self.ghosts[gid]
-                    sp.append(build_spatial(g, self.recent_nom[gid]))
+                    sp.append(build_spatial(g, self.recent_nom[gid], R, C, obs_resolution=1.0))
                     ve.append(build_vector(g))
-                    vm.append(build_valid_mask(g))
+                    vm.append(build_valid_mask(g, R, C, obs_resolution=1.0))
                 if alive:
                     t_sp = torch.tensor(np.stack(sp), device=RL_DEVICE, dtype=torch.float32)
                     t_ve = torch.tensor(np.stack(ve), device=RL_DEVICE, dtype=torch.float32)
@@ -584,16 +622,15 @@ class Game:
                         idx, _, scores, _, _ = RL_ACTOR(t_sp, t_ve, t_vm, K=3)
                     idx_np = idx.cpu().numpy()
                     sc_np  = scores.cpu().numpy()
-                    n_cols = len(self.grid[0])
                     for i, gid in enumerate(alive):
                         g = self.ghosts[gid]
-                        indices = [(int(x // n_cols), int(x % n_cols)) for x in idx_np[i]]
+                        indices = [(int(x // C), int(x % C)) for x in idx_np[i]]
                         scores_map = sc_np[i]
                         self.recent_nom[gid] *= 0.8
                         for r, c in indices:
-                            if 0 <= r < len(self.grid) and 0 <= c < len(self.grid[0]):
+                            if 0 <= r < R and 0 <= c < C:
                                 self.recent_nom[gid][r, c] = 1.0
-                        tasks = actions_to_tasks(g, scores_map, indices, self.frame_counter)
+                        tasks = actions_to_tasks(g, scores_map, indices, self.frame_counter, obs_resolution=1.0)
                         g.cbba_agent._last_auction = self.frame_counter
                         all_tasks = tasks
                         h_dists = {}
@@ -658,15 +695,15 @@ class Game:
         surf = self.screen
         for obs in self.world.obstacles:
             obs.draw(surf, CELL)
-        for r in range(ROWS):
-            for c in range(COLS):
-                x = c * CELL
-                y = r * CELL
-                cell = self.grid[r][c]
-                if cell == PELLET:
-                    pygame.draw.circle(surf, WHITE, (x + CELL // 2, y + CELL // 2), 2)
-                elif cell == POWER:
-                    pygame.draw.circle(surf, WHITE, (x + CELL // 2, y + CELL // 2), 5)
+        # Draw live pellet state from world (not stale self.grid)
+        for px, py in self.world.pellets:
+            x = int(px * CELL)
+            y = int(py * CELL)
+            pygame.draw.circle(surf, WHITE, (x, y), 2)
+        for px, py in self.world.power_pellets:
+            x = int(px * CELL)
+            y = int(py * CELL)
+            pygame.draw.circle(surf, WHITE, (x, y), 5)
 
     def draw_hud(self):
         y = ROWS * CELL
@@ -696,12 +733,6 @@ class Game:
         ghost = self.ghosts.get(self.debug_ghost_id)
         if not ghost:
             if self.ghosts:
-                self.debug_ghost_id = next(iter(self.ghosts))
-                ghost = self.ghosts[self.debug_ghost_id]
-    def draw_personal_map(self):
-        ghost = self.ghosts.get(self.debug_ghost_id)
-        if not ghost:
-            if self.ghosts:
                 ghost = next(iter(self.ghosts.values()))
             else:
                 return
@@ -709,18 +740,9 @@ class Game:
         old_clip = self.screen.get_clip()
         self.screen.set_clip(pygame.Rect(ox, 0, WIDTH, ROWS * CELL))
         pygame.draw.rect(self.screen, BLACK, (ox, 0, WIDTH, ROWS * CELL))
-        if len(ghost.lidar_memory) > 0:
-            if not hasattr(self, '_lidar_surf'):
-                self._lidar_surf = pygame.Surface((WIDTH, ROWS * CELL), pygame.SRCALPHA)
-                self._lidar_count = 0        
-            if len(ghost.lidar_memory) != self._lidar_count:
-                self._lidar_surf.fill((0, 0, 0, 0))
-                for py, px in ghost.lidar_memory:
-                    hit_x = int(px * CELL)
-                    hit_y = int(py * CELL)
-                    pygame.draw.rect(self._lidar_surf, (150, 150, 255), (hit_x, hit_y, 2, 2))
-                self._lidar_count = len(ghost.lidar_memory)
-            self.screen.blit(self._lidar_surf, (ox, 0))
+        if hasattr(ghost, 'lidar_memory'):
+            for r, c in ghost.lidar_memory:
+                pygame.draw.rect(self.screen, PURPLE, (int(ox + c * CELL - 2), int(r * CELL - 2), 4, 4))
         if hasattr(ghost, 'known_pellets'):
             for px, py in ghost.known_pellets:
                 pygame.draw.circle(self.screen, WHITE, (int(ox + px * CELL), int(py * CELL)), 2)

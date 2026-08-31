@@ -9,7 +9,7 @@ env.reset()
 profiler = cProfile.Profile()
 profiler.enable()
 
-for i in range(100):
+for i in range(10):
     action_dict = {}
     for gid in range(4):
         r, c = random.randint(1, 31), random.randint(1, 39)

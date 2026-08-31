@@ -48,6 +48,7 @@ class Task:
     assigned_to:   int = -1
     created_frame: int = 0
     owner:         int = -1
+    target_speed:  float = 1.0
 
 def _dist_score(d: float, scale: float) -> float:   #normalize the distances received from dijkstra
     return math.exp(-d/scale) if d != math.inf and d >= 0 else 0.0
@@ -59,7 +60,8 @@ def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
     if target is None:
         return []
     pr, pc = target
-    info = dists.get(target)
+    dist_key = (round(float(pr), 2), round(float(pc), 2))
+    info = dists.get(dist_key) or dists.get(target)
     if info is None:
         return []
     dist, _ = info
@@ -67,14 +69,15 @@ def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
         return []    
     tasks = []
     score = _dist_score(dist, HUNT_SCALE)
-    tasks.append(Task(task_type=TaskType.HUNT, target_pos=target, score=score, created_frame=frame, owner=ghost.gid))
+    tasks.append(Task(task_type=TaskType.HUNT, target_pos=(pr, pc), score=score, created_frame=frame, owner=ghost.gid, target_speed=1.0))
     for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
         cr, cc = float(pr + dr*4), float(pc + dc*4)
         if ghost.world and ghost.world.is_passable(cc, cr, radius=0.4):
-            cutoff_info = dists.get((cr, cc))
+            cutoff_key = (round(cr, 2), round(cc, 2))
+            cutoff_info = dists.get(cutoff_key) or dists.get((cr, cc))
             if cutoff_info and cutoff_info[0] != math.inf:
                 cutoff_score = _dist_score(cutoff_info[0], HUNT_SCALE) * 0.85
-                tasks.append(Task(task_type=TaskType.DYNAMIC, target_pos=(cr, cc), score=cutoff_score, created_frame=frame, owner=ghost.gid))
+                tasks.append(Task(task_type=TaskType.HUNT, target_pos=(cr, cc), score=1.2 * cutoff_score, created_frame=frame, owner=ghost.gid, target_speed=1.0))
     return tasks
 
 def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
@@ -82,14 +85,15 @@ def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
     if not hasattr(ghost, 'known_power_pellets'): return tasks
     for pos in ghost.known_power_pellets:
         yx_pos = (pos[1], pos[0])
-        info = dists.get(yx_pos)
+        dist_key = (round(yx_pos[0], 2), round(yx_pos[1], 2))
+        info = dists.get(dist_key) or dists.get(yx_pos)
         if info is None:
             continue
         dist, _ = info
         if dist == math.inf:
             continue
         score = _dist_score(dist, CONVERT_SCALE) + 2.0
-        tasks.append(Task(task_type=TaskType.CONVERT, target_pos=yx_pos, score=score, created_frame=frame))
+        tasks.append(Task(task_type=TaskType.CONVERT, target_pos=yx_pos, score=score, created_frame=frame, target_speed=1.0))
     return tasks
 
 def _find_flee_pos(ghost, pacman_pos: tuple) -> Optional[tuple]:
@@ -119,10 +123,10 @@ def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
         flee_pos = _find_flee_pos(ghost, target)
         if flee_pos is None:
             return None
-        return Task(task_type=TaskType.EVADE_TRACK, target_pos=flee_pos, score=2.0, created_frame=frame, owner=ghost.gid)
+        return Task(task_type=TaskType.EVADE_TRACK, target_pos=flee_pos, score=2.0, created_frame=frame, owner=ghost.gid, target_speed=1.0)
     else:
         score = 0.5 
-        return Task(task_type=TaskType.EVADE_TRACK, target_pos=target, score=score, created_frame=frame, owner=ghost.gid)
+        return Task(task_type=TaskType.EVADE_TRACK, target_pos=target, score=score, created_frame=frame, owner=ghost.gid, target_speed=0.5)
 
 def _score_explore(ghost, frame: int) -> List[Task]:
     ls = ghost.prm_last_seen
@@ -141,7 +145,7 @@ def _score_explore(ghost, frame: int) -> List[Task]:
             for key in ghost.cbba_agent.bundle:
                 if key[1] == pos:
                     score += 0.5
-        tasks.append(Task(task_type=TaskType.EXPLORE, target_pos=pos, score=score, created_frame=frame))
+        tasks.append(Task(task_type=TaskType.EXPLORE, target_pos=pos, score=score, created_frame=frame, target_speed=0.8))
     return tasks
 
 def generate_tasks(ghost, frame: int) -> tuple[List[Task], dict]:

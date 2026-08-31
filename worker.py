@@ -30,11 +30,12 @@ _DEFAULT_GHOSTS = 7
 _DEFAULT_POWER = 28
 
 class Env:
-    def __init__(self, env_id: int = 0, num_ghosts: int = _DEFAULT_GHOSTS, grid_rows: int = _DEFAULT_ROWS, grid_cols: int = _DEFAULT_COLS, n_power: int = _DEFAULT_POWER):
+    def __init__(self, env_id: int = 0, num_ghosts: int = _DEFAULT_GHOSTS, world_height: float = float(_DEFAULT_ROWS), world_width: float = float(_DEFAULT_COLS), obs_resolution: float = 1.0, n_power: int = _DEFAULT_POWER):
         self.env_id     = env_id
         self.num_ghosts = num_ghosts
-        self.grid_rows  = grid_rows
-        self.grid_cols  = grid_cols
+        self.world_height = world_height
+        self.world_width  = world_width
+        self.obs_resolution = obs_resolution
         self.n_power    = n_power
         self.grid       = None
         self.player     = None
@@ -43,23 +44,26 @@ class Env:
         self.shaper     = RewardShaper()
         self.recent_nom: dict[int, np.ndarray] = {}
         self._cached_ht: dict[int, np.ndarray] = {}   #heuristic targets cached at auction boundary
+        self._cached_hspeed: dict[int, float] = {}
         self.static_pacman = False
 
     def reset(self):
         self.grid, self._player_start, self.world = generate_map(
-            rows=self.grid_rows, cols=self.grid_cols, n_power=self.n_power, random_spawn=self.static_pacman)
+            world_height=self.world_height, world_width=self.world_width, n_power=self.n_power, random_spawn=self.static_pacman, obs_resolution=self.obs_resolution)
         self.player = Player(self.grid, self._player_start, self.world)
         if self.static_pacman:
             self.player.stationary = True
-        open_cells = np.argwhere(self.grid != WALL)
+        open_cells = np.array(self.world.prm_nodes) if hasattr(self.world, 'prm_nodes') and self.world.prm_nodes else np.array([[float(self._player_start[0]), float(self._player_start[1])]])
+        if len(open_cells) < self.num_ghosts:
+            open_cells = np.array([self.world.random_open_point() for _ in range(self.num_ghosts * 2)])
         pac = np.array(self._player_start)
-        d_pac = np.sum(np.abs(open_cells - pac), axis=1)
+        d_pac = np.sum(np.square(open_cells - pac), axis=1)
         avail = np.ones(len(open_cells), dtype=bool)
         d_ghosts = np.full(len(open_cells), np.inf)
         starts = [tuple(open_cells[np.argmax(d_pac)])]
         avail[np.argmax(d_pac)] = False
         for _ in range(self.num_ghosts - 1):
-            d_last = np.sum(np.abs(open_cells - np.array(starts[-1])), axis=1)
+            d_last = np.sum(np.square(open_cells - np.array(starts[-1])), axis=1)
             d_ghosts = np.minimum(d_ghosts, d_last)
             scores = np.minimum(d_pac, d_ghosts)
             scores[~avail] = -1
@@ -69,27 +73,29 @@ class Env:
         self.ghosts = { i: Ghost(i, self.grid, pos, GHOST_COLORS[i % len(GHOST_COLORS)], self._player_start, self.world) for i, pos in enumerate(starts) }
         self.frame = 0
         self.shaper.reset()
-        self.recent_nom = { i: np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32) for i in range(self.num_ghosts) }
+        r = int(self.world_height * self.obs_resolution)
+        c = int(self.world_width * self.obs_resolution)
+        self.recent_nom = { i: np.zeros((r, c), dtype=np.float32) for i in range(self.num_ghosts) }
         self._cached_ht = {}
         #pre-populate heuristic targets for the initial observation
         for gid in self.ghosts:
             g = self.ghosts[gid]
             if not g.dead:
                 h_tasks, _ = heuristic_generate_tasks(g, self.frame)
-                target = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
+                target = np.zeros((r, c), dtype=np.float32)
                 for t in h_tasks[:3]:
-                    r, c = int(t.target_pos[0]), int(t.target_pos[1])
-                    if 0 <= r < self.grid_rows and 0 <= c < self.grid_cols:
-                        target[r, c] = t.score
-                        #gaussian blur for soft BC targets
-                        for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
-                            nr, nc = r + dr, c + dc
-                            if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols and self.grid[nr][nc] != 1:
-                                target[nr, nc] += t.score * 0.5
-                        for dr, dc in [(-1,-1), (-1,1), (1,-1), (1,1)]:
-                            nr, nc = r + dr, c + dc
-                            if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols and self.grid[nr][nc] != 1:
-                                target[nr, nc] += t.score * 0.25
+                    r_t, c_t = int(t.target_pos[0] * self.obs_resolution), int(t.target_pos[1] * self.obs_resolution)
+                    if 0 <= r_t < r and 0 <= c_t < c:
+                        target[r_t, c_t] = t.score
+                        for dr in (-1, 0, 1):
+                            for dc in (-1, 0, 1):
+                                if dr == 0 and dc == 0: continue
+                                nr, nc = r_t + dr, c_t + dc
+                                if 0 <= nr < r and 0 <= nc < c:
+                                    wy = (float(nr) + 0.5) / self.obs_resolution
+                                    wx = (float(nc) + 0.5) / self.obs_resolution
+                                    if self.world.is_passable(wx, wy, radius=0.35):
+                                        target[nr, nc] += t.score * 0.5
                 self._cached_ht[gid] = target
         for gid in self.ghosts:
             self.ghosts[gid].cbba_agent.reset_caches()
@@ -107,30 +113,35 @@ class Env:
         grid_shape       : (rows, cols) int tuple — for padding on GPU side
         """
         alive = [gid for gid, g in self.ghosts.items() if not g.dead]
-        sp, ve, vm, ht = [], [], [], []
-        R, C = self.grid_rows, self.grid_cols
-        global_sp = build_global_spatial(self, R, C)
+        sp, ve, vm, ht, hs = [], [], [], [], []
+        R = int(self.world_height * self.obs_resolution)
+        C = int(self.world_width * self.obs_resolution)
+        global_sp = build_global_spatial(self, R, C, self.obs_resolution)
         for gid in alive:
             g = self.ghosts[gid]
-            sp.append(build_spatial(g, self.recent_nom[gid], R, C))
+            sp.append(build_spatial(g, self.recent_nom[gid], R, C, self.obs_resolution))
             ve.append(build_vector(g))
-            vm.append(build_valid_mask(g, R, C))
+            vm.append(build_valid_mask(g, R, C, self.obs_resolution))
             cached = self._cached_ht.get(gid)
             if cached is not None:
                 ht.append(cached[:R, :C])
+                hs.append(np.array([self._cached_hspeed.get(gid, 1.0)], dtype=np.float32))
             else:
                 ht.append(np.zeros((R, C), dtype=np.float32))
+                hs.append(np.array([1.0], dtype=np.float32))
         if not alive:
             z = lambda s: np.zeros(s, dtype=np.float32)
             return ([], z((0, SPATIAL_CH, R, C)), z((0, VEC_DIM)),
                     np.zeros((0, R, C), dtype=bool),
-                    z((0, R, C)), z((GLOBAL_SPATIAL_CH, R, C)), (R, C))
-        return (alive, np.stack(sp), np.stack(ve), np.stack(vm), np.stack(ht), global_sp, (R, C))
+                    z((0, R, C)), z((0, 1)), z((GLOBAL_SPATIAL_CH, R, C)), (R, C))
+        return (alive, np.stack(sp), np.stack(ve), np.stack(vm), np.stack(ht), np.stack(hs), global_sp, (R, C))
 
     def step(self, action_dict: dict, bc_prob: float = 0.0):
         info_heuristic_merges = 0
         info_total_auctions = 0
         alive = [gid for gid, g in self.ghosts.items() if not g.dead]
+        R = int(self.world_height * self.obs_resolution)
+        C = int(self.world_width * self.obs_resolution)
         for gid in alive:
             g = self.ghosts[gid]
             HEURISTIC_EVERY = DECISION_INTERVAL * 2
@@ -138,31 +149,26 @@ class Env:
             h_tasks = []
             h_dists = {}
             if need_h_tasks:
-                h_tasks, h_dists = heuristic_generate_tasks(g, self.frame)
-                target = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
+                h_tasks = heuristic_generate_tasks(g, self.frame)[0]
+                target = np.zeros((R, C), dtype=np.float32)
                 if h_tasks:
+                    self._cached_hspeed[gid] = h_tasks[0].target_speed
                     for t in h_tasks[:3]:
-                        r, c = int(t.target_pos[0]), int(t.target_pos[1])
-                        if 0 <= r < self.grid_rows and 0 <= c < self.grid_cols:
-                            target[r, c] = t.score
-                            #gaussian blur for soft BC targets
-                            for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
-                                nr, nc = r + dr, c + dc
-                                if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols and self.grid[nr][nc] != 1:
-                                    target[nr, nc] += t.score * 0.5
-                            for dr, dc in [(-1,-1), (-1,1), (1,-1), (1,1)]:
-                                nr, nc = r + dr, c + dc
-                                if 0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols and self.grid[nr][nc] != 1:
-                                    target[nr, nc] += t.score * 0.25
+                        r_t, c_t = int(t.target_pos[0] * self.obs_resolution), int(t.target_pos[1] * self.obs_resolution)
+                        if 0 <= r_t < R and 0 <= c_t < C:
+                            target[r_t, c_t] = t.score
+                else:
+                    self._cached_hspeed[gid] = 1.0
                 self._cached_ht[gid] = target
             if gid in action_dict:      #merge RL tasks with CBBA
-                indices, scores_map = action_dict[gid]
+                indices, scores_map, speed = action_dict[gid]
+                g.current_speed_mult = speed
                 self.recent_nom[gid] *= NOM_DECAY
                 for r, c in indices:
-                    if 0 <= r < self.grid_rows and 0 <= c < self.grid_cols:
+                    if 0 <= r < R and 0 <= c < C:
                         self.recent_nom[gid][r, c] = 1.0
                 if self.frame % DECISION_INTERVAL == 0:
-                    tasks = actions_to_tasks(g, scores_map, indices, self.frame)
+                    tasks = actions_to_tasks(g, scores_map, indices, self.frame, self.obs_resolution)
                     g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
                     if random.random() < bc_prob and h_tasks:
                         all_tasks = h_tasks + tasks
@@ -188,7 +194,7 @@ class Env:
             for gid, ghost in list(self.ghosts.items()):
                 if ghost.dead:
                     continue
-                ghost.update((self.player.y, self.player.x), powered, self.ghosts)
+                ghost.update((self.player.y, self.player.x), powered, self.ghosts, speed_mult=getattr(ghost, 'current_speed_mult', 1.0))
             if not self.player.dead:
                 for gid, ghost in list(self.ghosts.items()):
                     if ghost.dead:
@@ -244,7 +250,7 @@ class Env:
                     done = True
             if done:
                 break
-            if int(np.sum(np.isin(self.grid, (PELLET, POWER)))) == 0:
+            if (len(self.world.pellets) + len(self.world.power_pellets)) == 0:
                 done = True
                 for o in rewards:
                     rewards[o] -= 20.0
@@ -259,13 +265,19 @@ class Env:
                         prox = 0.20 * math.exp(-dist / 3.0)
                         rewards[gid_prox] += prox
 
-            grid_area = self.grid_rows * self.grid_cols
+            grid_area = self.world.height * self.world.width
             base_area = 33 * 41
             step_cost = 0.05 * (grid_area / base_area)   #0.009 on 7x9, scales to 0.05 on 33x41
             for gid in rewards:
                 if self.ghosts[gid].dead:
                     continue
                 rewards[gid] -= step_cost    #per-frame step cost
+                speed_mult = getattr(self.ghosts[gid], 'current_speed_mult', 1.0)
+                active_task = self.ghosts[gid].cbba_agent.get_active_task()
+                is_hunting = (active_task is not None and int(active_task.task_type) == 0) or \
+                             (self.ghosts[gid].known_pacman is not None and not self.ghosts[gid].pacman_powered)
+                if not is_hunting:
+                    rewards[gid] -= 0.01 * speed_mult
         for gid, g in self.ghosts.items():
             if not g.dead and gid in rewards:
                 rewards[gid] += self.shaper.shaping(g, self.ghosts)

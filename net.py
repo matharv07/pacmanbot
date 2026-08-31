@@ -11,17 +11,20 @@ import torch.nn.functional as F
 from obs import SPATIAL_CH, MAX_H, MAX_W, VEC_DIM, CRITIC_VEC_DIM, GLOBAL_SPATIAL_CH
 
 class ResBlock(nn.Module):
-    def __init__(self, c_in, c_out):
+    def __init__(self, c_in, c_out, cond_dim=None):
         super().__init__()
         self.conv1 = nn.Conv2d(c_in, c_out, 3, padding=1)
         self.bn1   = nn.GroupNorm(8, c_out)
         self.conv2 = nn.Conv2d(c_out, c_out, 3, padding=1)
         self.bn2   = nn.GroupNorm(8, c_out)
         self.skip  = (nn.Sequential(nn.Conv2d(c_in, c_out, 1), nn.GroupNorm(8, c_out)) if c_in != c_out else nn.Identity())
+        self.film = FiLM(cond_dim, c_out) if cond_dim else None
 
-    def forward(self, x):
+    def forward(self, x, cond=None):
         r = self.skip(x)
         x = F.relu(self.bn1(self.conv1(x)))
+        if self.film is not None and cond is not None:
+            x = self.film(x, cond)
         x = self.bn2(self.conv2(x))
         return F.relu(x + r)
 
@@ -44,22 +47,21 @@ class GhostActor(nn.Module):
     def __init__(self, vec_dim: int = VEC_DIM):
         super().__init__()
         self.stem = nn.Sequential(nn.Conv2d(SPATIAL_CH, 64, 7, padding=3), nn.GroupNorm(8, 64), nn.ReLU())
-        self.res1 = ResBlock(64, 128)
-        self.res2 = ResBlock(128, 128)
-        self.res3 = ResBlock(128, 128)
         self.vec_mlp = nn.Sequential(nn.Linear(vec_dim, 256), nn.LayerNorm(256), nn.GELU(), nn.Linear(256, 256), nn.LayerNorm(256), nn.GELU(), nn.Linear(256, 128), nn.LayerNorm(128), nn.GELU())
-        #vector context modulates spatial features
-        self.film = FiLM(128, 128)
+        self.res1 = ResBlock(64, 128, cond_dim=128)
+        self.res2 = ResBlock(128, 128, cond_dim=128)
+        self.res3 = ResBlock(128, 128, cond_dim=128)
         #1×1 conv to logit map
         self.head = nn.Conv2d(128, 1, 1)
+        #continuous speed head (alpha, beta for Beta distribution)
+        self.speed_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 2))
 
     def encode(self, spatial, vector):
         x = self.stem(spatial)
-        x = self.res1(x)
-        x = self.res2(x)
-        x = self.res3(x)
         vec = self.vec_mlp(vector)
-        x = self.film(x, vec)
+        x = self.res1(x, cond=vec)
+        x = self.res2(x, cond=vec)
+        x = self.res3(x, cond=vec)
         pool = F.adaptive_avg_pool2d(x, 1).flatten(1)   #(B, 128)
         return x, pool, vec
 
@@ -79,6 +81,8 @@ class GhostActor(nn.Module):
         scores   : (B, H, W)   — independent sigmoid for CBBA
         pool     : (B, 128)    — spatial pool for critic token
         vec      : (B, 128)    — vector embedding for critic token
+        speed    : (B, 1)      — sampled continuous speed [0, 1]
+        speed_lp : (B, 1)      — log prob of sampled speed
         """
         feats, pool, vec = self.encode(spatial, vector)
         logits = self.logits_from_features(feats, mask)
@@ -99,9 +103,16 @@ class GhostActor(nn.Module):
             sel_idx.append(idx)
             sel_lp.append(dist.log_prob(idx))
             flat.scatter_(1, idx.unsqueeze(1), float('-inf'))
-        return (torch.stack(sel_idx, 1), torch.stack(sel_lp, 1), scores, pool, vec)
+        speed_params = F.softplus(self.speed_head(torch.cat([pool, vec], dim=1))) + 1.001
+        alpha, beta = speed_params[:, 0], speed_params[:, 1]
+        dist_speed = torch.distributions.Beta(alpha, beta)
+        speed = dist_speed.sample()
+        #clamp to avoid 0/1 exactly which might cause log_prob issues
+        speed = torch.clamp(speed, 1e-4, 1.0 - 1e-4)
+        speed_lp = dist_speed.log_prob(speed)
+        return (torch.stack(sel_idx, 1), torch.stack(sel_lp, 1), scores, pool, vec, speed.unsqueeze(1), speed_lp.unsqueeze(1))
 
-    def evaluate_actions(self, spatial, vector, mask, actions):
+    def evaluate_actions(self, spatial, vector, mask, actions, speeds):
         """
         Re-computes log-probs and entropy for *stored* action indices.
         Used inside the PPO update loop (single forward pass).
@@ -109,14 +120,16 @@ class GhostActor(nn.Module):
         Parameters
         ----------
         actions : (B, K) long — previously sampled flattened indices
+        speeds  : (B, 1) float — previously sampled speeds
 
         Returns
         -------
-        logprobs    : (B,)          — sum of log-probs for the K actions
-        entropy     : (B,)          — mean entropy across K steps
+        logprobs    : (B,)          — sum of log-probs for the K actions + speed
+        entropy     : (B,)          — mean entropy across K steps + speed entropy
         pool        : (B, 128)      — spatial pool token
         vec         : (B, 128)      — vector embedding token
         flat_logits : (B, H*W)      — reusable for BC loss (NOT detached)
+        speed_params: (B, 2)        — (alpha, beta) for BC loss
         """
         feats, pool, vec = self.encode(spatial, vector)
         logits = self.logits_from_features(feats, mask)
@@ -142,9 +155,15 @@ class GhostActor(nn.Module):
             mask_k = torch.zeros_like(flat, dtype=torch.bool)
             mask_k.scatter_(1, actions[:, k].unsqueeze(1), True)
             flat = torch.where(mask_k, float('-inf'), flat)
-        logprobs = torch.stack(lp_list, 1).sum(1)    #(B,)
-        entropy  = torch.stack(ent_list, 1).sum(1)   #(B,)
-        return logprobs, entropy, pool, vec, flat_clean
+        speed_params = F.softplus(self.speed_head(torch.cat([pool, vec], dim=1))) + 1.001
+        alpha, beta = speed_params[:, 0], speed_params[:, 1]
+        dist_speed = torch.distributions.Beta(alpha, beta)
+        speeds = torch.clamp(speeds.squeeze(-1), 1e-4, 1.0 - 1e-4)
+        speed_lp = dist_speed.log_prob(speeds)
+        speed_ent = dist_speed.entropy()
+        logprobs = torch.stack(lp_list, 1).sum(1) + speed_lp
+        entropy  = torch.stack(ent_list, 1).mean(1) + speed_ent
+        return logprobs, entropy, pool, vec, flat_clean, speed_params
 
 class GhostCritic(nn.Module):
     #Independent CNN-based Critic: evaluates each ghost state

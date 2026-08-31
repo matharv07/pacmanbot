@@ -285,14 +285,16 @@ class World:
         return blocked.reshape((rows, cols))
 
     def resolve_collision(self, px, py, radius, max_iters=10):
-        px_arr = np.empty((1,), dtype=np.float32)
-        py_arr = np.empty((1,), dtype=np.float32)
+        # reuse class-level scratch to avoid per-call numpy allocation
+        if not hasattr(self, '_rc_px'):
+            self._rc_px = np.empty((1,), dtype=np.float32)
+            self._rc_py = np.empty((1,), dtype=np.float32)
         for _ in range(max_iters):
             if len(self.compiled_segments) == 0:
                 break
-            px_arr[0] = px
-            py_arr[0] = py
-            dist_sq, r_seg = self._points_to_segments_dist_sq(px_arr, py_arr)
+            self._rc_px[0] = px
+            self._rc_py[0] = py
+            dist_sq, r_seg = self._points_to_segments_dist_sq(self._rc_px, self._rc_py)
             dist_sq = dist_sq[0]
             r_seg = r_seg[0]
             min_dist_idx = np.argmin(dist_sq)
@@ -387,7 +389,8 @@ class World:
                 return ~grid_cv.astype(bool)
 
             # Carve openings to connect all regions
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+            k_size = min(31, max(3, int(min(eval_cols, eval_rows) // 4) * 2 + 1))
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
             for _ in range(200):
                 grid = get_conn_grid(0.35)
                 num_labels, labeled_array = cv2.connectedComponents(grid.astype(np.uint8), connectivity=8)
@@ -559,7 +562,11 @@ class World:
         matrix = sp.csr_matrix((data, (row, col)), shape=(n, n))
         print("Computing APSP for PRM graph...")
         self.apsp, self.apsp_pred = csgraph.shortest_path(matrix, directed=False, return_predecessors=True)
-        return random.choice(self.safe_area)
+
+    def random_open_point(self):
+        if hasattr(self, 'safe_area') and self.safe_area:
+            return random.choice(self.safe_area)
+        return (self.width / 2.0, self.height / 2.0)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="World Generation Debug Visualizer")

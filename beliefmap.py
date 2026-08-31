@@ -49,8 +49,8 @@ class BeliefMap:
     def __init__(self, gid: int, world, pacman_start: Optional[tuple] = None):
         self.gid = gid
         self.world = world
-        self.rows = world.height
-        self.cols = world.width
+        self.rows = int(world.height)   # cast to int — world dimensions are floats
+        self.cols = int(world.width)
         self._initialised = False
         self.last_known_pos: Optional[tuple] = None
         self.last_known_dir: tuple = (0, 0)
@@ -304,39 +304,6 @@ class BeliefMap:
                                     self._neighbours[v].remove(u)
                                 _disable_edge(u, v)
         self._normalise()
-
-    def sync_walls(self, personal_map: np.ndarray):
-        if self.n_nodes == 0 or self._open_arr.size == 0:
-            return
-        r_idx = np.clip(np.floor(self._open_arr[:, 0]).astype(int), 0, personal_map.shape[0]-1)
-        c_idx = np.clip(np.floor(self._open_arr[:, 1]).astype(int), 0, personal_map.shape[1]-1)
-        wall_mask = personal_map[r_idx, c_idx] == 1
-        wall_indices = np.where(wall_mask)[0]
-        new_walls = []
-        for i in wall_indices:
-            node = self._open_cells[i]
-            if node not in self._disabled_wall_nodes:
-                new_walls.append(node)
-        if new_walls:
-            self.observe_clear(set(), new_walls)
-        if hasattr(self, '_nbr_idx') and self._nbr_idx.shape[0] > 0:
-            for i in range(self.n_nodes):
-                u = self._open_cells[i]
-                if u in self._disabled_wall_nodes:
-                    continue
-                r1, c1 = int(math.floor(u[0])), int(math.floor(u[1]))
-                for k in range(self._nbr_idx.shape[1]):
-                    j = self._nbr_idx[i, k]
-                    if j >= 0:
-                        v = self._open_cells[j]
-                        r2, c2 = int(math.floor(v[0])), int(math.floor(v[1]))
-                        if r1 != r2 and c1 != c2: # Diagonal edge
-                            if personal_map[r1, c2] == 1 or personal_map[r2, c1] == 1:
-                                self._nbr_idx[i, k] = -1
-                                rev_k = np.where(self._nbr_idx[j] == i)[0]
-                                if len(rev_k) > 0:
-                                    self._nbr_idx[j, rev_k[0]] = -1
-                                self._W_dirty = True
 
     def diffuse(self, ghost_pos: tuple, known_pellets: set = None, known_power: set = None):
         if self._topology_dirty:
