@@ -337,7 +337,7 @@ class World:
         attempt = 0
         while True:
             attempt += 1
-            print(f"Generating map... (Attempt {attempt})")
+            # print(f"Generating map... (Attempt {attempt})")
             self.obstacles = []
             self.pellets = []
             self.power_pellets = []
@@ -451,11 +451,11 @@ class World:
                     self.safe_area = list(zip(px_valid, py_valid))
                     break
                 else:
-                    print(f"Failed area check: {component_sizes[largest_component]} < {target_area_eval}")
+                    pass # print(f"Failed area check: {component_sizes[largest_component]} < {target_area_eval}")
             else:
-                print(f"Failed num_features: {num_features}")
+                pass # print(f"Failed num_features: {num_features}")
             if attempt >= 50:
-                print("Max attempts reached! Returning fallback safe area.")
+                # print("Max attempts reached! Returning fallback safe area.")
                 self.safe_area = [(self.width/2, self.height/2)]
                 break
         #filter safe area for pellets (poisson diskish approximation)
@@ -496,7 +496,7 @@ class World:
         self.generate_roadmap()
     
     def generate_roadmap(self, n_samples=600):
-        print("Building continuous PRM (Probabilistic Roadmap)...")
+        # print("Building continuous PRM (Probabilistic Roadmap)...")
         x_cands = np.random.uniform(0.5, self.width - 0.5, size=n_samples * 5)
         y_cands = np.random.uniform(0.5, self.height - 0.5, size=n_samples * 5)
         passable = self.batch_is_passable(x_cands, y_cands, radius=0.4)
@@ -560,7 +560,7 @@ class World:
                     col.append(j)
                     data.append(cost)
         matrix = sp.csr_matrix((data, (row, col)), shape=(n, n))
-        print("Computing APSP for PRM graph...")
+        # print("Computing APSP for PRM graph...")
         self.apsp, self.apsp_pred = csgraph.shortest_path(matrix, directed=False, return_predecessors=True)
 
     def random_open_point(self):
