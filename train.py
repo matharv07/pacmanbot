@@ -46,7 +46,7 @@ VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 3e-4
 BC_INIT         = 0.5
-BC_FLOOR        = 0.05
+BC_FLOOR        = 0.0
 K_NOMINATIONS   = 3
 LOG_DIR         = os.path.join(os.path.dirname(__file__), "logs")
 CKPT_DIR        = os.path.join(os.path.dirname(__file__), "checkpoints")
@@ -282,9 +282,15 @@ class VecEnv:
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
         return self.current_obs
 
-    def set_curriculum(self, rows, cols, n_ghosts, n_power, static_pacman=False):
+    def set_curriculum(self, current_stage_idx, static_pacman=False):
+        import random
+        from curriculum import STAGES
         for p in self.parent:
-            p.send(("set_curriculum", (rows, cols, n_ghosts, n_power, static_pacman)))
+            if current_stage_idx == 0 or random.random() < 0.8:
+                s = STAGES[current_stage_idx]
+            else:
+                s = STAGES[random.randint(0, current_stage_idx - 1)]
+            p.send(("set_curriculum", (s.rows, s.cols, s.n_ghosts, s.n_power, static_pacman)))
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
         return self.current_obs
 
@@ -411,7 +417,7 @@ def train():
             actor_rollout.load_state_dict(actor.state_dict())
             critic_rollout.load_state_dict(critic.state_dict())
             stage = curriculum.stage
-            vec_env.set_curriculum(stage.rows, stage.cols,stage.n_ghosts, stage.n_power, static_pacman=(start_update <= 50 and CURRICULUM_START_STAGE == 0))
+            vec_env.set_curriculum(curriculum.stage_idx, static_pacman=(start_update <= 50 and CURRICULUM_START_STAGE == 0))
             print(f"Resumed at update {start_update}, stage {curriculum.stage_idx} ({stage.rows}×{stage.cols}, {stage.n_ghosts}g)")
         else:
             print("No checkpoints found, starting from scratch.")
@@ -590,7 +596,7 @@ def train():
         bc_prob = anneal_frac if anneal_frac >= 0.05 else 0.0
         if update == 51 and CURRICULUM_START_STAGE == 0:
             print("Transitioning to moving Pacman (static_pacman = False)...")
-            vec_env.set_curriculum(stage.rows, stage.cols, stage.n_ghosts, stage.n_power, static_pacman=False)
+            vec_env.set_curriculum(curriculum.stage_idx, static_pacman=False)
         t_start_rollout = time.time()
         #per-env, per-step storage (lists of length ROLLOUT_STEPS)
         buf_spatial   = [[] for _ in range(NUM_ENVS)]
@@ -925,7 +931,7 @@ def train():
                       f"({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts)")
                 print(f"{'='*60}\n")
                 is_static_pacman = (p_up <= 50)
-                vec_env.set_curriculum(stage.rows, stage.cols,stage.n_ghosts, stage.n_power, static_pacman=is_static_pacman)
+                vec_env.set_curriculum(curriculum.stage_idx, static_pacman=is_static_pacman)
                 torch.cuda.empty_cache()
                 current_returns = [0.0] * NUM_ENVS
                 for pg in opt_actor.param_groups:

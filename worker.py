@@ -46,6 +46,7 @@ class Env:
         self._cached_ht: dict[int, np.ndarray] = {}   #heuristic targets cached at auction boundary
         self._cached_hspeed: dict[int, float] = {}
         self.static_pacman = False
+        self.max_frames = int(world_height * world_width * 2) + 1000
 
     def reset(self):
         self.grid, self._player_start, self.world = generate_map(
@@ -254,6 +255,11 @@ class Env:
                 done = True
                 for o in rewards:
                     rewards[o] -= 20.0
+                break
+            if self.frame >= self.max_frames:
+                done = True
+                for o in rewards:
+                    rewards[o] -= 10.0
                 break
             if not done and not self.player.dead:
                 for gid_prox, ghost_prox in self.ghosts.items():
