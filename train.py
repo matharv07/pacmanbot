@@ -29,11 +29,11 @@ import requests
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 torch.set_num_threads(1)
 
-NUM_ENVS        = 10
+NUM_ENVS        = 14
 ROLLOUT_STEPS   = 256
-MINI_BATCH      = 2048
-MICRO_BATCH     = 512      #gradient accumulation chunk size (MINI_BATCH / 4)
-ROLLOUT_INFER_CHUNK = 64   #max ghosts per rollout inference forward pass
+MINI_BATCH      = 4096
+MICRO_BATCH     = 2048     #gradient accumulation chunk size (MINI_BATCH / 2)
+ROLLOUT_INFER_CHUNK = 512  #max ghosts per rollout inference forward pass
 #adaptive OOM-safe chunk sizes — halved automatically on cuda OOM, never grow back
 _eff_infer_chunk = ROLLOUT_INFER_CHUNK
 _eff_micro_batch = MICRO_BATCH

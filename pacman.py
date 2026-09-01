@@ -619,13 +619,15 @@ class Game:
                     t_ve = torch.tensor(np.stack(ve), device=RL_DEVICE, dtype=torch.float32)
                     t_vm = torch.tensor(np.stack(vm), device=RL_DEVICE, dtype=torch.bool)
                     with torch.inference_mode():
-                        idx, _, scores, _, _ = RL_ACTOR(t_sp, t_ve, t_vm, K=3)
+                        idx, _, scores, _, _, speed, _ = RL_ACTOR(t_sp, t_ve, t_vm, K=3)
                     idx_np = idx.cpu().numpy()
                     sc_np  = scores.cpu().numpy()
+                    spd_np = speed.cpu().numpy()
                     for i, gid in enumerate(alive):
                         g = self.ghosts[gid]
                         indices = [(int(x // C), int(x % C)) for x in idx_np[i]]
                         scores_map = sc_np[i]
+                        g.current_speed_mult = float(spd_np[i][0])
                         self.recent_nom[gid] *= 0.8
                         for r, c in indices:
                             if 0 <= r < R and 0 <= c < C:

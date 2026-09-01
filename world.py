@@ -118,12 +118,7 @@ class World:
             return True
         px = np.array([x], dtype=np.float32)
         py = np.array([y], dtype=np.float32)
-        dist_sq, r_seg = self._points_to_segments_dist_sq(px, py)
-        dist_sq = dist_sq[0]
-        r_seg = r_seg[0]
-        if np.any(dist_sq <= (r_seg + radius)**2):
-            return False
-        return True
+        return bool(self.batch_is_passable(px, py, radius)[0])
 
     def _compile_passable_grids(self):
         import cv2
@@ -149,6 +144,7 @@ class World:
             
         self._grid_0_0 = ~rasterize_collided(0.0)
         self._grid_0_3 = ~rasterize_collided(0.3)
+        self._grid_0_35 = ~rasterize_collided(0.35)
         self._grid_0_4 = ~rasterize_collided(0.4)
 
     def batch_is_passable(self, px, py, radius=0):
@@ -161,6 +157,8 @@ class World:
             valid = (cx >= 0) & (cx < cols) & (cy >= 0) & (cy < rows)
             if abs(radius - 0.4) < 1e-4:
                 grid = self._grid_0_4
+            elif abs(radius - 0.35) < 1e-4:
+                grid = self._grid_0_35
             elif abs(radius - 0.3) < 1e-4:
                 grid = self._grid_0_3
             elif radius < 1e-4:
@@ -495,7 +493,12 @@ class World:
                 self.power_pellets.append(self.pellets.pop(idx))
         self.generate_roadmap()
     
-    def generate_roadmap(self, n_samples=600):
+    def generate_roadmap(self, n_samples=None):
+        self._compile_passable_grids()
+        if n_samples is None:
+            area_ratio = (self.width * self.height) / (33 * 41)
+            n_samples = max(20, int(600 * area_ratio))
+
         # print("Building continuous PRM (Probabilistic Roadmap)...")
         x_cands = np.random.uniform(0.5, self.width - 0.5, size=n_samples * 5)
         y_cands = np.random.uniform(0.5, self.height - 0.5, size=n_samples * 5)
@@ -539,7 +542,6 @@ class World:
                         self.prm_graph[n2].append((dist_val, n1))
         self.prm_nodes_arr = np.array(self.prm_nodes, dtype=np.float32) if self.prm_nodes else np.empty((0, 2), dtype=np.float32)
         self._update_pellet_arrays()
-        self._compile_passable_grids()
         self._compute_apsp()
         
     def _compute_apsp(self):
