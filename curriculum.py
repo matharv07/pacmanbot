@@ -65,10 +65,22 @@ class CurriculumScheduler:
             return False
         if self._updates_in_stage < self.stage.min_updates:
             return False
-        if len(self._return_history) < ADVANCE_WINDOW // 2:
+        if len(self._return_history) < ADVANCE_WINDOW:
             return False
         avg = sum(self._return_history) / len(self._return_history)
-        return avg >= self.stage.advance_return
+        if avg >= self.stage.advance_return:
+            return True
+        #Plateau detection: if training has stalled in this stage
+        if self._updates_in_stage >= self.stage.min_updates + ADVANCE_WINDOW:
+            half = ADVANCE_WINDOW // 2
+            hist = list(self._return_history)
+            avg_first = sum(hist[:half]) / half
+            avg_second = sum(hist[half:]) / half   
+            #If improvement over the window is negligible and the policy isn't completely failing
+            if (avg_second - avg_first) < 1.0 and avg_second > 0:
+                print(f"Curriculum advancing due to plateau: improvement {avg_second - avg_first:.2f} < 1.0 (Current avg: {avg_second:.2f})")
+                return True
+        return False
 
     def advance(self):
         if self.is_final:

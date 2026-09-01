@@ -182,23 +182,16 @@ class BatchTransfer:
         return res
 
 def _pad_spatial(arr, target_h=MAX_H, target_w=MAX_W):
-    #Pad (*, H, W) numpy array to (*, target_h, target_w)
+    #Pad (*, H, W) numpy array to (*, target_h, target_w) using fast pre-allocation
     h, w = arr.shape[-2], arr.shape[-1]
     if h == target_h and w == target_w:
         return arr
-    pad_h = target_h - h
-    pad_w = target_w - w
-    if arr.ndim == 3:
-        return np.pad(arr, ((0, 0), (0, pad_h), (0, pad_w)), constant_values=0)
-    elif arr.ndim == 2:
-        return np.pad(arr, ((0, pad_h), (0, pad_w)), constant_values=0)
-    elif arr.ndim == 4:
-        out = np.pad(arr, ((0, 0), (0, 0), (0, pad_h), (0, pad_w)), constant_values=0)
-        if out.shape[1] in (SPATIAL_CH, 11):
-            out[:, 0, h:, :] = 1.0
-            out[:, 0, :, w:] = 1.0
-        return out
-    return arr
+    out = np.zeros(arr.shape[:-2] + (target_h, target_w), dtype=arr.dtype)
+    out[..., :h, :w] = arr
+    if arr.ndim == 4 and out.shape[1] in (SPATIAL_CH, 11):
+        out[:, 0, h:, :] = 1.0
+        out[:, 0, :, w:] = 1.0
+    return out
 
 def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
     try:
