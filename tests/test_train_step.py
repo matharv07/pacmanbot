@@ -1,14 +1,10 @@
 import os
 import sys
 
-# Set test environment variables
 os.environ["NUM_ENVS"] = "2"
 os.environ["ROLLOUT_STEPS"] = "16"
 os.environ["MAX_UPDATES"] = "302"
-
-# Avoid modifying real checkpoints/logs during this test
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import train
 
 if __name__ == "__main__":

@@ -391,15 +391,7 @@ class BeliefMap:
             idxs = np.nonzero(above)[0]
             vals = np.round(self._b_flat[idxs], 5)
             cells = { self._open_cells[int(i)]: float(v) for i, v in zip(idxs, vals) }
-        self._payload_cache = {
-            "cells": cells, 
-            "fss": self.frames_since_sighting, 
-            "lkp": self.last_known_pos, 
-            "lkd": self.last_known_dir, 
-            "p_dir": self.predicted_dir,
-            "hx": self.lstm_hx.tolist(),
-            "cx": self.lstm_cx.tolist()
-        }
+        self._payload_cache = {"cells": cells, "fss": self.frames_since_sighting, "lkp": self.last_known_pos, "lkd": self.last_known_dir, "p_dir": self.predicted_dir, "hx": self.lstm_hx.tolist(), "cx": self.lstm_cx.tolist()}
         self._payload_dirty = False
         return self._payload_cache
 
@@ -509,8 +501,7 @@ class BeliefMap:
         return 0.0
 
     def safest_cells(self, n: int = 5) -> list[tuple]:
-        if self.n_nodes == 0:
-            return []
+        if self.n_nodes == 0: return []
         k = min(n, self.n_nodes)
         top_idx = np.argpartition(self._safety[:self.n_nodes], -k)[-k:]
         top_idx = top_idx[np.argsort(self._safety[top_idx])[::-1]]
@@ -660,7 +651,6 @@ class BeliefMap:
         self._last_known_power = new_power
         self._last_pellet_graph_version = current_graph_version
         self._last_explored_len = current_explored_len
-        
         self._pellet_score = np.zeros(self.n_nodes, dtype=np.float32)
         self._pellet_dists = np.full(self.n_nodes, 9999.0, dtype=np.float32)
         if self.n_nodes == 0: return

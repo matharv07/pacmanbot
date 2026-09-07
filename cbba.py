@@ -17,15 +17,15 @@ class CBBA_Agent:
         self.gid = gid
         self.lt = lt
         self.lamda = lamda
-        self.bundle: list = []          #tasks in agent's bundle
-        self.path: list = []            #agent's ordered tasks for execution
-        self.y: dict = {}               #winning bids
-        self.z: dict = {}               #task winners
-        self.s: dict = {}               #last sync frames
+        self.bundle: list = []             #tasks in agent's bundle
+        self.path: list = []               #agent's ordered tasks for execution
+        self.y: dict = {}                  #winning bids
+        self.z: dict = {}                  #task winners
+        self.s: dict = {}                  #last sync frames
         self._task_map: dict = {}
-        self._last_auction: int = -gid  # Stagger initial auction frames
-        self._dist_cache: dict = {}     #(pos) -> distance, cached per-auction
-        self._astar_cache: dict = {}    #persists across auctions
+        self._last_auction: int = -gid     #stagger initial auction frames
+        self._dist_cache: dict = {}        #(pos) -> distance, cached per-auction
+        self._astar_cache: dict = {}       #persists across auctions
         self._unreachable_cache: dict = {} #(pos) -> timeout_frame
 
     def reset_caches(self):
@@ -33,7 +33,7 @@ class CBBA_Agent:
         self._astar_cache.clear()
 
     def mark_unreachable(self, target_pos: tuple, frame: int):
-        self._unreachable_cache[target_pos] = frame + 150  # 5 seconds penalty
+        self._unreachable_cache[target_pos] = frame + 150  #5 seconds penalty
 
     def step(self, ghost, frame: int) -> Optional[Task]:
         changed = False

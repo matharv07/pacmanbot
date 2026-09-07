@@ -54,7 +54,7 @@ CLIP_EPS        = 0.2
 ENT_COEF        = 0.002
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
-LR              = 3e-4
+LR              = 2e-4
 BC_INIT         = 0.5
 BC_FLOOR        = 0.0
 K_NOMINATIONS   = 3
@@ -549,7 +549,6 @@ def train():
                                     fl_bc     = flat_logits[valid_bc].clamp(min=-1e4)
                                     log_pi    = F.log_softmax(fl_bc, dim=-1)
                                     bc        = -(ht_prob * log_pi).sum(dim=-1).mean()
-                                    
                                     #speed BC loss using Beta distribution log-prob
                                     #mb_hs is the target heuristic speed
                                     #speed_params is (alpha, beta) of the predicted Beta
@@ -747,7 +746,6 @@ def train():
                 spd_t = torch.cat(spd_chunks, dim=0).float().cpu().numpy()
                 spd_lp_t = torch.cat(spd_lp_chunks, dim=0).float().cpu().numpy()
                 val_all_np = val_all.float().cpu().numpy()
-
                 offset = 0
                 for e in range(NUM_ENVS):
                     n_g = env_n_ghosts[e]
@@ -774,7 +772,6 @@ def train():
                     v_dict = {gids[i]: float(e_val[i]) for i in range(n_g)}
                     buf_values[e].append(v_dict)
                     offset += n_g
-
             obs_list, rew_list, done_list, info_list = vec_env.step(step_actions, bc_prob)
             for e in range(NUM_ENVS):
                 r = rew_list[e]
@@ -902,7 +899,6 @@ def train():
         _gsp_n = ds_gsp_unique.shape[0]
         if _gsp_max_id >= _gsp_n:
             print(f"  ⚠️  GSP ID OOB: max_id={_gsp_max_id} >= unique_n={_gsp_n}")
-
         indices = np.arange(N_total)
         #normalize advantages GLOBALLY across the entire batch, not per-minibatch
         ds_adv = (ds_adv - ds_adv.mean()) / (ds_adv.std() + 1e-8)

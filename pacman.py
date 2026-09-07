@@ -184,7 +184,7 @@ class Player:
     def _get_ghost_maps(self, ghosts):
         return []
 
-    def _pick_target(self, ghosts):     #PRM continuous scoring to pick the best pellet (or ghost when powered) target
+    def _pick_target(self, ghosts):        #PRM continuous scoring to pick the best pellet (or ghost when powered) target
         import pathfinder
         start = (self.y, self.x)
         if self.powered:
@@ -697,7 +697,7 @@ class Game:
         surf = self.screen
         for obs in self.world.obstacles:
             obs.draw(surf, CELL)
-        # Draw live pellet state from world (not stale self.grid)
+        #draw live pellet state from world (not stale self.grid)
         for px, py in self.world.pellets:
             x = int(px * CELL)
             y = int(py * CELL)

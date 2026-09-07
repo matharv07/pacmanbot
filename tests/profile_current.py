@@ -5,7 +5,6 @@ import time
 import sys
 import os
 
-# Append the parent directory to sys.path so we can import pacman
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pacman import Game
 
@@ -18,7 +17,7 @@ def run_prof():
         g.update()
         frames += 1
     print(f'Processed {frames} frames in {time.time() - start_time:.2f} seconds', file=sys.stderr)
-
+    
 cProfile.run('run_prof()', '/home/atharv/xTerra/pacmanbot/tests/profile_stats.prof')
 p = pstats.Stats('/home/atharv/xTerra/pacmanbot/tests/profile_stats.prof')
 with open('/home/atharv/xTerra/pacmanbot/tests/profile_current.txt', 'w') as f:

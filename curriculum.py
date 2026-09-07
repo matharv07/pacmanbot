@@ -34,14 +34,13 @@ class Stage:
         return int(self.world_width * self.obs_resolution)
 
 STAGES = [
-    Stage(world_height=7,  world_width=9,  obs_resolution=1.0, n_ghosts=3, n_power=2,  advance_return=18.0, min_updates=100),
-    Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=4, n_power=6,  advance_return=16.0, min_updates=200),
-    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=14, advance_return=14.0, min_updates=250),
-    Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=24, advance_return=12.0, min_updates=300),
-    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0)
-]
+    Stage(world_height=7,  world_width=9,  obs_resolution=1.0, n_ghosts=3, n_power=2,  advance_return=-7.0,  min_updates=100),
+    Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=4, n_power=6,  advance_return=-8.0,  min_updates=200),
+    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=14, advance_return=-10.0, min_updates=250),
+    Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=24, advance_return=-12.0, min_updates=300),
+    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0)]
 
-ADVANCE_WINDOW = 50    # rolling window of updates achieving return/kill threshold required to clear a stage
+ADVANCE_WINDOW = 50    #rolling window of updates achieving return/kill threshold required to clear a stage
 
 class CurriculumScheduler:
     def __init__(self, start_stage: int = 0):
@@ -76,24 +75,24 @@ class CurriculumScheduler:
         avg_ret = sum(self._return_history) / len(self._return_history)
         avg_kill = (sum(self._kill_history) / len(self._kill_history)) if self._kill_history else 0.0
 
-        # Dominant kill rate (>= 70%) clears stage directly
-        if avg_kill >= 0.70:
+        # Dominant kill rate (>= 50%) clears stage directly (50%+ is a dominant win-rate in Pac-Man with power pellets)
+        if avg_kill >= 0.50:
             return True
-        # Combined solid kill rate (>= 55%) and positive return threshold
-        if avg_kill >= 0.55 and avg_ret >= self.stage.advance_return:
+        # Combined solid kill rate (>= 38%) and target return threshold
+        if avg_kill >= 0.38 and avg_ret >= self.stage.advance_return:
             return True
-        # Raw return threshold as fallback
-        if avg_ret >= self.stage.advance_return and avg_kill >= 0.40:
+        # Target return threshold with baseline competency (>= 32% kill rate)
+        if avg_ret >= self.stage.advance_return and avg_kill >= 0.32:
             return True
-
-        # Plateau detection: if training has stalled in this stage
+        # Plateau detection: if training has stalled in this stage after min_updates + ADVANCE_WINDOW
         if self._updates_in_stage >= self.stage.min_updates + ADVANCE_WINDOW:
             half = ADVANCE_WINDOW // 2
             hist = list(self._return_history)
             avg_first = sum(hist[:half]) / half
             avg_second = sum(hist[half:]) / half
-            if (avg_second - avg_first) < 0.5 and avg_kill >= 0.50:
-                print(f"Curriculum advancing due to plateau: improvement {avg_second - avg_first:.2f} < 0.5 (Current avg: {avg_second:.2f}, kill: {avg_kill:.1%})")
+            # If returns have flattened out (< 0.5 improvement) and policy maintains competent play (>= 32% kills)
+            if (avg_second - avg_first) < 0.5 and (avg_kill >= 0.32 or avg_ret >= self.stage.advance_return):
+                print(f"Curriculum advancing due to plateau: improvement {avg_second - avg_first:.2f} < 0.5 (Current avg ret: {avg_second:.2f}, kill: {avg_kill:.1%})")
                 return True
         return False
 
@@ -106,12 +105,7 @@ class CurriculumScheduler:
         self._updates_in_stage = 0
 
     def state_dict(self) -> dict:
-        return {
-            "stage_idx": self.stage_idx,
-            "updates_in_stage": self._updates_in_stage,
-            "return_history": list(self._return_history),
-            "kill_history": list(self._kill_history)
-        }
+        return {"stage_idx": self.stage_idx, "updates_in_stage": self._updates_in_stage, "return_history": list(self._return_history), "kill_history": list(self._kill_history)}
 
     def load_state_dict(self, d: dict):
         self.stage_idx = d.get("stage_idx", 0)
@@ -122,6 +116,4 @@ class CurriculumScheduler:
     def __repr__(self):
         s = self.stage
         avg_k = (sum(self._kill_history) / len(self._kill_history)) if self._kill_history else 0.0
-        return (f"CurriculumScheduler(stage={self.stage_idx}, "
-                f"grid={s.rows}×{s.cols}, ghosts={s.n_ghosts}, "
-                f"updates={self._updates_in_stage}, win_rate={avg_k:.1%})")
+        return (f"CurriculumScheduler(stage={self.stage_idx}, grid={s.rows}×{s.cols}, ghosts={s.n_ghosts}, updates={self._updates_in_stage}, win_rate={avg_k:.1%})")

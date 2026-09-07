@@ -41,11 +41,8 @@ def _pacman_target(ghost):
             return top[0]
     return None
 
-
 def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_resolution: float = 1.0) -> np.ndarray:
-    """
-    Returns (SPATIAL_CH, rows, cols) float32 tensor.
-    """
+    """Returns (SPATIAL_CH, rows, cols) float32 tensor."""
     out = np.zeros((SPATIAL_CH, rows, cols), dtype=np.float32)
     grid_y, grid_x = np.mgrid[0:rows, 0:cols]
     px = (grid_x.ravel() / obs_resolution) + (0.5 / obs_resolution)
@@ -69,7 +66,6 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_reso
         _place_single_pixel(out[1], p[0], p[1])
     for p in ghost.known_power_pellets:
         _place_single_pixel(out[2], p[0], p[1])
-
     bm = ghost.belief_map
     if hasattr(bm, '_open_arr') and len(bm._open_arr) > 0:
         r_arr = (bm._open_arr[:, 0] * obs_resolution).astype(np.int32)
@@ -80,7 +76,6 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_reso
         if hasattr(bm, '_safety'):
             valid = (r_arr >= 0) & (r_arr < rows) & (c_arr >= 0) & (c_arr < cols) & (np.arange(len(r_arr)) < len(bm._safety))
             np.maximum.at(out[5], (r_arr[valid], c_arr[valid]), bm._safety[valid])
-
     _BLOB_SIGMA = 0.6
 
     def _place_blob(channel, fy, fx):
@@ -137,19 +132,16 @@ def build_vector(ghost) -> np.ndarray:
         f.append(1.0 if st == "UNKNOWN" or st is None else 0.0)
     f.append(min(ghost.frame, 2000) / 2000.0)
     f.append(1.0 if getattr(ghost, 'in_fallback_mode', False) else 0.0)
-    # NEW: Ghost's own continuous velocity
     import math
     speed = math.hypot(ghost.vx, ghost.vy)
     max_speed = getattr(ghost, 'max_speed', 0.5)
     f.append(speed / max_speed if max_speed > 0 else 0.0)
     f.extend([ghost.vy / 5.0, ghost.vx / 5.0])
-    # NEW: Relative distance to Pacman (if known)
     target = _pacman_target(ghost)
     if target:
         f.extend([(target[0] - ghost.y) / w_height, (target[1] - ghost.x) / w_width])
     else:
         f.extend([0.0, 0.0])
-    # NEW: Distance to nearest obstacle
     if hasattr(ghost.world, '_points_to_segments_dist_sq'):
         dist_sq, _ = ghost.world._points_to_segments_dist_sq(np.array([ghost.x]), np.array([ghost.y]))
         min_dist = math.sqrt(np.min(dist_sq)) if dist_sq.size > 0 else 10.0
@@ -242,7 +234,6 @@ def build_global_spatial(env, rows: int, cols: int, obs_resolution: float = 1.0)
         _place_single_pixel(out[1], p[0], p[1])
     for p in env.world.power_pellets:
         _place_single_pixel(out[2], p[0], p[1])
-        
     _BLOB_SIGMA = 0.6
     def _place_blob(channel, fy, fx):
         cr, cc = int(fy * obs_resolution), int(fx * obs_resolution)
@@ -251,8 +242,7 @@ def build_global_spatial(env, rows: int, cols: int, obs_resolution: float = 1.0)
                 nr, nc = cr + dr, cc + dc
                 if 0 <= nr < rows and 0 <= nc < cols:
                     d2 = (fy * obs_resolution - (nr + 0.5))**2 + (fx * obs_resolution - (nc + 0.5))**2
-                    channel[nr, nc] = max(channel[nr, nc], np.exp(-d2 / (2 * _BLOB_SIGMA**2)))
-                    
+                    channel[nr, nc] = max(channel[nr, nc], np.exp(-d2 / (2 * _BLOB_SIGMA**2)))      
     if not env.player.dead:
         _place_blob(out[3], env.player.y, env.player.x)
     for g in env.ghosts.values():

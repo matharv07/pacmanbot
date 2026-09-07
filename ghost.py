@@ -54,15 +54,13 @@ _ANGLES = np.linspace(0, 2*math.pi, RAY_COUNT, endpoint=False)
 _DX = np.cos(_ANGLES) * 0.5
 _DY = np.sin(_ANGLES) * 0.5
 
-def find_closest_pellet(p, world_obj, is_power=False):
-    # O(1) lookup to recover original float64 tuple from float32 array row
+def find_closest_pellet(p, world_obj, is_power=False):      #O(1) lookup to recover original float64 tuple from float32 array row
     cache_key = '_power_lookup' if is_power else '_pellet_lookup'
     lookup = getattr(world_obj, cache_key, None)
     if lookup is None:
         source_list = getattr(world_obj, 'power_pellets' if is_power else 'pellets', [])
         lookup = {(round(pt[0], 2), round(pt[1], 2)): pt for pt in source_list}
         setattr(world_obj, cache_key, lookup)
-        
     k = (round(p[0], 2), round(p[1], 2))
     return lookup.get(k)
 
@@ -161,7 +159,7 @@ class Ghost:
         if active_task is not None:
             tpr, tpc = active_task.target_pos
             if abs(self.y - tpr) < 0.5 and abs(self.x - tpc) < 0.5:
-                # If this is a pursuit task and Pacman is still in reach, dynamically track him rather than dropping task
+                #if this is a pursuit task and pacman is still in reach, dynamically track him rather than dropping task
                 is_hunt_task = (active_task.task_type in (TaskType.HUNT, TaskType.DYNAMIC))
                 pacman_in_reach = False
                 if self.known_pacman is not None and not self.pacman_powered:
@@ -179,9 +177,8 @@ class Ghost:
         desired_vx = 0.0
         desired_vy = 0.0
         moved = False
-
         dist_pac = 999.0
-        # 1. Dynamic Terminal Pursuit & Lead Interception (active when Pacman is in LOS or near)
+        #Dynamic Terminal Pursuit & Lead Interception (active when Pacman is in LOS or near)
         if not moved and not self.pacman_powered and self.known_pacman:
             pr, pc = self.known_pacman
             pac_y, pac_x = float(pr), float(pc)
@@ -192,13 +189,13 @@ class Ghost:
                     has_los = self.world.line_of_sight((self.x, self.y), (pac_x, pac_y), radius=self.radius, step_size=0.5)
                 if has_los:
                     if dist_pac < 1.8:
-                        # Close-range direct capture
+                        #close-range direct capture
                         if dist_pac > 0.01:
                             desired_vx = (pac_x - self.x) / dist_pac
                             desired_vy = (pac_y - self.y) / dist_pac
                         moved = True
                     else:
-                        # Corridor lead interception: project Pacman forward to cut off intersection
+                        #corridor lead interception: project pacman forward to cut off intersection
                         p_dir = getattr(self, '_player_dir', (0, 0))
                         lookahead = min(2.0, dist_pac * 0.45)
                         lead_y = pac_y + p_dir[0] * lookahead
@@ -212,8 +209,6 @@ class Ghost:
                             moved = True
                     if moved and hasattr(self, '_committed_path'):
                         self._committed_path = []
-
-        # 2. Power pellet area denial
         if not moved and not self.pacman_powered and self.known_pacman:
             pr, pc = self.known_pacman
             for p_pos in (self.world.power_pellets if hasattr(self, 'world') and self.world else []):
@@ -231,8 +226,6 @@ class Ghost:
                     if is_closest:
                         active_task = type('DummyTask', (), {'target_pos': (p_r, p_c), 'task_type': -1})()
                         break
-
-        # 3. Power pellet grab override
         GRAB_DIST = 2.0
         if not moved and (not self.known_pacman or self.pacman_powered or dist_pac > 4.5):
             best_power = None
@@ -258,8 +251,6 @@ class Ghost:
                 moved = True
                 if hasattr(self, '_committed_path'):
                     self._committed_path = []
-
-        # 4. Normal task execution via A*
         if not moved and active_task is not None:
             target = active_task.target_pos
             replan = False
@@ -294,8 +285,6 @@ class Ghost:
                         desired_vx = dx / d
                         desired_vy = dy / d
                 moved = True
-
-        # 5. Belief-guided search (NO random wandering when Pacman or belief peak is known)
         if not moved and active_task is None:
             target = None
             if self.known_pacman is not None and not self.pacman_powered:
@@ -306,7 +295,6 @@ class Ghost:
                 if self.belief_map._b_flat[best_idx] > 1e-4:
                     best_r, best_c = self.belief_map._open_cells[best_idx]
                     target = (float(best_r), float(best_c))
-            
             if target is not None:
                 replan = False
                 prev_target = getattr(self, '_committed_target', None)
@@ -317,7 +305,6 @@ class Ghost:
                         replan = True
                 elif self.frame - getattr(self, '_last_replan_frame', -999) >= 30:
                     replan = True
-
                 if replan:
                     from pathfinder import astar
                     full_path = astar(self.world, (float(self.y), float(self.x)), target)
@@ -327,7 +314,6 @@ class Ghost:
                         self._last_replan_frame = self.frame
                     else:
                         self._committed_path = []
-
                 if getattr(self, '_committed_path', None):
                     next_cell = self._committed_path[0]
                     if abs(self.y - next_cell[0]) < 0.4 and abs(self.x - next_cell[1]) < 0.4:
@@ -342,9 +328,8 @@ class Ghost:
                             desired_vx = dx / d
                             desired_vy = dy / d
                             moved = True
-
         self.in_fallback_mode = not moved
-        # 6. Fallback (maintain forward momentum along corridor instead of spinning)
+        #fallback (maintain forward momentum along corridor instead of spinning)
         if not moved:
             if hasattr(self, '_committed_path'):
                 self._committed_path = []
@@ -432,8 +417,8 @@ class Ghost:
             close_idx = np.where(dist < self.radius + 0.5)[0]
             if len(close_idx) > 0:
                 for idx in close_idx:
-                    arr_xy = power_arr[idx]   # (x, y) as float32
-                    # tolerance-based removal to handle float32 vs float64 mismatch
+                    arr_xy = power_arr[idx]   #(x, y) as float32
+                    #tolerance-based removal to handle float32 vs float64 mismatch
                     pt = None
                     for pp in list(self.world.power_pellets):
                         if abs(pp[0] - float(arr_xy[0])) < 0.02 and abs(pp[1] - float(arr_xy[1])) < 0.02:
@@ -452,8 +437,6 @@ class Ghost:
                     if pt not in self.known_pellets:
                         self.known_pellets.add(pt)
                     self.power_pellets_converted_this_frame += 1
-                    # broadcast both events: power_eaten (removes from others' known_power_pellets)
-                    # and pellet (adds to others' known_pellets)
                     self._broadcast([("power_eaten", pt), ("pellet", pt)], all_ghosts)
         self._check_oscillation()
         return newly_discovered, stale_refreshed
@@ -701,14 +684,12 @@ class Ghost:
         if tgt_pellets is None: tgt_pellets = set()
         for p in self.known_pellets:
             if p not in tgt_pellets:
-                sync_diffs.append(("pellet", p))
-                
+                sync_diffs.append(("pellet", p)) 
         tgt_power = getattr(target_ghost, 'known_power_pellets', None)
         if tgt_power is None: tgt_power = set()
         for p in self.known_power_pellets:
             if p not in tgt_power:
                 sync_diffs.append(("power", p))        
-                
         tgt_lidar = getattr(target_ghost, 'lidar_memory', None)
         if tgt_lidar is None: tgt_lidar = set()
         for w in self.lidar_memory:
@@ -768,7 +749,6 @@ class Ghost:
                         relay_diffs.append(diff)
                 elif dtype == "power_eaten":
                     _, p = diff
-                    # A teammate converted a power pellet — purge from our known_power_pellets
                     self.known_power_pellets.discard(p)
                     relay_diffs.append(diff)
                 elif dtype == "wall":
