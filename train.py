@@ -27,17 +27,26 @@ from collections import defaultdict
 import requests
 
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
 torch.set_num_threads(1)
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
-NUM_ENVS        = 14
+NUM_ENVS        = 14       # Sized for 8-core / 16-thread CPU (14 sim workers + 2 threads for coordinator/training)
 ROLLOUT_STEPS   = 256
 MINI_BATCH      = 4096
-MICRO_BATCH     = 2048     #gradient accumulation chunk size (MINI_BATCH / 2)
-ROLLOUT_INFER_CHUNK = 512  #max ghosts per rollout inference forward pass
+MICRO_BATCH     = 4096     # Gradient accumulation chunk size (takes full advantage of 16 GB VRAM)
+ROLLOUT_INFER_CHUNK = 2048 # Max ghosts per rollout inference forward pass (optimized for 16 GB VRAM)
 #adaptive OOM-safe chunk sizes — halved automatically on cuda OOM, never grow back
 _eff_infer_chunk = ROLLOUT_INFER_CHUNK
 _eff_micro_batch = MICRO_BATCH
-PPO_EPOCHS      = 12    
+PPO_EPOCHS      = 4    
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
 CLIP_EPS        = 0.2
@@ -56,6 +65,7 @@ TARGET_KL       = 0.05
 CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+AMP_DTYPE = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
 
 def get_discord_webhook():
     env_url = os.environ.get("DISCORD_WEBHOOK_URL")
@@ -194,6 +204,15 @@ def _pad_spatial(arr, target_h=MAX_H, target_w=MAX_W):
     return out
 
 def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+    os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+    os.environ['NUMEXPR_NUM_THREADS'] = '1'
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
     try:
         env = Env(env_id, num_ghosts=n_ghosts, world_height=float(rows), world_width=float(cols), n_power=n_power)
         env.static_pacman = static_pacman
@@ -493,44 +512,45 @@ def train():
                                 print(f"  ⚠️  Action index OOB: max={mb_act.max().item()} >= H*W={_hw}, clamping")
                                 push_discord_warning(f"⚠️ Action OOB at update {update}: max_act={mb_act.max().item()}, H*W={_hw}, sp={tuple(mb_sp.shape)}")
                                 mb_act = mb_act.clamp(max=_hw - 1)
-                            new_lp, ent, pool, vec, flat_logits, speed_params = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act, mb_spd)
-                            unique_ids, inv_idx = torch.unique(mb_gsp_ids, return_inverse=True)
-                            mb_gsp_unique = b_gsp_unique[unique_ids]
-                            mb_c_pool = critic.encode_spatial(mb_gsp_unique)
-                            v_pred = critic.forward_from_pool(mb_c_pool[inv_idx], mb_cve).squeeze(-1)
-                            ratio = torch.exp(new_lp - mb_olp)
-                            with torch.no_grad():
-                                approx_kl = 0.5 * (new_lp - mb_olp).pow(2).mean()
-                                clip_fraction = (torch.abs(ratio - 1.0) > CLIP_EPS).float().mean()
-                            s1 = ratio * mb_adv
-                            s2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * mb_adv
-                            a_loss = -torch.min(s1, s2).mean()
-                            v_loss = F.smooth_l1_loss(v_pred, ret_rms(mb_ret))
-                            mb_ht_masked = mb_ht * mb_vm.float()
-                            ht_flat     = mb_ht_masked.view(mb_ht_masked.shape[0], -1)
-                            ht_row_sums = ht_flat.sum(dim=1)
-                            valid_bc    = ht_row_sums > 1e-6
-                            if valid_bc.any():
-                                ht_valid  = ht_flat[valid_bc]
-                                ht_prob   = (ht_valid / ht_valid.sum(dim=1, keepdim=True)).detach()
-                                fl_bc     = flat_logits[valid_bc].clamp(min=-1e4)
-                                log_pi    = F.log_softmax(fl_bc, dim=-1)
-                                bc        = -(ht_prob * log_pi).sum(dim=-1).mean()
-                                
-                                #speed BC loss using Beta distribution log-prob
-                                #mb_hs is the target heuristic speed
-                                #speed_params is (alpha, beta) of the predicted Beta
-                                #we can maximize log-prob of target speed:
-                                target_speed = mb_hs[valid_bc].squeeze(-1).clamp(1e-4, 1.0 - 1e-4)
-                                alpha = speed_params[valid_bc, 0]
-                                beta = speed_params[valid_bc, 1]
-                                dist_speed = torch.distributions.Beta(alpha, beta)
-                                bc_speed = -dist_speed.log_prob(target_speed).mean()
-                                bc = (bc + bc_speed * 0.2) * bc_valid_frac
-                            else:
-                                bc = torch.tensor(0.0, device=DEVICE)
-                            loss_actor = a_loss - ENT_COEF * ent.mean() + lam_bc * bc
-                            loss_critic = VF_COEF * v_loss
+                            with torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
+                                new_lp, ent, pool, vec, flat_logits, speed_params = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act, mb_spd)
+                                unique_ids, inv_idx = torch.unique(mb_gsp_ids, return_inverse=True)
+                                mb_gsp_unique = b_gsp_unique[unique_ids]
+                                mb_c_pool = critic.encode_spatial(mb_gsp_unique)
+                                v_pred = critic.forward_from_pool(mb_c_pool[inv_idx], mb_cve).squeeze(-1)
+                                ratio = torch.exp(new_lp - mb_olp)
+                                with torch.no_grad():
+                                    approx_kl = 0.5 * (new_lp - mb_olp).pow(2).mean()
+                                    clip_fraction = (torch.abs(ratio - 1.0) > CLIP_EPS).float().mean()
+                                s1 = ratio * mb_adv
+                                s2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * mb_adv
+                                a_loss = -torch.min(s1, s2).mean()
+                                v_loss = F.smooth_l1_loss(v_pred, ret_rms(mb_ret))
+                                mb_ht_masked = mb_ht * mb_vm.float()
+                                ht_flat     = mb_ht_masked.view(mb_ht_masked.shape[0], -1)
+                                ht_row_sums = ht_flat.sum(dim=1)
+                                valid_bc    = ht_row_sums > 1e-6
+                                if valid_bc.any():
+                                    ht_valid  = ht_flat[valid_bc]
+                                    ht_prob   = (ht_valid / ht_valid.sum(dim=1, keepdim=True)).detach()
+                                    fl_bc     = flat_logits[valid_bc].clamp(min=-1e4)
+                                    log_pi    = F.log_softmax(fl_bc, dim=-1)
+                                    bc        = -(ht_prob * log_pi).sum(dim=-1).mean()
+                                    
+                                    #speed BC loss using Beta distribution log-prob
+                                    #mb_hs is the target heuristic speed
+                                    #speed_params is (alpha, beta) of the predicted Beta
+                                    #we can maximize log-prob of target speed:
+                                    target_speed = mb_hs[valid_bc].squeeze(-1).clamp(1e-4, 1.0 - 1e-4)
+                                    alpha = speed_params[valid_bc, 0]
+                                    beta = speed_params[valid_bc, 1]
+                                    dist_speed = torch.distributions.Beta(alpha, beta)
+                                    bc_speed = -dist_speed.log_prob(target_speed).mean()
+                                    bc = (bc + bc_speed * 0.2) * bc_valid_frac
+                                else:
+                                    bc = torch.tensor(0.0, device=DEVICE)
+                                loss_actor = a_loss - ENT_COEF * ent.mean() + lam_bc * bc
+                                loss_critic = VF_COEF * v_loss
                             (loss_critic * weight).backward()
                             if critic_warmup_remaining <= 0:
                                 (loss_actor * weight).backward()
@@ -650,12 +670,10 @@ def train():
                 for i, gid in enumerate(gids):
                     joint_ve[gid] = ve[i]
                 joint_ve_flat = joint_ve.flatten()
-                cve_batch = []
-                for gid in gids:
-                    one_hot = np.zeros(MAX_GHOSTS, dtype=np.float32)
-                    one_hot[gid] = 1.0
-                    cve_batch.append(np.concatenate([joint_ve_flat, one_hot]))
-                cve_batch = np.array(cve_batch, dtype=np.float32)
+                cve_batch = np.zeros((n_g, MAX_GHOSTS * VEC_DIM + MAX_GHOSTS), dtype=np.float32)
+                cve_batch[:, :MAX_GHOSTS * VEC_DIM] = joint_ve_flat
+                for i, gid in enumerate(gids):
+                    cve_batch[i, MAX_GHOSTS * VEC_DIM + gid] = 1.0
                 batch_sp.append(sp_padded)
                 batch_gsp_unique.append(gsp_padded[np.newaxis, ...])
                 active_n_ghosts.append(n_g)
@@ -687,7 +705,7 @@ def train():
                 while True:
                     try:
                         idx_chunks, lp_chunks, sc_chunks, spd_chunks, spd_lp_chunks = [], [], [], [], []
-                        with torch.inference_mode():
+                        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
                             for ci in range(0, n_total, _eff_infer_chunk):
                                 ce = min(ci + _eff_infer_chunk, n_total)
                                 c_idx, c_lp, c_scores, _, _, c_speed, c_speed_lp = actor_rollout(

@@ -87,6 +87,7 @@ class Ghost:
         self.known_power_pellets = set()
         self.lidar_memory = set()
         self.prm_last_seen = {n: -1 for n in getattr(world, 'prm_nodes', [])}
+        self.prm_known_count = 0
         self.frame = 0
         self.message_queue = []
         self.seen_message_ids = {}
@@ -620,7 +621,9 @@ class Ghost:
         diffs.extend(pellet_diffs)
         for n in visible_prm:
             last = self.prm_last_seen.get(n, -1)
-            if last != -1:
+            if last == -1:
+                self.prm_known_count += 1
+            else:
                 staleness = min(self.frame - last, 200) / 200.0
                 if staleness > 0.25: stale_refreshed += staleness
             self.prm_last_seen[n] = self.frame
@@ -733,7 +736,10 @@ class Ghost:
                 dtype = diff[0]
                 if dtype == "prm_refresh":
                     _, n = diff
-                    if self.prm_last_seen.get(n, -1) < self.frame - MEMORY_FRAMES:
+                    old = self.prm_last_seen.get(n, -1)
+                    if old < self.frame - MEMORY_FRAMES:
+                        if old == -1:
+                            self.prm_known_count += 1
                         self.prm_last_seen[n] = self.frame
                         relay_diffs.append(diff)
                 elif dtype == "agent":

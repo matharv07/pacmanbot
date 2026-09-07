@@ -110,7 +110,9 @@ class RewardShaper:
         if not hasattr(ghost.world, 'prm_nodes') or not hasattr(ghost, 'prm_last_seen'):
             return 0.0
         total_nodes = max(len(ghost.world.prm_nodes), 1)
-        known = sum(1 for v in ghost.prm_last_seen.values() if v != -1)
+        known = getattr(ghost, 'prm_known_count', None)
+        if known is None:
+            known = sum(1 for v in ghost.prm_last_seen.values() if v != -1)
         return self.gamma_ex * (known / total_nodes)
 
     def _phi_belief(self, ghost) -> float:

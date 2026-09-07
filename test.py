@@ -71,6 +71,13 @@ def _run_episode(actor, env, stage):
     return env.frame, surviving, 0.0, False
 
 def _worker_chunk(ckpt_path: str, n_games: int, stage_override=None, seed_offset: int = 0):
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
     os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = 'hide'
     os.environ['SDL_VIDEODRIVER'] = 'dummy'
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
