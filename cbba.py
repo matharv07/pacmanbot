@@ -185,16 +185,27 @@ class CBBA_Agent:
             if prev_pos == (ghost.y, ghost.x):
                 d = self._dist_cache.get((round(tgt[0], 2), round(tgt[1], 2)), math.inf)
             else:
-                cache_pair = ((round(prev_pos[0], 2), round(prev_pos[1], 2)), (round(tgt[0], 2), round(tgt[1], 2)))
-                if cache_pair not in getattr(self, '_astar_cache', {}):
-                    res = dijkstra_multi(ghost.world, prev_pos, [tgt])
-                    d = res[tgt][0] if tgt in res else math.inf
-                    if not hasattr(self, '_astar_cache'):
-                        self._astar_cache = {}
-                    if len(self._astar_cache) > 2000:
-                        self._astar_cache.clear()
-                    self._astar_cache[cache_pair] = d
-                d = self._astar_cache[cache_pair]
+                r1, c1 = int(round(prev_pos[0])), int(round(prev_pos[1]))
+                r2, c2 = int(round(tgt[0])), int(round(tgt[1]))
+                if r1 == r2 and c1 == c2:
+                    d = 0.0
+                elif abs(r1 - r2) + abs(c1 - c2) == 1:
+                    d = 1.0
+                else:
+                    w = getattr(ghost, 'world', None)
+                    if w is not None:
+                        if not hasattr(w, '_pair_dist_cache'):
+                            w._pair_dist_cache = {}
+                        cache_key = (r1, c1, r2, c2)
+                        d = w._pair_dist_cache.get(cache_key)
+                        if d is None:
+                            res = dijkstra_multi(w, (float(r1), float(c1)), [(float(r2), float(c2))])
+                            tgt_tuple = (float(r2), float(c2))
+                            d = res[tgt_tuple][0] if tgt_tuple in res else math.inf
+                            w._pair_dist_cache[cache_key] = d
+                            w._pair_dist_cache[(r2, c2, r1, c1)] = d
+                    else:
+                        d = abs(r1 - r2) + abs(c1 - c2)
             cumulative += d
             total += task.score * (self.lamda ** cumulative)
             prev_pos = tgt

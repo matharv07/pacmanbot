@@ -41,7 +41,7 @@ STAGES = [
     Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0)
 ]
 
-ADVANCE_WINDOW = 100   # rolling window of updates achieving return/kill threshold required to clear a stage
+ADVANCE_WINDOW = 50    # rolling window of updates achieving return/kill threshold required to clear a stage
 
 class CurriculumScheduler:
     def __init__(self, start_stage: int = 0):

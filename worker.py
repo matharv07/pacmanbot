@@ -200,7 +200,10 @@ class Env:
                 for gid, ghost in list(self.ghosts.items()):
                     if ghost.dead:
                         continue
-                    #continuous radius-based swept-path collision (matches pacman.py visualizer)
+                    # Coarse proximity filter before expensive swept-path interpolation
+                    if abs(ghost.x - self.player.x) > 2.0 or abs(ghost.y - self.player.y) > 2.0:
+                        continue
+                    # continuous radius-based swept-path collision (matches pacman.py visualizer)
                     collision_radius = self.player.radius + ghost.radius + 0.15
                     collided = False
                     p_path = getattr(self.player, 'path_this_frame', [(self.player.x, self.player.y)])

@@ -297,39 +297,51 @@ class Ghost:
 
         # 5. Belief-guided search (NO random wandering when Pacman or belief peak is known)
         if not moved and active_task is None:
+            target = None
             if self.known_pacman is not None and not self.pacman_powered:
                 pr, pc = self.known_pacman
-                from pathfinder import astar
-                full_path = astar(self.world, (float(self.y), float(self.x)), (float(pr), float(pc)))
-                if len(full_path) >= 2:
-                    self._committed_path = full_path[1:]
-                    self._committed_target = (pr, pc)
-                    target_y, target_x = self._committed_path[0]
-                    dx, dy = target_x - self.x, target_y - self.y
-                    d = math.hypot(dx, dy)
-                    if d > 0:
-                        desired_vx = dx / d
-                        desired_vy = dy / d
-                        moved = True
-            elif self.belief_map._initialised and self.belief_map._open_cells:
-                probs = self.belief_map._b_flat.tolist()
-                if probs:
-                    max_p = max(probs)
-                    if max_p > 1e-4:
-                        best_idx = probs.index(max_p)
-                        best_r, best_c = self.belief_map._open_cells[best_idx]
-                        from pathfinder import astar
-                        full_path = astar(self.world, (float(self.y), float(self.x)), (float(best_r), float(best_c)))
-                        if len(full_path) >= 2:
-                            self._committed_path = full_path[1:]
-                            self._committed_target = (best_r, best_c)
-                            target_y, target_x = self._committed_path[0]
-                            dx, dy = target_x - self.x, target_y - self.y
-                            d = math.hypot(dx, dy)
-                            if d > 0:
-                                desired_vx = dx / d
-                                desired_vy = dy / d
-                                moved = True
+                target = (float(pr), float(pc))
+            elif self.belief_map._initialised and len(self.belief_map._b_flat) > 0:
+                best_idx = int(np.argmax(self.belief_map._b_flat))
+                if self.belief_map._b_flat[best_idx] > 1e-4:
+                    best_r, best_c = self.belief_map._open_cells[best_idx]
+                    target = (float(best_r), float(best_c))
+            
+            if target is not None:
+                replan = False
+                prev_target = getattr(self, '_committed_target', None)
+                if not getattr(self, '_committed_path', []):
+                    replan = True
+                elif prev_target is None or math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 2.0:
+                    if self.frame - getattr(self, '_last_replan_frame', -999) >= 8:
+                        replan = True
+                elif self.frame - getattr(self, '_last_replan_frame', -999) >= 30:
+                    replan = True
+
+                if replan:
+                    from pathfinder import astar
+                    full_path = astar(self.world, (float(self.y), float(self.x)), target)
+                    if len(full_path) >= 2:
+                        self._committed_path = full_path[1:]
+                        self._committed_target = target
+                        self._last_replan_frame = self.frame
+                    else:
+                        self._committed_path = []
+
+                if getattr(self, '_committed_path', None):
+                    next_cell = self._committed_path[0]
+                    if abs(self.y - next_cell[0]) < 0.4 and abs(self.x - next_cell[1]) < 0.4:
+                        self._committed_path.pop(0)
+                        if self._committed_path:
+                            next_cell = self._committed_path[0]
+                    if self._committed_path:
+                        target_y, target_x = next_cell[0], next_cell[1]
+                        dx, dy = target_x - self.x, target_y - self.y
+                        d = math.hypot(dx, dy)
+                        if d > 0:
+                            desired_vx = dx / d
+                            desired_vy = dy / d
+                            moved = True
 
         self.in_fallback_mode = not moved
         # 6. Fallback (maintain forward momentum along corridor instead of spinning)
@@ -498,29 +510,23 @@ class Ghost:
                 visible_prm = [tuple(n) for n, vis in zip(valid_nodes, is_los) if vis]
         bm_arr = getattr(self.belief_map, '_open_arr', None)
         if bm_arr is not None and len(bm_arr) > 0:
-            sources = [(self.x, self.y)]
-            for pos in self.known_agents.values():
-                if pos != "UNKNOWN":
-                    sources.append((pos[1], pos[0]))
-            for sx, sy in sources:
-                dx = bm_arr[:, 1] - sx
-                dy = bm_arr[:, 0] - sy
-                dist = np.hypot(dx, dy)
-                valid_mask = dist <= MAX_RAY_DIST
-                if np.any(valid_mask):
-                    valid_nodes = bm_arr[valid_mask]
-                    valid_idxs = np.where(valid_mask)[0]
-                    valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
-                    is_pass = self.world.batch_is_passable(valid_targets[:, 0], valid_targets[:, 1], radius=0.0)
-                    passable_targets = valid_targets[is_pass]
-                    passable_idxs = valid_idxs[is_pass]
-                    if len(passable_targets) > 0:
-                        is_los = self.world.batch_line_of_sight((sx, sy), passable_targets, radius=0.0, step_size=0.5)
-                        visible_belief_idxs.update(passable_idxs[is_los])
-                    if (sx, sy) == (self.x, self.y):
-                        impassable_nodes = valid_nodes[~is_pass]
-                        if len(impassable_nodes) > 0:
-                            impassable_belief_nodes.extend([tuple(n) for n in impassable_nodes])
+            dx = bm_arr[:, 1] - self.x
+            dy = bm_arr[:, 0] - self.y
+            dist = np.hypot(dx, dy)
+            valid_mask = dist <= MAX_RAY_DIST
+            if np.any(valid_mask):
+                valid_nodes = bm_arr[valid_mask]
+                valid_idxs = np.where(valid_mask)[0]
+                valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
+                is_pass = self.world.batch_is_passable(valid_targets[:, 0], valid_targets[:, 1], radius=0.0)
+                passable_targets = valid_targets[is_pass]
+                passable_idxs = valid_idxs[is_pass]
+                if len(passable_targets) > 0:
+                    is_los = self.world.batch_line_of_sight((self.x, self.y), passable_targets, radius=0.0, step_size=0.5)
+                    visible_belief_idxs.update(passable_idxs[is_los])
+                impassable_nodes = valid_nodes[~is_pass]
+                if len(impassable_nodes) > 0:
+                    impassable_belief_nodes.extend([tuple(n) for n in impassable_nodes])
         pellet_diffs = []
         pellets_arr = getattr(self.world, 'pellets_arr', None)
         if pellets_arr is not None and len(pellets_arr) > 0:

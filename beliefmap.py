@@ -224,7 +224,10 @@ class BeliefMap:
             self._explored_nodes = set()
         if visible_idxs:
             self._explored_nodes.update(visible_idxs)
-            idxs = np.array(list(visible_idxs), dtype=np.int32)
+            if isinstance(visible_idxs, np.ndarray):
+                idxs = visible_idxs
+            else:
+                idxs = np.fromiter(visible_idxs, dtype=np.int32, count=len(visible_idxs))
             if pacman_pos is not None:
                 pac_idx = self._closest_node(pacman_pos)
                 idxs = idxs[idxs != pac_idx]
@@ -404,6 +407,9 @@ class BeliefMap:
         self._ensure_initialised()
         if len(self._b_flat) == 0:
             return []
+        if n == 1:
+            best_idx = int(np.argmax(self._b_flat))
+            return [self._open_cells[best_idx]]
         k = min(n, len(self._b_flat))
         top_idx = np.argpartition(self._b_flat, -k)[-k:]
         top_idx = top_idx[np.argsort(self._b_flat[top_idx])[::-1]]

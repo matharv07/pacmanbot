@@ -103,7 +103,7 @@ class GhostActor(nn.Module):
             sel_idx.append(idx)
             sel_lp.append(dist.log_prob(idx))
             flat.scatter_(1, idx.unsqueeze(1), float('-inf'))
-        speed_params = F.softplus(self.speed_head(torch.cat([pool, vec], dim=1))) + 1.001
+        speed_params = torch.clamp(F.softplus(self.speed_head(torch.cat([pool, vec], dim=1))) + 1.001, max=15.0)
         alpha, beta = speed_params[:, 0], speed_params[:, 1]
         dist_speed = torch.distributions.Beta(alpha, beta)
         speed = dist_speed.sample()
@@ -155,7 +155,7 @@ class GhostActor(nn.Module):
             mask_k = torch.zeros_like(flat, dtype=torch.bool)
             mask_k.scatter_(1, actions[:, k].unsqueeze(1), True)
             flat = torch.where(mask_k, float('-inf'), flat)
-        speed_params = F.softplus(self.speed_head(torch.cat([pool, vec], dim=1))) + 1.001
+        speed_params = torch.clamp(F.softplus(self.speed_head(torch.cat([pool, vec], dim=1))) + 1.001, max=15.0)
         alpha, beta = speed_params[:, 0], speed_params[:, 1]
         dist_speed = torch.distributions.Beta(alpha, beta)
         speeds = torch.clamp(speeds.squeeze(-1), 1e-4, 1.0 - 1e-4)

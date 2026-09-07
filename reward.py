@@ -42,9 +42,8 @@ class RewardShaper:
                 return top[0]
         return None
 
-    def _phi_hunt(self, ghost) -> float:
-        target = self._pac_target(ghost)
-        if target is None:
+    def _phi_hunt(self, ghost, target) -> float:
+        if getattr(ghost, 'pacman_powered', False) or target is None:
             return 0.0
         # Use cached Dijkstra distance if available (from CBBA auction)
         if hasattr(ghost, 'cbba_agent') and target in ghost.cbba_agent._dist_cache:
@@ -56,15 +55,10 @@ class RewardShaper:
         if math.isinf(d) or math.isnan(d):
             d = 999.0
         diag = math.hypot(ghost.world.width, ghost.world.height)
-        if getattr(ghost, 'pacman_powered', False):
-            return 0.0
         return -self.alpha * (d / diag)
 
-    def _phi_flee(self, ghost) -> float:
-        if not getattr(ghost, 'pacman_powered', False):
-            return 0.0
-        target = self._pac_target(ghost)
-        if target is None:
+    def _phi_flee(self, ghost, target) -> float:
+        if not getattr(ghost, 'pacman_powered', False) or target is None:
             return 0.0
         if hasattr(ghost, 'cbba_agent') and target in ghost.cbba_agent._dist_cache:
             d = ghost.cbba_agent._dist_cache[target]
@@ -77,12 +71,9 @@ class RewardShaper:
         diag = math.hypot(ghost.world.width, ghost.world.height)
         return self.alpha * (d / diag)
 
-    def _phi_surround(self, ghost, all_ghosts) -> float:
+    def _phi_surround(self, ghost, all_ghosts, target) -> float:
         """Rewards multi-angle pincer/encirclement around Pacman using circular variance."""
-        if getattr(ghost, 'pacman_powered', False):
-            return 0.0
-        target = self._pac_target(ghost)
-        if target is None:
+        if getattr(ghost, 'pacman_powered', False) or target is None:
             return 0.0
         pr, pc = target
         angles = []
@@ -93,14 +84,10 @@ class RewardShaper:
             if dy == 0 and dx == 0:
                 continue
             dist = math.hypot(dy, dx)
-            # Only count ghosts within reasonable cordon radius (e.g. 15 units)
             if dist <= 15.0:
                 angles.append(math.atan2(dy, dx))
         if len(angles) < 2:
             return 0.0
-        # Circular variance = 1.0 - || mean unit vector ||
-        # If all ghosts approach from same angle, ||R|| = 1.0 -> variance = 0 (no bonus)
-        # If ghosts approach from opposite/flanking angles, ||R|| -> 0 -> variance = 1.0 (max bonus)
         N = len(angles)
         R = math.hypot(sum(math.cos(a) for a in angles) / N,
                        sum(math.sin(a) for a in angles) / N)
@@ -142,12 +129,13 @@ class RewardShaper:
         return 0.0
 
     def potential(self, ghost, all_ghosts) -> float:
-        return (self._phi_hunt(ghost) + 
-                self._phi_surround(ghost, all_ghosts) + 
+        target = self._pac_target(ghost)
+        return (self._phi_hunt(ghost, target) + 
+                self._phi_surround(ghost, all_ghosts, target) + 
                 self._phi_explore(ghost) + 
                 self._phi_belief(ghost) +
                 self._phi_dispersion(ghost, all_ghosts) +
-                self._phi_flee(ghost))
+                self._phi_flee(ghost, target))
 
     def shaping(self, ghost, all_ghosts) -> float:
         phi = self.potential(ghost, all_ghosts)

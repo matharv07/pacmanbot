@@ -24,6 +24,7 @@ import traceback
 import threading
 import queue
 from collections import defaultdict
+from datetime import datetime
 import requests
 
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
@@ -38,7 +39,7 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-NUM_ENVS        = 14       # Sized for 8-core / 16-thread CPU (14 sim workers + 2 threads for coordinator/training)
+NUM_ENVS        = int(os.environ.get("NUM_ENVS", "14"))       # Sized for 8-core / 16-thread CPU (14 sim workers + 2 threads for coordinator/training)
 ROLLOUT_STEPS   = int(os.environ.get("ROLLOUT_STEPS", "256"))
 MINI_BATCH      = 4096
 MICRO_BATCH     = 4096     # Gradient accumulation chunk size (takes full advantage of 16 GB VRAM)
@@ -60,7 +61,7 @@ K_NOMINATIONS   = 3
 LOG_DIR         = os.path.join(os.path.dirname(__file__), "logs")
 CKPT_DIR        = os.path.join(os.path.dirname(__file__), "checkpoints")
 BC_ANNEAL_UPDATES = 150
-BC_ADVANCE_GATE = 0.10
+BC_ADVANCE_GATE = 0.35
 TARGET_KL       = 0.05
 CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
@@ -223,31 +224,39 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
         conn.send(e)
         return
     while True:
-        cmd, data = conn.recv()
-        if cmd == "step":
-            if isinstance(data, tuple) and len(data) == 2:
-                a, bc_prob = data
-                result = env.step(a, bc_prob)
-            else:
-                result = env.step(data)
-            obs, rew, done, info = result
-            if done:
+        try:
+            cmd, data = conn.recv()
+            if cmd == "step":
+                if isinstance(data, tuple) and len(data) == 2:
+                    a, bc_prob = data
+                    result = env.step(a, bc_prob)
+                else:
+                    result = env.step(data)
+                obs, rew, done, info = result
+                if done:
+                    obs = env.reset()
+                    info["was_done"] = True
+                conn.send((obs, rew, done, info))
+            elif cmd == "reset":
                 obs = env.reset()
-                info["was_done"] = True
-            conn.send((obs, rew, done, info))
-        elif cmd == "reset":
-            obs = env.reset()
-            conn.send(obs)
-        elif cmd == "set_curriculum":
-            rows, cols, n_ghosts, n_power, static_pacman = data
-            env.world_height = float(rows)
-            env.world_width = float(cols)
-            env.num_ghosts = n_ghosts
-            env.n_power = n_power
-            env.static_pacman = static_pacman
-            obs = env.reset()
-            conn.send(obs)
-        elif cmd == "close":
+                conn.send(obs)
+            elif cmd == "set_curriculum":
+                rows, cols, n_ghosts, n_power, static_pacman = data
+                env.world_height = float(rows)
+                env.world_width = float(cols)
+                env.num_ghosts = n_ghosts
+                env.n_power = n_power
+                env.static_pacman = static_pacman
+                obs = env.reset()
+                conn.send(obs)
+            elif cmd == "close":
+                break
+        except Exception as e:
+            traceback.print_exc()
+            try:
+                conn.send(e)
+            except Exception:
+                pass
             break
 
 def _recv_unordered(conns, procs=None):
@@ -266,7 +275,10 @@ def _recv_unordered(conns, procs=None):
         for conn in ready:
             i = conn_to_idx[id(conn)]
             try:
-                results[i] = conn.recv()
+                msg = conn.recv()
+                if isinstance(msg, Exception):
+                    raise RuntimeError(f"Worker {i} raised exception: {msg}") from msg
+                results[i] = msg
             except EOFError:
                 if procs:
                     dead = [p.pid for p in procs if not p.is_alive()]
@@ -518,7 +530,8 @@ def train():
                                 mb_gsp_unique = b_gsp_unique[unique_ids]
                                 mb_c_pool = critic.encode_spatial(mb_gsp_unique)
                                 v_pred = critic.forward_from_pool(mb_c_pool[inv_idx], mb_cve).squeeze(-1)
-                                ratio = torch.exp(new_lp - mb_olp)
+                                log_ratio = torch.clamp(new_lp - mb_olp, -10.0, 10.0)
+                                ratio = torch.exp(log_ratio)
                                 with torch.no_grad():
                                     approx_kl = 0.5 * (new_lp - mb_olp).pow(2).mean()
                                     clip_fraction = (torch.abs(ratio - 1.0) > CLIP_EPS).float().mean()
@@ -541,7 +554,7 @@ def train():
                                     #mb_hs is the target heuristic speed
                                     #speed_params is (alpha, beta) of the predicted Beta
                                     #we can maximize log-prob of target speed:
-                                    target_speed = mb_hs[valid_bc].squeeze(-1).clamp(1e-4, 1.0 - 1e-4)
+                                    target_speed = mb_hs[valid_bc].squeeze(-1).clamp(0.05, 0.95)
                                     alpha = speed_params[valid_bc, 0]
                                     beta = speed_params[valid_bc, 1]
                                     dist_speed = torch.distributions.Beta(alpha, beta)
@@ -978,30 +991,34 @@ def train():
             if p_up == 1 or p_up % 10 == 0:
                 if p_up % 10 == 0:
                     threading.Thread(target=push_to_discord, args=(row,), daemon=True).start()
-                elapsed = res["wall_s"]
-                mins, secs = divmod(int(elapsed), 60)
-                hrs, mins = divmod(mins, 60)
-                runtime = f"{hrs}h {mins:02d}m {secs:02d}s" if hrs else f"{mins}m {secs:02d}s"
-                if res["lam_bc"] > 0.25:
-                    phase = "\033[95mHybrid RL + IL\033[0m"
-                elif res["lam_bc"] > 0.06:
-                    phase = "\033[93mIL → RL Transition\033[0m"
-                else:
-                    phase = "\033[92mReinforcement Learning\033[0m"
-                stg = curriculum.stage
-                cur_lr = opt_actor.param_groups[0]['lr']
-                print(f"\n┌─── Update {p_up:>5} / 50k ── {runtime} ─────────────────────────────────")
-                print(f"│  Phase: {phase}   Curriculum: Stage {curriculum.stage_idx} ({stg.rows}×{stg.cols}, {stg.n_ghosts}g)")
-                print(f"│  Episodes: {res['episodes']:<8}  Steps: {res['total_steps']:<10}  LR: {cur_lr:.2e}")
-                print(f"│  BC Coef:   {res['lam_bc']:.4f}    Policy Loss: {row['actor_loss']:>+.5f}")
-                print(f"│  BC Prob:   {res['bc_prob']:.4f} ({row['merge_rate']:.1%} merge)    Value Loss: {row['value_loss']:.5f}")
-                print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f} (KL: {row['approx_kl']:.4f}, Clip: {row['clip_frac']:.1%})")
-                ret_str = f"{row['mean_return']:.3f}" if row['mean_return'] is not None else "—"
-                pac_str = f"{row['pacman_score']:.1f}" if row['pacman_score'] is not None else "—"
-                kill_str = f"{row['kill_rate']:.1%}" if row.get('kill_rate') is not None else "—"
-                print(f"│  Ghost Return: {ret_str:<10}  Kill Rate: {kill_str:<8}  Pacman Score: {pac_str}")
-                print(f"│  Timings: Rollout {res['t_rollout']:.1f}s | PPO {res['t_ppo']:.1f}s")
-                print(f"└{'─'*64}")
+                try:
+                    elapsed = res["wall_s"]
+                    mins, secs = divmod(int(elapsed), 60)
+                    hrs, mins = divmod(mins, 60)
+                    runtime = f"{hrs}h {mins:02d}m {secs:02d}s" if hrs else f"{mins}m {secs:02d}s"
+                    if res["lam_bc"] > 0.25:
+                        phase = "\033[95mHybrid RL + IL\033[0m"
+                    elif res["lam_bc"] > 0.06:
+                        phase = "\033[93mIL → RL Transition\033[0m"
+                    else:
+                        phase = "\033[92mReinforcement Learning\033[0m"
+                    stg = curriculum.stage
+                    cur_lr = opt_actor.param_groups[0]['lr']
+                    print(f"\n┌─── Update {p_up:>5} / 50k ── {runtime} ─────────────────────────────────")
+                    print(f"│  Phase: {phase}   Curriculum: Stage {curriculum.stage_idx} ({stg.rows}×{stg.cols}, {stg.n_ghosts}g)")
+                    print(f"│  Episodes: {res['episodes']:<8}  Steps: {res['total_steps']:<10}  LR: {cur_lr:.2e}")
+                    print(f"│  BC Coef:   {res['lam_bc']:.4f}    Policy Loss: {row['actor_loss']:>+.5f}")
+                    print(f"│  BC Prob:   {res['bc_prob']:.4f} ({row['merge_rate']:.1%} merge)    Value Loss: {row['value_loss']:.5f}")
+                    print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f} (KL: {row['approx_kl']:.4f}, Clip: {row['clip_frac']:.1%})")
+                    ret_str = f"{row['mean_return']:.3f}" if row['mean_return'] is not None else "—"
+                    pac_str = f"{row['pacman_score']:.1f}" if row['pacman_score'] is not None else "—"
+                    kill_str = f"{row['kill_rate']:.1%}" if row.get('kill_rate') is not None else "—"
+                    print(f"│  Ghost Return: {ret_str:<10}  Kill Rate: {kill_str:<8}  Pacman Score: {pac_str}")
+                    print(f"│  Timings: Rollout {res['t_rollout']:.1f}s | PPO {res['t_ppo']:.1f}s")
+                    print(f"└{'─'*64}")
+                    sys.stdout.flush()
+                except (BrokenPipeError, OSError):
+                    pass
             if p_up % 100 == 0:
                 path = os.path.join(CKPT_DIR, f"ckpt_{p_up}.pt")
                 torch.save({"actor": actor.state_dict(),
@@ -1020,7 +1037,11 @@ def train():
                              "np_rng_state": np.random.get_state()}, path)
                 with open(log_path, "a") as f:
                     f.write(json.dumps({"checkpoint": path, "update": p_up}) + "\n")
-                print(f"  💾 Checkpoint saved: {path}")
+                try:
+                    print(f"  💾 Checkpoint saved: {path}")
+                    sys.stdout.flush()
+                except (BrokenPipeError, OSError):
+                    pass
         ret_rms.update(ds_ret)
         train_thread = threading.Thread(target=ppo_worker, args=(
             update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_olp, ds_adv, ds_ret,
@@ -1031,4 +1052,20 @@ def train():
     vec_env.close()
 
 if __name__ == "__main__":
-    train()
+    try:
+        train()
+    except Exception as e:
+        tb = traceback.format_exc()
+        try:
+            print(f"FATAL ERROR in training:\n{tb}", file=sys.stderr)
+        except Exception:
+            pass
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            crash_log = os.path.join(LOG_DIR, "crash.log")
+            with open(crash_log, "a") as f:
+                f.write(f"\n[{datetime.now().isoformat()}] CRASH on {os.uname().nodename}:\n{tb}\n")
+        except Exception:
+            pass
+        push_discord_warning(f"🚨 Training CRASHED on {os.uname().nodename}: {e}\n```{tb[-1500:]}```")
+        raise
