@@ -39,7 +39,7 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
 
 NUM_ENVS        = 14       # Sized for 8-core / 16-thread CPU (14 sim workers + 2 threads for coordinator/training)
-ROLLOUT_STEPS   = 256
+ROLLOUT_STEPS   = int(os.environ.get("ROLLOUT_STEPS", "256"))
 MINI_BATCH      = 4096
 MICRO_BATCH     = 4096     # Gradient accumulation chunk size (takes full advantage of 16 GB VRAM)
 ROLLOUT_INFER_CHUNK = 2048 # Max ghosts per rollout inference forward pass (optimized for 16 GB VRAM)
@@ -605,7 +605,8 @@ def train():
     current_returns = [0.0] * NUM_ENVS
     rollout_transfer = BatchTransfer(DEVICE)
     train_transfer   = BatchTransfer(DEVICE)
-    for update in range(start_update, 50_001):
+    max_updates = int(os.environ.get("MAX_UPDATES", "50001"))
+    for update in range(start_update, max_updates):
         anneal_frac = math.exp(-bc_decay_step / BC_ANNEAL_UPDATES)
         bc_prob = anneal_frac if anneal_frac >= 0.05 else 0.0
         # static_pacman transition removed: pacman moves dynamically from update 1
@@ -727,11 +728,12 @@ def train():
                         _eff_infer_chunk = new_chunk
                         if _eff_infer_chunk <= 8:
                             raise  #can't go lower, something else is wrong
-                idx_t = torch.cat(idx_chunks, dim=0)
-                lp_t  = torch.cat(lp_chunks, dim=0)
-                sc_t  = torch.cat(sc_chunks, dim=0)
-                spd_t = torch.cat(spd_chunks, dim=0)
-                spd_lp_t = torch.cat(spd_lp_chunks, dim=0)
+                idx_t = torch.cat(idx_chunks, dim=0).cpu().numpy()
+                lp_t  = torch.cat(lp_chunks, dim=0).float().cpu().numpy()
+                sc_t  = torch.cat(sc_chunks, dim=0).float().cpu().numpy()
+                spd_t = torch.cat(spd_chunks, dim=0).float().cpu().numpy()
+                spd_lp_t = torch.cat(spd_lp_chunks, dim=0).float().cpu().numpy()
+                val_all_np = val_all.float().cpu().numpy()
 
                 offset = 0
                 for e in range(NUM_ENVS):
@@ -740,17 +742,18 @@ def train():
                         continue
                     obs = vec_env.current_obs[e]
                     gids = obs[0]
-                    e_idx = idx_t[offset:offset + n_g].cpu().numpy()
-                    e_sc  = sc_t[offset:offset + n_g].cpu().numpy()
-                    e_lp  = lp_t[offset:offset + n_g].cpu().numpy()
-                    e_spd = spd_t[offset:offset + n_g].cpu().numpy()
-                    e_spd_lp = spd_lp_t[offset:offset + n_g].cpu().numpy()
-                    e_val = val_all[offset:offset + n_g].cpu().numpy()
+                    e_idx = idx_t[offset:offset + n_g]
+                    e_sc  = sc_t[offset:offset + n_g]
+                    e_lp  = lp_t[offset:offset + n_g]
+                    e_spd = spd_t[offset:offset + n_g]
+                    e_spd_lp = spd_lp_t[offset:offset + n_g]
+                    e_val = val_all_np[offset:offset + n_g]
                     env_act = {}
                     for i, gid in enumerate(gids):
                         pairs = [(int(x // stage.cols), int(x % stage.cols))
                                  for x in e_idx[i]]
-                        env_act[gid] = (pairs, e_sc[i], e_spd[i].item())
+                        spd_val = float(e_spd[i].item() if hasattr(e_spd[i], 'item') else e_spd[i])
+                        env_act[gid] = (pairs, e_sc[i], spd_val)
                     step_actions[e] = env_act
                     buf_actions[e].append(e_idx)
                     buf_speeds[e].append(e_spd)
@@ -810,11 +813,11 @@ def train():
             cat_cve = np.concatenate(boot_cve, axis=0)
             cat_vm = np.concatenate(boot_vm, axis=0)
             t_sp, t_gsp_unique, t_ve, t_cve, t_vm = rollout_transfer.transfer(cat_sp, cat_gsp_unique, cat_ve, cat_cve, cat_vm)
-            with torch.inference_mode():
+            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
                 #only the critic value is needed for bootstrap — actor call here was wasteful
                 val = _critic_value(critic_rollout, t_gsp_unique, t_cve, boot_n_ghosts)
                 val = ret_rms(val, unnorm=True)
-            v_np = val.cpu().numpy()
+            v_np = val.float().cpu().numpy()
             offset = 0
             gids_iter = iter(boot_gids_list)
             n_ghosts_iter = iter(boot_n_ghosts)
@@ -972,9 +975,9 @@ def train():
                              "np_rng_state": np.random.get_state()}, path)
                 with open(log_path, "a") as f:
                     f.write(json.dumps({"checkpoint": path, "update": p_up, "reason": "curriculum_advance"}) + "\n")
-                print(f"  💾 Checkpoint saved on curriculum advance: {path}")
-            if p_up % 10 == 0:
-                threading.Thread(target=push_to_discord, args=(row,), daemon=True).start()
+            if p_up == 1 or p_up % 10 == 0:
+                if p_up % 10 == 0:
+                    threading.Thread(target=push_to_discord, args=(row,), daemon=True).start()
                 elapsed = res["wall_s"]
                 mins, secs = divmod(int(elapsed), 60)
                 hrs, mins = divmod(mins, 60)

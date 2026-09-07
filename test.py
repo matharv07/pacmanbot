@@ -50,9 +50,9 @@ def _run_episode(actor, env, stage):
         t_vm = torch.from_numpy(vm_p)
         with torch.inference_mode():
             idx, lp, scores, _pool, _vec, speed, _speed_lp = actor(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
-        idx_np    = idx.numpy()
-        scores_np = scores.numpy()
-        speed_np  = speed.numpy()
+        idx_np    = idx.cpu().numpy()
+        scores_np = scores.float().cpu().numpy()
+        speed_np  = speed.float().cpu().numpy()
         action_dict = {}
         for i, gid in enumerate(gids):
             pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in idx_np[i]]
