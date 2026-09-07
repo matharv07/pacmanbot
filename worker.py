@@ -240,12 +240,14 @@ class Env:
                             done = True
                             if gid in rewards:
                                 rewards[gid] += 100.0
-                            TEAM_KILL_SHARE = 0.60   #60% of kill reward shared
+                            TEAM_KILL_BASE = 40.0
+                            TEAM_KILL_PROX = 40.0
                             for other_gid, other_ghost in self.ghosts.items():
                                 if other_gid != gid and not other_ghost.dead and other_gid in rewards:
                                     dist = math.hypot(other_ghost.y - self.player.y, other_ghost.x - self.player.x)
-                                    proximity_scale = math.exp(-dist / 5.0)
-                                    rewards[other_gid] += 100.0 * TEAM_KILL_SHARE * proximity_scale
+                                    # Decay slower for continuous space, base reward ensures credit assignment
+                                    proximity_scale = math.exp(-dist / 10.0)
+                                    rewards[other_gid] += TEAM_KILL_BASE + TEAM_KILL_PROX * proximity_scale
                             break
                 if not any(not g.dead for g in self.ghosts.values()):
                     done = True
@@ -278,14 +280,17 @@ class Env:
                 if self.ghosts[gid].dead:
                     continue
                 rewards[gid] -= step_cost    #per-frame step cost
-                speed_mult = getattr(self.ghosts[gid], 'current_speed_mult', 1.0)
-                active_task = self.ghosts[gid].cbba_agent.get_active_task()
-                is_hunting = (active_task is not None and int(active_task.task_type) == 0) or \
-                             (self.ghosts[gid].known_pacman is not None and not self.ghosts[gid].pacman_powered)
-                if not is_hunting:
-                    rewards[gid] -= 0.01 * speed_mult
+                conv = getattr(self.ghosts[gid], 'power_pellets_converted_this_frame', 0)
+                if conv > 0:
+                    rewards[gid] += 5.0 * conv
+                    self.ghosts[gid].power_pellets_converted_this_frame = 0
         for gid, g in self.ghosts.items():
             if not g.dead and gid in rewards:
-                rewards[gid] += self.shaper.shaping(g, self.ghosts)
+                if done:
+                    # For Ng et al. shaping, terminal potential must be 0
+                    rewards[gid] += (0.0 - self.shaper._prev.get(gid, 0.0))
+                else:
+                    rewards[gid] += self.shaper.shaping(g, self.ghosts)
         obs = self.observe() if not done else None
-        return obs, rewards, done, {"pacman_score": getattr(self.player, "score", 0), "heuristic_merges": info_heuristic_merges, "total_auctions": info_total_auctions}
+        pacman_caught = bool(getattr(self.player, "dead", False))
+        return obs, rewards, done, {"pacman_score": getattr(self.player, "score", 0), "heuristic_merges": info_heuristic_merges, "total_auctions": info_total_auctions, "pacman_caught": pacman_caught}

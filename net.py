@@ -161,8 +161,8 @@ class GhostActor(nn.Module):
         speeds = torch.clamp(speeds.squeeze(-1), 1e-4, 1.0 - 1e-4)
         speed_lp = dist_speed.log_prob(speeds)
         speed_ent = dist_speed.entropy()
-        logprobs = torch.stack(lp_list, 1).sum(1) + speed_lp
-        entropy  = torch.stack(ent_list, 1).mean(1) + speed_ent
+        logprobs = torch.stack(lp_list, 1).mean(1) + 0.1 * speed_lp
+        entropy  = torch.stack(ent_list, 1).mean(1) + 0.1 * speed_ent
         return logprobs, entropy, pool, vec, flat_clean, speed_params
 
 class GhostCritic(nn.Module):

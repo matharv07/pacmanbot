@@ -40,7 +40,7 @@ def _run_episode(actor, env, stage):
     while True:
         if obs is None:
             break
-        gids, sp, ve, vm, ht, global_sp, grid_shape = obs
+        gids, sp, ve, vm, ht, hs, global_sp, grid_shape = obs
         if not gids:
             break
         sp_p = _pad_spatial(sp.astype(np.float32), stage.rows, stage.cols)
@@ -49,13 +49,14 @@ def _run_episode(actor, env, stage):
         t_ve = torch.from_numpy(ve.astype(np.float32))
         t_vm = torch.from_numpy(vm_p)
         with torch.inference_mode():
-            idx, lp, scores, _pool, _vec = actor(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
+            idx, lp, scores, _pool, _vec, speed, _speed_lp = actor(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
         idx_np    = idx.numpy()
         scores_np = scores.numpy()
+        speed_np  = speed.numpy()
         action_dict = {}
         for i, gid in enumerate(gids):
             pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in idx_np[i]]
-            action_dict[gid] = (pairs, scores_np[i])
+            action_dict[gid] = (pairs, scores_np[i], float(speed_np[i].item()))
         obs, _rewards, done, info = env.step(action_dict, bc_prob=0.0)
         if done:
             surviving = sum(1 for g in env.ghosts.values() if not g.dead)
@@ -77,17 +78,18 @@ def _worker_chunk(ckpt_path: str, n_games: int, stage_override=None, seed_offset
     torch.manual_seed(seed_offset)
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     stage_idx = ckpt['curriculum']['stage_idx']
-    stage     = STAGES[stage_override] if stage_override is not None else STAGES[stage_idx]
+    eff_stage_idx = stage_override if stage_override is not None else stage_idx
+    stage     = STAGES[eff_stage_idx]
     actor = GhostActor().cpu()
     actor.load_state_dict(ckpt['actor'])
     actor.eval()
-    env = Env(env_id=seed_offset, num_ghosts=stage.n_ghosts, grid_rows=stage.rows, grid_cols=stage.cols, n_power=stage.n_power)
+    env = Env(env_id=seed_offset, num_ghosts=stage.n_ghosts, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     results = []
     for i in range(n_games):
         np.random.seed(seed_offset * 1000 + i)
         r = _run_episode(actor, env, stage)
         results.append(r)
-    return ckpt_path, stage_idx, stage, results
+    return ckpt_path, eff_stage_idx, stage, results
 
 def _aggregate(chunks):
     frames_all, surv_all, pac_all, caught_all = [], [], [], []
@@ -142,7 +144,7 @@ def main():
     ap.add_argument('--chunk',    type=int,  default=25,   help='Games per worker chunk (default: 25)')
     ap.add_argument('--workers',  type=int,  default=None, help='Max parallel workers (default: cpu count)')
     ap.add_argument('--ckpts',    type=int,  nargs='*',    help='Specific update numbers, e.g. 1100 1600')
-    ap.add_argument('--stage',    type=int,  default=4,    help='Force all checkpoints onto this stage index (default: 4 = 33x41 / 7 ghosts)')
+    ap.add_argument('--stage',    type=int,  default=None, help='Force all checkpoints onto this stage index (default: checkpoint native stage)')
     ap.add_argument('--ckpt_dir', type=str,  default='checkpoints', help='Checkpoint directory')
     args = ap.parse_args()
     ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), args.ckpt_dir)

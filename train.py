@@ -354,7 +354,7 @@ def train():
     stage = curriculum.stage
     print(f"Curriculum: starting at Stage {curriculum.stage_idx}\n({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts)")
     print("Initializing VecEnv (spawn before CUDA to prevent hang)...")
-    vec_env = VecEnv(NUM_ENVS, rows=stage.rows, cols=stage.cols, n_ghosts=stage.n_ghosts, n_power=stage.n_power, static_pacman=(CURRICULUM_START_STAGE == 0))
+    vec_env = VecEnv(NUM_ENVS, rows=stage.rows, cols=stage.cols, n_ghosts=stage.n_ghosts, n_power=stage.n_power, static_pacman=False)
     print("Initializing networks...")
     actor  = GhostActor().to(DEVICE)
     critic = GhostCritic().to(DEVICE)
@@ -410,14 +410,14 @@ def train():
             actor_rollout.load_state_dict(actor.state_dict())
             critic_rollout.load_state_dict(critic.state_dict())
             stage = curriculum.stage
-            vec_env.set_curriculum(curriculum.stage_idx, static_pacman=(start_update <= 50 and CURRICULUM_START_STAGE == 0))
+            vec_env.set_curriculum(curriculum.stage_idx, static_pacman=False)
             print(f"Resumed at update {start_update}, stage {curriculum.stage_idx} ({stage.rows}×{stage.cols}, {stage.n_ghosts}g)")
         else:
             print("No checkpoints found, starting from scratch.")
     print("VecEnv initialized. Starting training...")
     t0 = time.time()
 
-    def ppo_worker(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_act, b_spd, b_olp, b_adv, b_ret, lam_bc, anneal_frac, mean_ret, mean_pac, episodes, total_steps, t_rollout, t0_ref, bc_prob, realized_merge_rate, ret_rms):
+    def ppo_worker(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_act, b_spd, b_olp, b_adv, b_ret, lam_bc, anneal_frac, mean_ret, mean_pac, kill_rate, episodes, total_steps, t_rollout, t0_ref, bc_prob, realized_merge_rate, ret_rms):
         t_ppo_start = time.time()
         metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "approx_kl": 0, "clip_fraction": 0, "n_batches": 0}    
         N_total = b_sp.shape[0]
@@ -521,7 +521,7 @@ def train():
                                 #mb_hs is the target heuristic speed
                                 #speed_params is (alpha, beta) of the predicted Beta
                                 #we can maximize log-prob of target speed:
-                                target_speed = mb_hs[valid_bc].clamp(1e-4, 1.0 - 1e-4)
+                                target_speed = mb_hs[valid_bc].squeeze(-1).clamp(1e-4, 1.0 - 1e-4)
                                 alpha = speed_params[valid_bc, 0]
                                 beta = speed_params[valid_bc, 1]
                                 dist_speed = torch.distributions.Beta(alpha, beta)
@@ -580,6 +580,7 @@ def train():
         if critic_warmup_remaining > 0:
             critic_warmup_remaining -= 1
         result_queue.put({"update": update, "metrics": metrics,"mean_ret": mean_ret, "mean_pac": mean_pac,
+        "kill_rate": kill_rate,
         "episodes": episodes,"total_steps": total_steps, "t_rollout": t_rollout, "t_ppo": t_ppo, "lam_bc": lam_bc, "bc_prob": bc_prob, "realized_merge_rate": realized_merge_rate, "wall_s": round(time.time() - t0_ref, 1)})
     current_returns = [0.0] * NUM_ENVS
     rollout_transfer = BatchTransfer(DEVICE)
@@ -587,9 +588,7 @@ def train():
     for update in range(start_update, 50_001):
         anneal_frac = math.exp(-bc_decay_step / BC_ANNEAL_UPDATES)
         bc_prob = anneal_frac if anneal_frac >= 0.05 else 0.0
-        if update == 51 and CURRICULUM_START_STAGE == 0:
-            print("Transitioning to moving Pacman (static_pacman = False)...")
-            vec_env.set_curriculum(curriculum.stage_idx, static_pacman=False)
+        # static_pacman transition removed: pacman moves dynamically from update 1
         t_start_rollout = time.time()
         #per-env, per-step storage (lists of length ROLLOUT_STEPS)
         buf_spatial   = [[] for _ in range(NUM_ENVS)]
@@ -609,6 +608,7 @@ def train():
         buf_gids      = [[] for _ in range(NUM_ENVS)]
         ep_returns       = []
         ep_pacman_scores = []
+        ep_kills         = []
         ep_heuristic_merges = 0
         ep_total_auctions = 0
         for _ in range(ROLLOUT_STEPS):
@@ -736,7 +736,7 @@ def train():
                     step_actions[e] = env_act
                     buf_actions[e].append(e_idx)
                     buf_speeds[e].append(e_spd)
-                    buf_logprobs[e].append(e_lp.sum(axis=1) + e_spd_lp.squeeze(-1))
+                    buf_logprobs[e].append(e_lp.mean(axis=1) + 0.1 * e_spd_lp.squeeze(-1))
                     v_dict = {gids[i]: float(e_val[i]) for i in range(n_g)}
                     buf_values[e].append(v_dict)
                     offset += n_g
@@ -752,6 +752,7 @@ def train():
                     episodes += 1
                     ep_returns.append(current_returns[e])
                     ep_pacman_scores.append(info_list[e].get("pacman_score", 0))
+                    ep_kills.append(1.0 if info_list[e].get("pacman_caught", False) else 0.0)
                     ep_heuristic_merges += info_list[e].get("heuristic_merges", 0)
                     ep_total_auctions += info_list[e].get("total_auctions", 0)
                     current_returns[e] = 0.0
@@ -876,7 +877,8 @@ def train():
         t_rollout = time.time() - t_start_rollout
         mean_ret = round(float(np.mean(ep_returns)), 3) if ep_returns else None
         mean_pac = round(float(np.mean(ep_pacman_scores)), 1) if ep_pacman_scores else None
-        if update > 50 and mean_ret is not None:
+        kill_rate = round(float(np.mean(ep_kills)), 3) if ep_kills else 0.0
+        if mean_ret is not None:
             if ema_return == 0.0:
                 ema_return = mean_ret
             else:
@@ -908,6 +910,7 @@ def train():
                 "merge_rate": round(res["realized_merge_rate"], 4),
                 "mean_return": res["mean_ret"],
                 "pacman_score": res["mean_pac"],
+                "kill_rate": res.get("kill_rate", 0.0),
                 "curriculum_stage": curriculum.stage_idx,
                 "grid_size": f"{curriculum.stage.rows}x{curriculum.stage.cols}",
                 "lr":         opt_actor.param_groups[0]['lr'],
@@ -915,7 +918,7 @@ def train():
                 "t_ppo":      round(res["t_ppo"], 1)}
             with open(log_path, "a") as f:
                 f.write(json.dumps(row) + "\n")
-            curriculum.record_return(res["mean_ret"] if res["lam_bc"] <= BC_ADVANCE_GATE else None)
+            curriculum.record_return(res["mean_ret"] if res["lam_bc"] <= BC_ADVANCE_GATE else None, kill_rate=res.get("kill_rate", 0.0))
             if curriculum.should_advance():
                 curriculum.advance()
                 stage = curriculum.stage
@@ -923,8 +926,7 @@ def train():
                 print(f"CURRICULUM ADVANCE → Stage {curriculum.stage_idx} "
                       f"({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts)")
                 print(f"{'='*60}\n")
-                is_static_pacman = (p_up <= 50)
-                vec_env.set_curriculum(curriculum.stage_idx, static_pacman=is_static_pacman)
+                vec_env.set_curriculum(curriculum.stage_idx, static_pacman=False)
                 torch.cuda.empty_cache()
                 current_returns = [0.0] * NUM_ENVS
                 for pg in opt_actor.param_groups:
@@ -975,7 +977,8 @@ def train():
                 print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f} (KL: {row['approx_kl']:.4f}, Clip: {row['clip_frac']:.1%})")
                 ret_str = f"{row['mean_return']:.3f}" if row['mean_return'] is not None else "—"
                 pac_str = f"{row['pacman_score']:.1f}" if row['pacman_score'] is not None else "—"
-                print(f"│  Ghost Return: {ret_str:<10}  Pacman Score: {pac_str}")
+                kill_str = f"{row['kill_rate']:.1%}" if row.get('kill_rate') is not None else "—"
+                print(f"│  Ghost Return: {ret_str:<10}  Kill Rate: {kill_str:<8}  Pacman Score: {pac_str}")
                 print(f"│  Timings: Rollout {res['t_rollout']:.1f}s | PPO {res['t_ppo']:.1f}s")
                 print(f"└{'─'*64}")
             if p_up % 100 == 0:
@@ -1000,7 +1003,7 @@ def train():
         ret_rms.update(ds_ret)
         train_thread = threading.Thread(target=ppo_worker, args=(
             update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_olp, ds_adv, ds_ret,
-            lam_bc, anneal_frac, mean_ret, mean_pac, episodes, total_steps, t_rollout, t0, bc_prob, realized_merge_rate, ret_rms))
+            lam_bc, anneal_frac, mean_ret, mean_pac, kill_rate, episodes, total_steps, t_rollout, t0, bc_prob, realized_merge_rate, ret_rms))
         train_thread.start()
     if train_thread is not None:
         train_thread.join()

@@ -113,6 +113,7 @@ class Ghost:
         self._proximity_channel_target = None
         self._last_synced_map: dict[int, np.ndarray] = {}   # per-peer snapshot for delta sync
         self._tail_pacman_remaining = 0         #post-pop number of ghosts that will be tailing
+        self.power_pellets_converted_this_frame = 0
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False, speed_mult=1.0):
         self.frame += 1
@@ -155,19 +156,63 @@ class Ghost:
         active_task = self.cbba_agent.step(self, self.frame)
         if active_task and self.pacman_powered and active_task.task_type == TaskType.HUNT:
             active_task = None
-        #use tolerance-based comparison — target_pos is float, int() cast never matches
+        #use tolerance-based comparison
         if active_task is not None:
             tpr, tpc = active_task.target_pos
             if abs(self.y - tpr) < 0.5 and abs(self.x - tpc) < 0.5:
-                rounded_pos = (round(float(tpr), 2), round(float(tpc), 2))
-                key = (int(active_task.task_type), rounded_pos, getattr(active_task, 'owner', -1))
-                if key in self.cbba_agent.path: self.cbba_agent.path.remove(key)
-                if key in self.cbba_agent.bundle: self.cbba_agent.bundle.remove(key)
-                active_task = None
+                # If this is a pursuit task and Pacman is still in reach, dynamically track him rather than dropping task
+                is_hunt_task = (active_task.task_type in (TaskType.HUNT, TaskType.DYNAMIC))
+                pacman_in_reach = False
+                if self.known_pacman is not None and not self.pacman_powered:
+                    d_p = math.hypot(self.known_pacman[0] - self.y, self.known_pacman[1] - self.x)
+                    if d_p < 4.5:
+                        pacman_in_reach = True
+                if is_hunt_task and pacman_in_reach:
+                    active_task.target_pos = (float(self.known_pacman[0]), float(self.known_pacman[1]))
+                else:
+                    rounded_pos = (round(float(tpr), 2), round(float(tpc), 2))
+                    key = (int(active_task.task_type), rounded_pos, getattr(active_task, 'owner', -1))
+                    if key in self.cbba_agent.path: self.cbba_agent.path.remove(key)
+                    if key in self.cbba_agent.bundle: self.cbba_agent.bundle.remove(key)
+                    active_task = self.cbba_agent.get_active_task()
         desired_vx = 0.0
         desired_vy = 0.0
         moved = False
-        #power pellet area denial
+
+        dist_pac = 999.0
+        # 1. Dynamic Terminal Pursuit & Lead Interception (active when Pacman is in LOS or near)
+        if not moved and not self.pacman_powered and self.known_pacman:
+            pr, pc = self.known_pacman
+            pac_y, pac_x = float(pr), float(pc)
+            dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
+            if dist_pac < 4.5:
+                has_los = True
+                if self.world and hasattr(self.world, 'line_of_sight'):
+                    has_los = self.world.line_of_sight((self.x, self.y), (pac_x, pac_y), radius=self.radius, step_size=0.5)
+                if has_los:
+                    if dist_pac < 1.8:
+                        # Close-range direct capture
+                        if dist_pac > 0.01:
+                            desired_vx = (pac_x - self.x) / dist_pac
+                            desired_vy = (pac_y - self.y) / dist_pac
+                        moved = True
+                    else:
+                        # Corridor lead interception: project Pacman forward to cut off intersection
+                        p_dir = getattr(self, '_player_dir', (0, 0))
+                        lookahead = min(2.0, dist_pac * 0.45)
+                        lead_y = pac_y + p_dir[0] * lookahead
+                        lead_x = pac_x + p_dir[1] * lookahead
+                        if self.world and not self.world.is_passable(lead_x, lead_y, radius=self.radius):
+                            lead_y, lead_x = pac_y, pac_x
+                        d_lead = math.hypot(lead_y - self.y, lead_x - self.x)
+                        if d_lead > 0.01:
+                            desired_vx = (lead_x - self.x) / d_lead
+                            desired_vy = (lead_y - self.y) / d_lead
+                            moved = True
+                    if moved and hasattr(self, '_committed_path'):
+                        self._committed_path = []
+
+        # 2. Power pellet area denial
         if not moved and not self.pacman_powered and self.known_pacman:
             pr, pc = self.known_pacman
             for p_pos in (self.world.power_pellets if hasattr(self, 'world') and self.world else []):
@@ -185,55 +230,14 @@ class Ghost:
                     if is_closest:
                         active_task = type('DummyTask', (), {'target_pos': (p_r, p_c), 'task_type': -1})()
                         break
-        #chase override
-        CHASE_RADIUS = 5.0
+
+        # 3. Power pellet grab override
         GRAB_DIST = 2.0
-        dist_pac = 999
-        if not moved and not self.pacman_powered and self.known_pacman:
-            pr, pc = self.known_pacman
-            pac_y, pac_x = pr, pc
-            dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
-            if dist_pac < CHASE_RADIUS:
-                has_los = True
-                if self.world and hasattr(self.world, 'line_of_sight'):
-                    has_los = self.world.line_of_sight((self.x, self.y), (pac_x, pac_y), radius=self.radius, step_size=0.5)
-                closest_to_pac = True
-                nearby_ghosts = 1
-                for _gid, pos in self.known_agents.items():
-                    if pos != "UNKNOWN":
-                        d_other = math.hypot(pos[0] + 0.5 - pac_y, pos[1] + 0.5 - pac_x)
-                        if d_other < dist_pac:
-                            closest_to_pac = False
-                        if math.hypot(pos[0] - self.y, pos[1] - self.x) <= 6:
-                            nearby_ghosts += 1
-                self._tail_pacman_remaining = 2 if nearby_ghosts <= 2 else 0
-                if closest_to_pac and has_los:
-                    self.cbba_agent.bundle.clear()
-                    self.cbba_agent.path.clear()
-                    active_task = None
-                    if dist_pac > 0:
-                        desired_vx = (pac_x - self.x) / dist_pac
-                        desired_vy = (pac_y - self.y) / dist_pac
-                    moved = True
-                else:
-                    tr, tc = pr, pc
-                    if not closest_to_pac:
-                        dr = pr - self.prev_pac_row if self.prev_pac_row >= 0 else 0
-                        dc = pc - self.prev_pac_col if self.prev_pac_col >= 0 else 0
-                        dr = max(-1, min(1, dr))
-                        dc = max(-1, min(1, dc))
-                        if abs(dr) + abs(dc) > 0:
-                            tr = pr + dr * 4
-                            tc = pc + dc * 4
-                    active_task = type('DummyTask', (), {'target_pos': (int(tr), int(tc)), 'task_type': -1})()
-        #power pellet grab override
-        if not moved and (not self.known_pacman or self.pacman_powered or dist_pac > CHASE_RADIUS):
-            r, c = int(self.y), int(self.x)
+        if not moved and (not self.known_pacman or self.pacman_powered or dist_pac > 4.5):
             best_power = None
             best_pd = float('inf')
             power_arr = getattr(self.world, 'power_pellets_arr', None)
             if power_arr is not None and len(power_arr) > 0:
-                # power_arr stores (x, y)
                 dist = np.hypot(power_arr[:, 0] - self.x, power_arr[:, 1] - self.y)
                 valid_mask = dist < 3.5
                 if np.any(valid_mask):
@@ -253,32 +257,8 @@ class Ghost:
                 moved = True
                 if hasattr(self, '_committed_path'):
                     self._committed_path = []
-        #tailing
-        if not moved and self._tail_pacman_remaining > 0:
-            if self.known_pacman and not self.pacman_powered:
-                pr, pc = self.known_pacman
-                pac_y, pac_x = float(pr), float(pc)
-                dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
-                if dist_pac > 0:
-                    desired_vx = (pac_x - self.x) / dist_pac
-                    desired_vy = (pac_y - self.y) / dist_pac
-                moved = True
-                self._tail_pacman_remaining -= 1
-                if hasattr(self, '_committed_path'):
-                    self._committed_path = []
-            else:
-                self._tail_pacman_remaining = 0
-        #belief-map coordinated search
-        if not moved and self.known_pacman is None and active_task is None:
-            if self.belief_map._initialised and self.belief_map._open_cells:
-                probs = self.belief_map._b_flat.tolist()
-                if probs:
-                    max_p = max(probs)
-                    if max_p > 1e-4:
-                        best_idx = probs.index(max_p)
-                        best_r, best_c = self.belief_map._open_cells[best_idx]
-                        active_task = type('DummyTask', (), {'target_pos': (best_r, best_c), 'task_type': -1})()
-        #normal task execution
+
+        # 4. Normal task execution via A*
         if not moved and active_task is not None:
             target = active_task.target_pos
             replan = False
@@ -313,20 +293,56 @@ class Ghost:
                         desired_vx = dx / d
                         desired_vy = dy / d
                 moved = True
+
+        # 5. Belief-guided search (NO random wandering when Pacman or belief peak is known)
+        if not moved and active_task is None:
+            if self.known_pacman is not None and not self.pacman_powered:
+                pr, pc = self.known_pacman
+                from pathfinder import astar
+                full_path = astar(self.world, (float(self.y), float(self.x)), (float(pr), float(pc)))
+                if len(full_path) >= 2:
+                    self._committed_path = full_path[1:]
+                    self._committed_target = (pr, pc)
+                    target_y, target_x = self._committed_path[0]
+                    dx, dy = target_x - self.x, target_y - self.y
+                    d = math.hypot(dx, dy)
+                    if d > 0:
+                        desired_vx = dx / d
+                        desired_vy = dy / d
+                        moved = True
+            elif self.belief_map._initialised and self.belief_map._open_cells:
+                probs = self.belief_map._b_flat.tolist()
+                if probs:
+                    max_p = max(probs)
+                    if max_p > 1e-4:
+                        best_idx = probs.index(max_p)
+                        best_r, best_c = self.belief_map._open_cells[best_idx]
+                        from pathfinder import astar
+                        full_path = astar(self.world, (float(self.y), float(self.x)), (float(best_r), float(best_c)))
+                        if len(full_path) >= 2:
+                            self._committed_path = full_path[1:]
+                            self._committed_target = (best_r, best_c)
+                            target_y, target_x = self._committed_path[0]
+                            dx, dy = target_x - self.x, target_y - self.y
+                            d = math.hypot(dx, dy)
+                            if d > 0:
+                                desired_vx = dx / d
+                                desired_vy = dy / d
+                                moved = True
+
         self.in_fallback_mode = not moved
-        #fallback
+        # 6. Fallback (maintain forward momentum along corridor instead of spinning)
         if not moved:
             if hasattr(self, '_committed_path'):
                 self._committed_path = []
-            if random.random() < 0.1 or (self.vx == 0 and self.vy == 0):
+            cur_speed = math.hypot(self.vx, self.vy)
+            if cur_speed > 0.01:
+                desired_vx = self.vx / cur_speed
+                desired_vy = self.vy / cur_speed
+            else:
                 angle = random.uniform(0, 2*math.pi)
                 desired_vx = math.cos(angle)
                 desired_vy = math.sin(angle)
-            else:
-                cur_speed = math.hypot(self.vx, self.vy)
-                if cur_speed > 0:
-                    desired_vx = self.vx / cur_speed
-                    desired_vy = self.vy / cur_speed
         #context steering and momentum — cached every 3 frames to reduce jitter/CPU load
         _STEER_CACHE_TTL = 3
         best_vx, best_vy = desired_vx, desired_vy
@@ -422,6 +438,7 @@ class Ghost:
                     self.known_power_pellets.discard(pt)
                     if pt not in self.known_pellets:
                         self.known_pellets.add(pt)
+                    self.power_pellets_converted_this_frame += 1
                     # broadcast both events: power_eaten (removes from others' known_power_pellets)
                     # and pellet (adds to others' known_pellets)
                     self._broadcast([("power_eaten", pt), ("pellet", pt)], all_ghosts)
