@@ -83,6 +83,8 @@ class Ghost:
         self.last_dir = random.choice(DIRS)
         self.known_pellets = set()
         self.known_power_pellets = set()
+        self.eaten_pellets = set()
+        self.eaten_power_pellets = set()
         self.lidar_memory = set()
         self.prm_last_seen = {n: -1 for n in getattr(world, 'prm_nodes', [])}
         self.prm_known_count = 0
@@ -211,8 +213,8 @@ class Ghost:
                         self._committed_path = []
         if not moved and not self.pacman_powered and self.known_pacman:
             pr, pc = self.known_pacman
-            for p_pos in (self.world.power_pellets if hasattr(self, 'world') and self.world else []):
-                p_r, p_c = float(p_pos[0]), float(p_pos[1])
+            for p_pos in list(self.known_power_pellets):
+                p_r, p_c = float(p_pos[1]), float(p_pos[0])
                 dist_pac_to_power = abs(pr - p_r) + abs(pc - p_c)
                 if dist_pac_to_power < 8:
                     my_dist = abs(self.y - p_r) + abs(self.x - p_c)
@@ -220,7 +222,7 @@ class Ghost:
                     for _gid, pos in self.known_agents.items():
                         if pos != "UNKNOWN":
                             other_dist = abs(pos[0] - p_r) + abs(pos[1] - p_c)
-                            if other_dist < my_dist:
+                            if other_dist < my_dist - 0.5:
                                 is_closest = False
                                 break
                     if is_closest:
@@ -409,7 +411,8 @@ class Ghost:
             for _ in range(steps):
                 self.x += step_vx
                 self.y += step_vy
-                self.x, self.y = self.world.resolve_collision(self.x, self.y, self.radius, max_iters=3)
+                self.x, self.y, self.vx, self.vy = self.world.resolve_collision(
+                    self.x, self.y, self.radius, max_iters=3, vx=self.vx, vy=self.vy)
                 self.path_this_frame.append((self.x, self.y))
         power_arr = getattr(self.world, 'power_pellets_arr', None)
         if power_arr is not None and len(power_arr) > 0:
@@ -434,6 +437,7 @@ class Ghost:
                         if hasattr(self.world, '_update_pellet_arrays'):
                             self.world._update_pellet_arrays()
                     self.known_power_pellets.discard(pt)
+                    self.eaten_power_pellets.add(pt)
                     if pt not in self.known_pellets:
                         self.known_pellets.add(pt)
                     self.power_pellets_converted_this_frame += 1
@@ -524,7 +528,7 @@ class Ghost:
                         pt = find_closest_pellet(p, self.world, is_power=False)
                         if pt is None:
                             pt = tuple(p)
-                        if pt not in self.known_pellets:
+                        if pt not in self.known_pellets and pt not in self.eaten_pellets:
                             self.known_pellets.add(pt)
                             pellet_diffs.append(("pellet", pt))
         power_arr = getattr(self.world, 'power_pellets_arr', None)
@@ -540,9 +544,46 @@ class Ghost:
                         pt = find_closest_pellet(p, self.world, is_power=True)
                         if pt is None:
                             pt = tuple(p)
-                        if pt not in self.known_power_pellets:
+                        if pt not in self.known_power_pellets and pt not in self.known_pellets and pt not in self.eaten_power_pellets:
                             self.known_power_pellets.add(pt)
                             pellet_diffs.append(("power", pt))
+        # Decentralized missing-pellet detection via LOS raycast:
+        if self.known_pellets:
+            known_list = list(self.known_pellets)
+            k_arr = np.array(known_list, dtype=np.float32)
+            k_dx = k_arr[:, 0] - self.x
+            k_dy = k_arr[:, 1] - self.y
+            k_in_range = (k_dx*k_dx + k_dy*k_dy) <= (MAX_RAY_DIST * MAX_RAY_DIST)
+            if np.any(k_in_range):
+                cand_pts = k_arr[k_in_range]
+                cand_orig = [known_list[idx] for idx in np.where(k_in_range)[0]]
+                is_los = self.world.batch_line_of_sight((self.x, self.y), cand_pts, radius=0, step_size=0.5)
+                world_pellet_set = getattr(self.world, 'pellet_set', None)
+                if world_pellet_set is None:
+                    world_pellet_set = set(getattr(self.world, 'pellets', []))
+                for pt, los in zip(cand_orig, is_los):
+                    if los and pt not in world_pellet_set:
+                        self.known_pellets.discard(pt)
+                        self.eaten_pellets.add(pt)
+                        pellet_diffs.append(("pellet_eaten", pt))
+        if self.known_power_pellets:
+            p_list = list(self.known_power_pellets)
+            p_arr = np.array(p_list, dtype=np.float32)
+            p_dx = p_arr[:, 0] - self.x
+            p_dy = p_arr[:, 1] - self.y
+            p_in_range = (p_dx*p_dx + p_dy*p_dy) <= (MAX_RAY_DIST * MAX_RAY_DIST)
+            if np.any(p_in_range):
+                cand_pts = p_arr[p_in_range]
+                cand_orig = [p_list[idx] for idx in np.where(p_in_range)[0]]
+                is_los = self.world.batch_line_of_sight((self.x, self.y), cand_pts, radius=0, step_size=0.5)
+                world_power_set = getattr(self.world, 'power_pellet_set', None)
+                if world_power_set is None:
+                    world_power_set = set(getattr(self.world, 'power_pellets', []))
+                for pt, los in zip(cand_orig, is_los):
+                    if los and pt not in world_power_set:
+                        self.known_power_pellets.discard(pt)
+                        self.eaten_power_pellets.add(pt)
+                        pellet_diffs.append(("power_eaten", pt))
         agent_diffs = []
         alive_ghosts = []
         alive_gids = []
@@ -637,15 +678,6 @@ class Ghost:
             self.belief_map.diffuse((float(self.y), float(self.x)), self.known_pellets, self.known_power_pellets)
         pac_pos = (float(pr), float(pc)) if pacman_in_los else None
         self.belief_map.observe_clear(visible_belief_idxs, impassable_belief_nodes, pac_pos)
-        #cleanup eaten pellets from memory
-        world_pellets = getattr(self.world, 'pellet_set', None)
-        if world_pellets is None:
-            world_pellets = set(getattr(self.world, 'pellets', []))
-        world_power_pellets = getattr(self.world, 'power_pellet_set', None)
-        if world_power_pellets is None:
-            world_power_pellets = set(getattr(self.world, 'power_pellets', []))
-        self.known_pellets.intersection_update(world_pellets)
-        self.known_power_pellets.intersection_update(world_power_pellets)
         self._last_visible_belief_idxs = visible_belief_idxs
         return diffs, newly_discovered, stale_refreshed
 
@@ -682,14 +714,24 @@ class Ghost:
                 sync_diffs.append(("prm_refresh", n))
         tgt_pellets = getattr(target_ghost, 'known_pellets', None)
         if tgt_pellets is None: tgt_pellets = set()
+        tgt_eaten = getattr(target_ghost, 'eaten_pellets', None)
+        if tgt_eaten is None: tgt_eaten = set()
         for p in self.known_pellets:
-            if p not in tgt_pellets:
+            if p not in tgt_pellets and p not in tgt_eaten:
                 sync_diffs.append(("pellet", p)) 
+        for p in self.eaten_pellets:
+            if p not in tgt_eaten:
+                sync_diffs.append(("pellet_eaten", p))
         tgt_power = getattr(target_ghost, 'known_power_pellets', None)
         if tgt_power is None: tgt_power = set()
+        tgt_power_eaten = getattr(target_ghost, 'eaten_power_pellets', None)
+        if tgt_power_eaten is None: tgt_power_eaten = set()
         for p in self.known_power_pellets:
-            if p not in tgt_power:
+            if p not in tgt_power and p not in tgt_power_eaten:
                 sync_diffs.append(("power", p))        
+        for p in self.eaten_power_pellets:
+            if p not in tgt_power_eaten:
+                sync_diffs.append(("power_eaten", p))
         tgt_lidar = getattr(target_ghost, 'lidar_memory', None)
         if tgt_lidar is None: tgt_lidar = set()
         for w in self.lidar_memory:
@@ -739,18 +781,26 @@ class Ghost:
                         relay_diffs.append(diff)
                 elif dtype == "pellet":
                     _, p = diff
-                    if p not in self.known_pellets:
+                    if p not in self.known_pellets and p not in self.eaten_pellets:
                         self.known_pellets.add(p)
+                        relay_diffs.append(diff)
+                elif dtype == "pellet_eaten":
+                    _, p = diff
+                    self.known_pellets.discard(p)
+                    if p not in self.eaten_pellets:
+                        self.eaten_pellets.add(p)
                         relay_diffs.append(diff)
                 elif dtype == "power":
                     _, p = diff
-                    if p not in self.known_power_pellets and p not in self.known_pellets:
+                    if p not in self.known_power_pellets and p not in self.known_pellets and p not in self.eaten_power_pellets:
                         self.known_power_pellets.add(p)
                         relay_diffs.append(diff)
                 elif dtype == "power_eaten":
                     _, p = diff
                     self.known_power_pellets.discard(p)
-                    relay_diffs.append(diff)
+                    if p not in self.eaten_power_pellets:
+                        self.eaten_power_pellets.add(p)
+                        relay_diffs.append(diff)
                 elif dtype == "wall":
                     _, w = diff
                     if w not in self.lidar_memory:
