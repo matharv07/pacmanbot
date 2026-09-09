@@ -15,7 +15,7 @@ def _connect_temp_nodes_batch(world, nodes_list):
     misses = []
     results_map = {}
     for i, origin in enumerate(nodes_list):
-        origin_tup = (round(origin[0], 1), round(origin[1], 1))
+        origin_tup = (round(origin[0], 2), round(origin[1], 2))
         if origin_tup in world._conn_cache:
             results_map[i] = world._conn_cache[origin_tup]
         else:
@@ -68,10 +68,8 @@ def _connect_temp_nodes_batch(world, nodes_list):
                 res = (clear_dists, clear_indices)
             world._conn_cache[origin_tup] = res
             results_map[i] = res
-    if len(world._conn_cache) > 8000:
-        keys_to_del = list(world._conn_cache.keys())[:4000]
-        for k in keys_to_del:
-            del world._conn_cache[k]
+    if len(world._conn_cache) > 5000:
+        world._conn_cache.clear()
     for i in range(len(nodes_list)):
         results.append(results_map[i])
     return results

@@ -404,23 +404,9 @@ def train():
     ema_return   = 0.0
     bc_decay_step = 0
     if "--resume" in sys.argv:
-        r_idx = sys.argv.index("--resume")
-        target_ckpt = None
-        if r_idx + 1 < len(sys.argv) and not sys.argv[r_idx + 1].startswith("--"):
-            val = sys.argv[r_idx + 1]
-            if os.path.exists(val):
-                target_ckpt = val
-            elif os.path.exists(os.path.join(CKPT_DIR, val)):
-                target_ckpt = os.path.join(CKPT_DIR, val)
-            elif os.path.exists(os.path.join(CKPT_DIR, f"ckpt_{val}.pt")):
-                target_ckpt = os.path.join(CKPT_DIR, f"ckpt_{val}.pt")
-            else:
-                matches = sorted(glob.glob(os.path.join(CKPT_DIR, f"ckpt_{val}_*.pt")))
-                if matches:
-                    target_ckpt = matches[0]
         ckpts = sorted(glob.glob(os.path.join(CKPT_DIR, "ckpt_*.pt")), key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[1]))
-        ckpt_path = target_ckpt if target_ckpt else (ckpts[-1] if ckpts else None)
-        if ckpt_path:
+        if ckpts:
+            ckpt_path = ckpts[-1]
             print(f"Resuming from {ckpt_path} ...")
             ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
             actor.load_state_dict(ckpt["actor"])

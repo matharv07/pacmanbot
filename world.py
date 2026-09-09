@@ -282,12 +282,11 @@ class World:
             blocked = np.zeros_like(px, dtype=bool)
         return blocked.reshape((rows, cols))
 
-    def resolve_collision(self, px, py, radius, max_iters=10, vx=None, vy=None):
+    def resolve_collision(self, px, py, radius, max_iters=10):
         # reuse class-level scratch to avoid per-call numpy allocation
         if not hasattr(self, '_rc_px'):
             self._rc_px = np.empty((1,), dtype=np.float32)
             self._rc_py = np.empty((1,), dtype=np.float32)
-        has_vel = (vx is not None and vy is not None)
         for _ in range(max_iters):
             if len(self.compiled_segments) == 0:
                 break
@@ -323,17 +322,10 @@ class World:
                 overlap = buffer - min_dist
                 px += nx * overlap
                 py += ny * overlap
-                if has_vel:
-                    v_dot_n = vx * nx + vy * ny
-                    if v_dot_n < 0:
-                        vx -= v_dot_n * nx
-                        vy -= v_dot_n * ny
             else:
                 break
         px = max(radius, min(self.width - radius, px))
         py = max(radius, min(self.height - radius, py))
-        if has_vel:
-            return px, py, vx, vy
         return px, py
 
     def generate(self, n_obstacles=25, complexity=2):
