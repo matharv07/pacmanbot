@@ -230,6 +230,12 @@ class Env:
         rewards = {gid: 0.0 for gid in alive}
         done = False
         pred_samples = []
+        prev_dists = {}
+        near_miss = set()
+        for gid in alive:
+            g = self.ghosts[gid]
+            if not g.dead:
+                prev_dists[gid] = math.hypot(g.y - self.player.y, g.x - self.player.x)
         for _ in range(DECISION_INTERVAL):
             self.frame += 1
             self.player.update(self.ghosts)
@@ -344,7 +350,8 @@ class Env:
                         #attenuated proximity reward to avoid disincentivizing catch completion
                         prox = 0.05 * math.exp(-dist / 3.0)
                         rewards[gid_prox] += prox
-
+                        if dist < 2.0:
+                            near_miss.add(gid_prox)
             step_cost = 0.01   #uniform per-frame step cost across all grid sizes
             for gid in rewards:
                 if self.ghosts[gid].dead:
@@ -354,6 +361,45 @@ class Env:
                 if conv > 0:
                     rewards[gid] += 10.0 * conv
                     self.ghosts[gid].power_pellets_converted_this_frame = 0
+        #distance-closing bonus per decision interval
+        if not done:
+            for gid in alive:
+                g = self.ghosts[gid]
+                if g.dead or gid not in prev_dists or gid not in rewards:
+                    continue
+                if not self.player.powered:
+                    curr_dist = math.hypot(g.y - self.player.y, g.x - self.player.x)
+                    delta_dist = prev_dists[gid] - curr_dist
+                    if delta_dist > 0:
+                        rewards[gid] += 0.5 * delta_dist
+        #near-miss bonus (ghost got within 2.0 cells without killing)
+        for gid in near_miss:
+            if gid in rewards and not self.ghosts[gid].dead:
+                rewards[gid] += 5.0
+        #coordination reward (2+ ghosts flanking Pacman from different angles)
+        if not done and not self.player.dead and not self.player.powered:
+            close_ghosts = []
+            for gid in alive:
+                g = self.ghosts[gid]
+                if g.dead:
+                    continue
+                dist = math.hypot(g.y - self.player.y, g.x - self.player.x)
+                if dist <= 5.0:
+                    angle = math.atan2(g.y - self.player.y, g.x - self.player.x)
+                    close_ghosts.append((gid, angle))
+            if len(close_ghosts) >= 2:
+                angles = [a for _, a in close_ghosts]
+                max_spread = 0.0
+                for i in range(len(angles)):
+                    for j in range(i + 1, len(angles)):
+                        diff = abs(angles[i] - angles[j])
+                        if diff > math.pi:
+                            diff = 2 * math.pi - diff
+                        max_spread = max(max_spread, diff)
+                if max_spread > math.pi / 2:  # > 90 degrees
+                    for gid, _ in close_ghosts:
+                        if gid in rewards:
+                            rewards[gid] += 2.0
         for gid, g in self.ghosts.items():
             if gid not in rewards:
                 continue
