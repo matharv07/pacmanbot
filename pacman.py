@@ -69,6 +69,11 @@ LEFT  = ( 0, -1)
 RIGHT = ( 0,  1)
 DIRS  = [UP, DOWN, LEFT, RIGHT]
 
+_NUM_STEERING_RAYS = 16
+_STEERING_ANGLES = np.linspace(0, 2 * math.pi, _NUM_STEERING_RAYS, endpoint=False)
+_STEERING_RAY_VX = np.cos(_STEERING_ANGLES)
+_STEERING_RAY_VY = np.sin(_STEERING_ANGLES)
+
 AUTO_MODE = True
 RL_MODE = True
 TOGGLE_WIDTH, TOGGLE_HEIGHT = 160, 32
@@ -217,7 +222,9 @@ class Player:
                     if gd < 4:
                         danger += (4 - gd) * 15.0
             orig_tgt = (tgt[1], tgt[0])
-            weight = 0.5 if orig_tgt in self.world.power_pellets else 1.5
+            power_set = getattr(self.world, 'power_pellet_set', None)
+            is_power = (orig_tgt in power_set) if power_set is not None else (orig_tgt in self.world.power_pellets)
+            weight = 0.5 if is_power else 1.5
             score = dist * weight + danger
             if score < best_score:
                 best_score = score
@@ -225,6 +232,12 @@ class Player:
                 best_path = path[1:]
         if not best_target and targets:
             best_target = (targets[0][1], targets[0][0])
+        if best_target is not None and self.world:
+            full_path = pathfinder.astar(self.world, start, (best_target[1], best_target[0]))
+            if len(full_path) >= 2:
+                best_path = list(full_path[1:])
+            elif not best_path:
+                best_path = [(best_target[1], best_target[0])]
         return best_target, best_path
 
     def update(self, ghosts):
@@ -267,7 +280,12 @@ class Player:
             target_eaten = False
             if self._route_target is not None and not self.powered:
                 if self.world:
-                    target_eaten = (self._route_target not in self.world.pellets and self._route_target not in self.world.power_pellets)
+                    pellet_set = getattr(self.world, 'pellet_set', None)
+                    power_pellet_set = getattr(self.world, 'power_pellet_set', None)
+                    if pellet_set is not None and power_pellet_set is not None:
+                        target_eaten = (self._route_target not in pellet_set and self._route_target not in power_pellet_set)
+                    else:
+                        target_eaten = (self._route_target not in self.world.pellets and self._route_target not in self.world.power_pellets)
                 else:
                     tr, tc = int(self._route_target[0]), int(self._route_target[1])
                     if 0 <= tr < len(self.grid) and 0 <= tc < len(self.grid[0]):
@@ -308,14 +326,13 @@ class Player:
             speed_mult = 1.0        #1.0 so that nominal motion is at max speed
             best_score = -float('inf')
             best_vx, best_vy = desired_vx, desired_vy
-            num_rays = 16           #context steering for wall avoidance
+            num_rays = _NUM_STEERING_RAYS
             current_speed = self.max_speed * speed_mult
             cur_speed_mag = math.hypot(self.vx, self.vy) + 1e-6
             cur_vx_norm = self.vx / cur_speed_mag
             cur_vy_norm = self.vy / cur_speed_mag
-            angles = np.linspace(0, 2*math.pi, num_rays, endpoint=False)
-            ray_vx_arr = np.cos(angles)
-            ray_vy_arr = np.sin(angles)
+            ray_vx_arr = _STEERING_RAY_VX
+            ray_vy_arr = _STEERING_RAY_VY
             check_dist_max = current_speed * 1.5 + self.radius
             n_steps = max(2, int(math.ceil(check_dist_max / 0.2)))
             fracs = np.linspace(1/n_steps, 1.0, n_steps)
@@ -439,8 +456,25 @@ class Player:
                             self.power_timer = 40
                         collected_anything = True
         if collected_anything:
-            self._route = []
-            self._route_target = None
+            target_cleared = False
+            if self.powered and not self._route_power_state:
+                target_cleared = True
+            elif self._route_target is not None:
+                if self.world:
+                    pellet_set = getattr(self.world, 'pellet_set', None)
+                    power_pellet_set = getattr(self.world, 'power_pellet_set', None)
+                    if pellet_set is not None and power_pellet_set is not None:
+                        if self._route_target not in pellet_set and self._route_target not in power_pellet_set:
+                            target_cleared = True
+                    elif self._route_target not in self.world.pellets and self._route_target not in self.world.power_pellets:
+                        target_cleared = True
+                else:
+                    tr, tc = int(self._route_target[0]), int(self._route_target[1])
+                    if not (0 <= tr < len(self.grid) and 0 <= tc < len(self.grid[0])) or self.grid[tr][tc] not in (PELLET, POWER):
+                        target_cleared = True
+            if target_cleared:
+                self._route = []
+                self._route_target = None
         self.mouth_tick += 1
         if self.mouth_tick >= 3:
             self.mouth_tick = 0

@@ -68,10 +68,14 @@ class World:
         self.resolution = resolution
         self.safe_area = []
         self.prm_nodes_arr = np.empty((0, 2), dtype=np.float32)
+        self.pellets_tuples = []
+        self.power_pellets_tuples = []
         self.pellets_arr = np.empty((0, 2), dtype=np.float32)
         self.power_pellets_arr = np.empty((0, 2), dtype=np.float32)
 
     def _update_pellet_arrays(self):
+        self.pellets_tuples = list(self.pellets) if self.pellets else []
+        self.power_pellets_tuples = list(self.power_pellets) if self.power_pellets else []
         self.pellets_arr = np.array(self.pellets, dtype=np.float32) if self.pellets else np.empty((0, 2), dtype=np.float32)
         self.power_pellets_arr = np.array(self.power_pellets, dtype=np.float32) if self.power_pellets else np.empty((0, 2), dtype=np.float32)
         self.pellet_set = set(self.pellets)
@@ -152,8 +156,8 @@ class World:
             res = 0.1
             cols = self._grid_0_0.shape[1]
             rows = self._grid_0_0.shape[0]
-            cx = (px / res).astype(np.int32)
-            cy = (py / res).astype(np.int32)
+            cx = (px * 10.0).astype(np.int32)
+            cy = (py * 10.0).astype(np.int32)
             valid = (cx >= 0) & (cx < cols) & (cy >= 0) & (cy < rows)
             if abs(radius - 0.4) < 1e-4:
                 grid = self._grid_0_4
@@ -203,14 +207,12 @@ class World:
         dx = p2s[:, 0] - p1[0]
         dy = p2s[:, 1] - p1[1]
         dist = np.hypot(dx, dy)
-        n_steps_arr = np.maximum(2, np.ceil(dist / step_size).astype(int))
-        total_steps = np.sum(n_steps_arr)
-        indices = np.repeat(np.arange(len(p2s)), n_steps_arr)
-        ones = np.ones(total_steps, dtype=int)
-        start_idx = np.cumsum(n_steps_arr) - n_steps_arr
-        ones[start_idx] = 1 - np.roll(n_steps_arr, 1)
-        ones[0] = 0
-        local_idx = np.cumsum(ones)
+        n_steps_arr = np.maximum(2, np.ceil(dist / step_size).astype(np.int32))
+        total_steps = int(np.sum(n_steps_arr))
+        indices = np.repeat(np.arange(len(p2s), dtype=np.int32), n_steps_arr)
+        start_idx = np.zeros(len(n_steps_arr), dtype=np.int32)
+        start_idx[1:] = np.cumsum(n_steps_arr[:-1])
+        local_idx = np.arange(total_steps, dtype=np.int32) - np.repeat(start_idx, n_steps_arr)
         fracs = local_idx / (n_steps_arr[indices] - 1)
         px_flat = p1[0] + fracs * dx[indices]
         py_flat = p1[1] + fracs * dy[indices]
@@ -227,14 +229,12 @@ class World:
         dx = p2s[:, 0] - p1s[:, 0]
         dy = p2s[:, 1] - p1s[:, 1]
         dist = np.hypot(dx, dy)
-        n_steps_arr = np.maximum(2, np.ceil(dist / step_size).astype(int))
-        total_steps = np.sum(n_steps_arr)
-        indices = np.repeat(np.arange(len(p1s)), n_steps_arr)
-        ones = np.ones(total_steps, dtype=int)
-        start_idx = np.cumsum(n_steps_arr) - n_steps_arr
-        ones[start_idx] = 1 - np.roll(n_steps_arr, 1)
-        ones[0] = 0
-        local_idx = np.cumsum(ones)
+        n_steps_arr = np.maximum(2, np.ceil(dist / step_size).astype(np.int32))
+        total_steps = int(np.sum(n_steps_arr))
+        indices = np.repeat(np.arange(len(p1s), dtype=np.int32), n_steps_arr)
+        start_idx = np.zeros(len(n_steps_arr), dtype=np.int32)
+        start_idx[1:] = np.cumsum(n_steps_arr[:-1])
+        local_idx = np.arange(total_steps, dtype=np.int32) - np.repeat(start_idx, n_steps_arr)
         fracs = local_idx / (n_steps_arr[indices] - 1)
         px_flat = p1s[indices, 0] + fracs * dx[indices]
         py_flat = p1s[indices, 1] + fracs * dy[indices]

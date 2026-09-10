@@ -44,9 +44,6 @@ def _pacman_target(ghost):
 def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_resolution: float = 1.0) -> np.ndarray:
     """Returns (SPATIAL_CH, rows, cols) float32 tensor."""
     out = np.zeros((SPATIAL_CH, rows, cols), dtype=np.float32)
-    grid_y, grid_x = np.mgrid[0:rows, 0:cols]
-    px = (grid_x.ravel() / obs_resolution) + (0.5 / obs_resolution)
-    py = (grid_y.ravel() / obs_resolution) + (0.5 / obs_resolution)
     for hy, hx in ghost.lidar_memory:
         r_idx = int(hy * obs_resolution)
         c_idx = int(hx * obs_resolution)
@@ -176,17 +173,20 @@ def build_vector(ghost) -> np.ndarray:
         f.extend(_enc(ghost.cbba_agent.get_known_task_for(gid)))
     return np.asarray(f, dtype=np.float32)
 
-def build_valid_mask(ghost, rows: int, cols: int, obs_resolution: float = 1.0) -> np.ndarray:
-    mask = np.ones((rows, cols), dtype=bool)
-    for hy, hx in ghost.lidar_memory:
-        r_idx = int(hy * obs_resolution)
-        c_idx = int(hx * obs_resolution)
-        if 0 <= r_idx < rows and 0 <= c_idx < cols:
-            mask[r_idx, c_idx] = False
-            if r_idx > 0: mask[r_idx-1, c_idx] = False
-            if r_idx < rows-1: mask[r_idx+1, c_idx] = False
-            if c_idx > 0: mask[r_idx, c_idx-1] = False
-            if c_idx < cols-1: mask[r_idx, c_idx+1] = False
+def build_valid_mask(ghost, rows: int, cols: int, obs_resolution: float = 1.0, spatial_walls: np.ndarray = None) -> np.ndarray:
+    if spatial_walls is not None and spatial_walls.shape == (rows, cols):
+        mask = (spatial_walls < 0.5)
+    else:
+        mask = np.ones((rows, cols), dtype=bool)
+        for hy, hx in ghost.lidar_memory:
+            r_idx = int(hy * obs_resolution)
+            c_idx = int(hx * obs_resolution)
+            if 0 <= r_idx < rows and 0 <= c_idx < cols:
+                mask[r_idx, c_idx] = False
+                if r_idx > 0: mask[r_idx-1, c_idx] = False
+                if r_idx < rows-1: mask[r_idx+1, c_idx] = False
+                if c_idx > 0: mask[r_idx, c_idx-1] = False
+                if c_idx < cols-1: mask[r_idx, c_idx+1] = False
     if hasattr(ghost, 'cbba_agent') and hasattr(ghost.cbba_agent, '_unreachable_cache'):
         for pos, timeout_frame in ghost.cbba_agent._unreachable_cache.items():
             if timeout_frame > ghost.frame:

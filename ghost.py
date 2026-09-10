@@ -105,8 +105,8 @@ class Ghost:
         p_start = None
         if player_start:
             p_start = (float(np.float32(player_start[0])), float(np.float32(player_start[1])))
-        self.belief_map = BeliefMap(gid, self.world, pacman_start=p_start)
-        self.belief_map.init_full_topology(getattr(self.world, 'prm_graph', {}))
+        self.belief_map = BeliefMap(gid, rows=int(self.world.height), cols=int(self.world.width), pacman_start=p_start)
+        self.belief_map.init_full_topology()
         self._proximity_channel_cache = None
         self._proximity_channel_frame = -1
         self._proximity_channel_target = None
@@ -263,8 +263,8 @@ class Ghost:
                 elif prev_target and math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 3.0:
                     replan = True
             if replan:
-                from pathfinder import astar
-                full_path = astar(self.world, (float(self.y), float(self.x)), target)
+                from pathfinder import astar_belief
+                full_path = astar_belief(self.belief_map, (float(self.y), float(self.x)), target)
                 if len(full_path) >= 2:
                     self._committed_path = full_path[1:]
                     self._committed_target = target
@@ -306,8 +306,8 @@ class Ghost:
                 elif self.frame - getattr(self, '_last_replan_frame', -999) >= 30:
                     replan = True
                 if replan:
-                    from pathfinder import astar
-                    full_path = astar(self.world, (float(self.y), float(self.x)), target)
+                    from pathfinder import astar_belief
+                    full_path = astar_belief(self.belief_map, (float(self.y), float(self.x)), target)
                     if len(full_path) >= 2:
                         self._committed_path = full_path[1:]
                         self._committed_target = target
@@ -475,6 +475,7 @@ class Ghost:
                 new_walls = hits - self.lidar_memory
                 if new_walls:
                     self.lidar_memory.update(new_walls)
+                    self.belief_map.observe_walls_batch(list(new_walls))
                     wall_diffs = [("wall", w) for w in new_walls]
                     self._broadcast(wall_diffs, all_ghosts)
         visible_prm = []
@@ -501,48 +502,70 @@ class Ghost:
                 valid_nodes = bm_arr[valid_mask]
                 valid_idxs = np.where(valid_mask)[0]
                 valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
-                is_pass = self.world.batch_is_passable(valid_targets[:, 0], valid_targets[:, 1], radius=0.0)
-                passable_targets = valid_targets[is_pass]
-                passable_idxs = valid_idxs[is_pass]
-                if len(passable_targets) > 0:
-                    is_los = self.world.batch_line_of_sight((self.x, self.y), passable_targets, radius=0.0, step_size=0.5)
-                    visible_belief_idxs.update(passable_idxs[is_los])
-                impassable_nodes = valid_nodes[~is_pass]
-                if len(impassable_nodes) > 0:
-                    impassable_belief_nodes.extend([tuple(n) for n in impassable_nodes])
+                is_los = self.world.batch_line_of_sight((self.x, self.y), valid_targets, radius=0.0, step_size=0.5)
+                if hasattr(self.belief_map, '_walkable_mask') and len(self.belief_map._walkable_mask) > 0:
+                    walkable = self.belief_map._walkable_mask[valid_idxs]
+                    visible_belief_idxs.update(valid_idxs[is_los & walkable].tolist())
+                else:
+                    disabled_nodes = getattr(self.belief_map, '_disabled_wall_nodes', set())
+                    for idx, node, vis in zip(valid_idxs, valid_nodes, is_los):
+                        if vis and tuple(node) not in disabled_nodes:
+                            visible_belief_idxs.add(idx)
         pellet_diffs = []
         pellets_arr = getattr(self.world, 'pellets_arr', None)
+        pellets_tup = getattr(self.world, 'pellets_tuples', None)
         if pellets_arr is not None and len(pellets_arr) > 0:
             dx = pellets_arr[:, 0] - self.x
             dy = pellets_arr[:, 1] - self.y
             dist = np.hypot(dx, dy)
-            valid = pellets_arr[dist <= MAX_RAY_DIST]
-            if len(valid) > 0:
+            valid_mask = dist <= MAX_RAY_DIST
+            if np.any(valid_mask):
+                valid = pellets_arr[valid_mask]
                 is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0, step_size=0.5)
-                for p, v in zip(valid, is_los):
-                    if v:
-                        pt = find_closest_pellet(p, self.world, is_power=False)
-                        if pt is None:
-                            pt = tuple(p)
-                        if pt not in self.known_pellets:
-                            self.known_pellets.add(pt)
-                            pellet_diffs.append(("pellet", pt))
+                if pellets_tup is not None and len(pellets_tup) == len(pellets_arr):
+                    valid_idxs = np.where(valid_mask)[0]
+                    for idx, v in zip(valid_idxs, is_los):
+                        if v:
+                            pt = pellets_tup[idx]
+                            if pt not in self.known_pellets:
+                                self.known_pellets.add(pt)
+                                pellet_diffs.append(("pellet", pt))
+                else:
+                    for p, v in zip(valid, is_los):
+                        if v:
+                            pt = find_closest_pellet(p, self.world, is_power=False)
+                            if pt is None:
+                                pt = tuple(p)
+                            if pt not in self.known_pellets:
+                                self.known_pellets.add(pt)
+                                pellet_diffs.append(("pellet", pt))
         power_arr = getattr(self.world, 'power_pellets_arr', None)
+        power_tup = getattr(self.world, 'power_pellets_tuples', None)
         if power_arr is not None and len(power_arr) > 0:
             dx = power_arr[:, 0] - self.x
             dy = power_arr[:, 1] - self.y
             dist = np.hypot(dx, dy)
-            valid = power_arr[dist <= MAX_RAY_DIST]
-            if len(valid) > 0:
+            valid_mask = dist <= MAX_RAY_DIST
+            if np.any(valid_mask):
+                valid = power_arr[valid_mask]
                 is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0, step_size=0.5)
-                for p, v in zip(valid, is_los):
-                    if v:
-                        pt = find_closest_pellet(p, self.world, is_power=True)
-                        if pt is None:
-                            pt = tuple(p)
-                        if pt not in self.known_power_pellets:
-                            self.known_power_pellets.add(pt)
-                            pellet_diffs.append(("power", pt))
+                if power_tup is not None and len(power_tup) == len(power_arr):
+                    valid_idxs = np.where(valid_mask)[0]
+                    for idx, v in zip(valid_idxs, is_los):
+                        if v:
+                            pt = power_tup[idx]
+                            if pt not in self.known_power_pellets:
+                                self.known_power_pellets.add(pt)
+                                pellet_diffs.append(("power", pt))
+                else:
+                    for p, v in zip(valid, is_los):
+                        if v:
+                            pt = find_closest_pellet(p, self.world, is_power=True)
+                            if pt is None:
+                                pt = tuple(p)
+                            if pt not in self.known_power_pellets:
+                                self.known_power_pellets.add(pt)
+                                pellet_diffs.append(("power", pt))
         agent_diffs = []
         alive_ghosts = []
         alive_gids = []
@@ -627,25 +650,59 @@ class Ghost:
             pac_dir = (0, 0)
             if self.prev_pac_row >= 0:
                 pac_dir = (pr - self.prev_pac_row, pc - self.prev_pac_col)
-            self.belief_map.observe((float(pr), float(pc)), pac_dir)
+            cur_v = pac_dir
+            p_v = getattr(self, '_prev_pac_dir', (0.0, 0.0))
+            self._prev_pac_dir = pac_dir
+            known_ghost_coords = [pos for gid, pos in self.known_agents.items() if pos != "UNKNOWN"]
+            self.belief_map.observe((float(pr), float(pc)), pac_dir, current_vel=cur_v, prev_vel=p_v, 
+                                known_ghosts=known_ghost_coords, known_pellets=self.known_pellets,
+                                known_walls=self.lidar_memory, is_powered=powered)
             self.prev_pac_row, self.prev_pac_col = pr, pc
         elif pacman_just_lost:
             _, kr, kc, _ = pacman_diff
             self.belief_map.observe_lost((float(kr), float(kc)))
         #throttle belief diffusion to every BELIEF_DIFFUSE_EVERY frames and stagger by ghost ID
         if (self.frame + self.gid) % BELIEF_DIFFUSE_EVERY == 0:
-            self.belief_map.diffuse((float(self.y), float(self.x)), self.known_pellets, self.known_power_pellets)
+            known_ghost_coords = [pos for gid, pos in self.known_agents.items() if pos != "UNKNOWN"]
+            self.belief_map.diffuse((float(self.y), float(self.x)), self.known_pellets, self.known_power_pellets,
+                                    ghost_positions=known_ghost_coords, is_powered=powered)
         pac_pos = (float(pr), float(pc)) if pacman_in_los else None
         self.belief_map.observe_clear(visible_belief_idxs, impassable_belief_nodes, pac_pos)
-        #cleanup eaten pellets from memory
+        #cleanup eaten pellets from memory only if within LOS (sensor-scoped eviction)
         world_pellets = getattr(self.world, 'pellet_set', None)
         if world_pellets is None:
             world_pellets = set(getattr(self.world, 'pellets', []))
         world_power_pellets = getattr(self.world, 'power_pellet_set', None)
         if world_power_pellets is None:
             world_power_pellets = set(getattr(self.world, 'power_pellets', []))
-        self.known_pellets.intersection_update(world_pellets)
-        self.known_power_pellets.intersection_update(world_power_pellets)
+        if self.known_pellets and hasattr(self.world, 'batch_line_of_sight'):
+            p_list = list(self.known_pellets)
+            p_arr = np.array(p_list, dtype=np.float32)
+            dists = np.hypot(p_arr[:, 0] - self.x, p_arr[:, 1] - self.y)
+            close_mask = dists <= MAX_RAY_DIST
+            if np.any(close_mask):
+                close_pts = p_arr[close_mask]
+                close_indices = np.where(close_mask)[0]
+                is_los = self.world.batch_line_of_sight((self.x, self.y), close_pts, radius=0.0, step_size=0.5)
+                for idx, los in zip(close_indices, is_los):
+                    if los:
+                        pt = p_list[idx]
+                        if pt not in world_pellets:
+                            self.known_pellets.discard(pt)
+        if self.known_power_pellets and hasattr(self.world, 'batch_line_of_sight'):
+            pow_list = list(self.known_power_pellets)
+            pow_arr = np.array(pow_list, dtype=np.float32)
+            pow_dists = np.hypot(pow_arr[:, 0] - self.x, pow_arr[:, 1] - self.y)
+            close_pow = pow_dists <= MAX_RAY_DIST
+            if np.any(close_pow):
+                close_pow_pts = pow_arr[close_pow]
+                close_pow_indices = np.where(close_pow)[0]
+                pow_los = self.world.batch_line_of_sight((self.x, self.y), close_pow_pts, radius=0.0, step_size=0.5)
+                for idx, los in zip(close_pow_indices, pow_los):
+                    if los:
+                        pt = pow_list[idx]
+                        if pt not in world_power_pellets:
+                            self.known_power_pellets.discard(pt)
         self._last_visible_belief_idxs = visible_belief_idxs
         return diffs, newly_discovered, stale_refreshed
 
@@ -713,6 +770,7 @@ class Ghost:
             target_ghost.message_queue.append({"id": sync_id, "diffs": sync_diffs, "hop": 0})
 
     def _process_messages(self, all_ghosts):
+        new_peer_walls = []
         for msg in self.message_queue:
             if msg["id"] in self.seen_message_ids:
                 continue
@@ -755,6 +813,7 @@ class Ghost:
                     _, w = diff
                     if w not in self.lidar_memory:
                         self.lidar_memory.add(w)
+                        new_peer_walls.append(w)
                         relay_diffs.append(diff)
                 elif dtype == "agent_lost":
                     _, gid = diff
@@ -827,6 +886,8 @@ class Ghost:
                     else:
                         chunk_msg_id = tuple(list(msg["id"]) + [f"chunk_{idx}"])                        
                     self._broadcast(chunk, all_ghosts, msg_id=chunk_msg_id, hop=hop+1)
+        if new_peer_walls:
+            self.belief_map.observe_walls_batch(new_peer_walls)
         self.message_queue.clear()
         self.belief_map._ensure_initialised()
         #rolling prune - keep newest 250, discarding rest post 500 messages

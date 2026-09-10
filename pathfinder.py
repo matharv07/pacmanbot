@@ -165,3 +165,65 @@ def next_step(world, start, goal):
     if len(path) >= 2:
         return path[1]
     return None
+
+def astar_belief(belief_map, start: tuple, goal: tuple) -> list:
+    """
+    A* pathfinding on the ghost's personal belief topology (discovered map only).
+    Uses belief_map._open_cells, _neighbours, and respects discovered wall dead zones.
+    Returns a list of (y, x) waypoints from start to goal.
+    """
+    if start == goal:
+        return [start]
+    if not hasattr(belief_map, '_open_cells') or not belief_map._open_cells:
+        return []
+    start_idx = belief_map._closest_node(start)
+    goal_idx = belief_map._closest_node(goal)
+    if start_idx < 0 or goal_idx < 0:
+        return []
+    start_node = belief_map._open_cells[start_idx]
+    goal_node = belief_map._open_cells[goal_idx]
+    disabled_walls = getattr(belief_map, '_disabled_wall_nodes', set())
+    if start_node in disabled_walls or goal_node in disabled_walls:
+        if goal_node in disabled_walls:
+            return []
+    if start_node == goal_node:
+        return [start, goal]
+    open_set = []
+    counter = 0
+    start_h = _euclidean(start_node, goal_node)
+    heapq.heappush(open_set, (start_h, counter, start_node))
+    g_score = {start_node: 0.0}
+    came_from = {}
+    visited = set()
+    found = False
+    while open_set:
+        f, _, current = heapq.heappop(open_set)
+        if current == goal_node:
+            found = True
+            break
+        if current in visited:
+            continue
+        visited.add(current)
+        curr_g = g_score[current]
+        neighbours = belief_map._neighbours.get(current, [])
+        for nbr in neighbours:
+            if nbr in disabled_walls or nbr in visited:
+                continue
+            step_cost = _euclidean(current, nbr)
+            tentative_g = curr_g + step_cost
+            if tentative_g < g_score.get(nbr, math.inf):
+                came_from[nbr] = current
+                g_score[nbr] = tentative_g
+                h = _euclidean(nbr, goal_node)
+                counter += 1
+                heapq.heappush(open_set, (tentative_g + h, counter, nbr))
+    if not found:
+        return []
+    path = _reconstruct(came_from, goal_node)
+    full_path = []
+    if _euclidean(start, path[0]) > 0.1:
+        full_path.append(start)
+    full_path.extend(path)
+    if _euclidean(path[-1], goal) > 0.1:
+        full_path.append(goal)
+    return full_path

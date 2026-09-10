@@ -12,26 +12,23 @@ from obs import SPATIAL_CH, VEC_DIM
 
 def test_curriculum_logic():
     print("Testing curriculum logic...")
-    # Test 1: Dominant kill rate
     cs = CurriculumScheduler(start_stage=0)
     assert cs.stage_idx == 0
-    for _ in range(100):
-        cs.record_return(mean_return=-9.0, kill_rate=0.55)
-    assert cs.should_advance(), "Curriculum should advance with 55% kill rate"
+    for _ in range(150):
+        cs.record_return(mean_return=-8.0, kill_rate=0.55)
+    assert cs.should_advance(), "Curriculum should advance with 55% kill rate (dominant gate)"
     cs.advance()
     assert cs.stage_idx == 1, f"Expected Stage 1, got {cs.stage_idx}"
-    # Test 2: Combined return and kill rate on Stage 0 (advance_return = -7.0, kill >= 38%)
     cs0 = CurriculumScheduler(start_stage=0)
-    for _ in range(100):
-        cs0.record_return(mean_return=-6.5, kill_rate=0.40)
-    assert cs0.should_advance(), "Curriculum should advance with return=-6.5 >= -7.0 and kill=40%"
+    for _ in range(150):
+        cs0.record_return(mean_return=-6.5, kill_rate=0.36)
+    assert cs0.should_advance(), "Curriculum should advance with return=-6.5 >= -7.0 and kill=36% >= 34%"
     cs0.advance()
     assert cs0.stage_idx == 1
-    # Test 3: Plateau detection on Stage 0 (min_updates=100 + window=50, kill >= 32%)
     cs_plateau = CurriculumScheduler(start_stage=0)
-    for _ in range(150):
-        cs_plateau.record_return(mean_return=-9.0, kill_rate=0.35)
-    assert cs_plateau.should_advance(), "Curriculum should advance via plateau detection with stalled return and 35% kill rate"
+    for _ in range(200):
+        cs_plateau.record_return(mean_return=-9.0, kill_rate=0.34)
+    assert cs_plateau.should_advance(), "Curriculum should advance via plateau detection with stalled return and 34% kill rate"
     cs_plateau.advance()
     assert cs_plateau.stage_idx == 1
     print("✓ Curriculum test passed!")
@@ -69,8 +66,36 @@ def test_run_episode_integration():
     assert frames > 0, "Episode terminated immediately without frames"
     print("✓ Run episode integration passed!")
 
+def test_predictor_sequence_and_env_sync():
+    print("Testing MovementPredictor sequence BPTT and worker weight sync...")
+    from net import MovementPredictor, PREDICTOR_IN_DIM, PREDICTOR_HIDDEN_DIM
+    predictor = MovementPredictor(in_dim=PREDICTOR_IN_DIM, hidden_dim=PREDICTOR_HIDDEN_DIM)
+    B, T = 4, 8
+    x_seq = torch.randn(B, T, PREDICTOR_IN_DIM)
+    base_v = torch.randn(B, T, 2)
+    gt_v = torch.randn(B, T, 2)
+    pred_seq, final_h = predictor.forward_sequence(x_seq, base_vel_seq=base_v)
+    assert pred_seq.shape == (B, T, 2), f"Expected (B, T, 2), got {pred_seq.shape}"
+    assert final_h.shape == (B, PREDICTOR_HIDDEN_DIM)
+    loss = torch.nn.functional.smooth_l1_loss(pred_seq, gt_v)
+    loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in predictor.parameters())
+    # Test Env synchronization
+    env = Env(env_id=0, num_ghosts=3, world_height=15.0, world_width=15.0, n_power=2)
+    env.reset()
+    # Modify a parameter in predictor
+    with torch.no_grad():
+        for p in predictor.parameters():
+            p.add_(0.5)
+    env.sync_predictor(predictor.state_dict())
+    for g in env.ghosts.values():
+        for p_env, p_main in zip(g.belief_map.predictor.parameters(), predictor.parameters()):
+            assert torch.allclose(p_env, p_main)
+    print("✓ Predictor sequence BPTT and env sync passed!")
+
 if __name__ == "__main__":
     test_curriculum_logic()
     test_actor_critic_shapes_and_logprobs()
     test_run_episode_integration()
+    test_predictor_sequence_and_env_sync()
     print("\nAll integration tests passed successfully!")

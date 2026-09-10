@@ -16,6 +16,7 @@ import pathfinder
 from obs import (build_spatial, build_global_spatial, build_vector, build_valid_mask, actions_to_tasks, MAX_H, MAX_W, MAX_GHOSTS, UNKNOWN, SPATIAL_CH, GLOBAL_SPATIAL_CH, VEC_DIM)
 from reward import RewardShaper
 from allocator import generate_tasks as heuristic_generate_tasks
+from beliefmap import extract_movement_features
 
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 os.environ['SDL_VIDEODRIVER'] = "dummy"
@@ -47,6 +48,18 @@ class Env:
         self._cached_hspeed: dict[int, float] = {}
         self.static_pacman = False
         self.max_frames = int(world_height * world_width * 2) + 1000
+        self._pending_pred = None
+        self._stored_predictor_weights = None
+
+    def sync_predictor(self, state_dict):
+        """Synchronize trained MovementPredictor weights across all active ghosts' belief maps."""
+        self._stored_predictor_weights = state_dict
+        for g in self.ghosts.values():
+            if hasattr(g, 'belief_map') and hasattr(g.belief_map, 'predictor'):
+                try:
+                    g.belief_map.predictor.load_state_dict(state_dict)
+                except Exception:
+                    pass
 
     def reset(self):
         self.grid, self._player_start, self.world = generate_map(
@@ -74,6 +87,14 @@ class Env:
         self.ghosts = { i: Ghost(i, self.grid, pos, GHOST_COLORS[i % len(GHOST_COLORS)], self._player_start, self.world) for i, pos in enumerate(starts) }
         self.frame = 0
         self.shaper.reset()
+        self._pending_pred = None
+        if self._stored_predictor_weights is not None:
+            for g in self.ghosts.values():
+                if hasattr(g, 'belief_map') and hasattr(g.belief_map, 'predictor'):
+                    try:
+                        g.belief_map.predictor.load_state_dict(self._stored_predictor_weights)
+                    except Exception:
+                        pass
         r = int(self.world_height * self.obs_resolution)
         c = int(self.world_width * self.obs_resolution)
         self.recent_nom = { i: np.zeros((r, c), dtype=np.float32) for i in range(self.num_ghosts) }
@@ -120,9 +141,10 @@ class Env:
         global_sp = build_global_spatial(self, R, C, self.obs_resolution)
         for gid in alive:
             g = self.ghosts[gid]
-            sp.append(build_spatial(g, self.recent_nom[gid], R, C, self.obs_resolution))
+            s_map = build_spatial(g, self.recent_nom[gid], R, C, self.obs_resolution)
+            sp.append(s_map)
             ve.append(build_vector(g))
-            vm.append(build_valid_mask(g, R, C, self.obs_resolution))
+            vm.append(build_valid_mask(g, R, C, self.obs_resolution, spatial_walls=s_map[0]))
             cached = self._cached_ht.get(gid)
             if cached is not None:
                 ht.append(cached[:R, :C])
@@ -188,22 +210,51 @@ class Env:
                     g.cbba_agent._phase1(g, all_tasks, h_dists)
         rewards = {gid: 0.0 for gid in alive}
         done = False
+        pred_samples = []
         for _ in range(DECISION_INTERVAL):
             self.frame += 1
             self.player.update(self.ghosts)
             powered = self.player.powered
+            new_pac_v = np.array([float(self.player.vy), float(self.player.vx)], dtype=np.float32)
+            if self._pending_pred is not None:
+                p_feats, p_base_v = self._pending_pred
+                pred_samples.append((p_feats, p_base_v, new_pac_v))
+                self._pending_pred = None
             for gid, ghost in list(self.ghosts.items()):
                 if ghost.dead:
                     continue
                 ghost.update((self.player.y, self.player.x), powered, self.ghosts, speed_mult=getattr(ghost, 'current_speed_mult', 1.0))
             if not self.player.dead:
+                seeing_ghosts = [g for g in self.ghosts.values() if not g.dead and g.known_pacman is not None]
+                if seeing_ghosts:
+                    best_ghost = min(seeing_ghosts, key=lambda g: math.hypot(g.y - self.player.y, g.x - self.player.x))
+                    feats = extract_movement_features(
+                        pacman_pos=best_ghost.known_pacman,
+                        current_vel=(float(self.player.vy), float(self.player.vx)),
+                        prev_vel=(float(getattr(self.player, 'prev_vy', 0.0)), float(getattr(self.player, 'prev_vx', 0.0))),
+                        known_walls=best_ghost.lidar_memory,
+                        map_width=self.world.width,
+                        map_height=self.world.height,
+                        known_ghosts=[(g.y, g.x) for g in self.ghosts.values() if not g.dead],
+                        known_pellets=best_ghost.known_pellets,
+                        is_powered=self.player.powered
+                    )
+                    base_v = new_pac_v.copy()
+                    self._pending_pred = (feats, base_v)
+                else:
+                    self._pending_pred = None
+            else:
+                self._pending_pred = None
+            self.player.prev_vy = self.player.vy
+            self.player.prev_vx = self.player.vx
+            if not self.player.dead:
                 for gid, ghost in list(self.ghosts.items()):
                     if ghost.dead:
                         continue
-                    # Coarse proximity filter before expensive swept-path interpolation
+                    #coarse proximity filter before expensive swept-path interpolation
                     if abs(ghost.x - self.player.x) > 2.0 or abs(ghost.y - self.player.y) > 2.0:
                         continue
-                    # continuous radius-based swept-path collision (matches pacman.py visualizer)
+                    #continuous radius-based swept-path collision
                     collision_radius = self.player.radius + ghost.radius + 0.15
                     collided = False
                     p_path = getattr(self.player, 'path_this_frame', [(self.player.x, self.player.y)])
@@ -296,4 +347,4 @@ class Env:
                     rewards[gid] += self.shaper.shaping(g, self.ghosts)
         obs = self.observe() if not done else None
         pacman_caught = bool(getattr(self.player, "dead", False))
-        return obs, rewards, done, {"pacman_score": getattr(self.player, "score", 0), "heuristic_merges": info_heuristic_merges, "total_auctions": info_total_auctions, "pacman_caught": pacman_caught}
+        return obs, rewards, done, {"pacman_score": getattr(self.player, "score", 0), "heuristic_merges": info_heuristic_merges, "total_auctions": info_total_auctions, "pacman_caught": pacman_caught, "pred_samples": pred_samples}

@@ -162,7 +162,7 @@ class GhostActor(nn.Module):
         speed_lp = dist_speed.log_prob(speeds)
         speed_ent = dist_speed.entropy()
         logprobs = torch.stack(lp_list, 1).mean(1) + 0.1 * speed_lp
-        entropy  = torch.stack(ent_list, 1).mean(1) + 0.1 * speed_ent
+        entropy  = torch.stack(ent_list, 1).mean(1) + 0.5 * speed_ent
         return logprobs, entropy, pool, vec, flat_clean, speed_params
 
 class GhostCritic(nn.Module):
@@ -194,3 +194,39 @@ class GhostCritic(nn.Module):
     def forward(self, spatial, vector):
         pool = self.encode_spatial(spatial)
         return self.forward_from_pool(pool, vector)
+
+PREDICTOR_IN_DIM = 19
+PREDICTOR_HIDDEN_DIM = 32
+
+class MovementPredictor(nn.Module):
+    """Controller-agnostic opponent velocity and transition predictor."""
+    def __init__(self, in_dim: int = PREDICTOR_IN_DIM, hidden_dim: int = PREDICTOR_HIDDEN_DIM):
+        super().__init__()
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.gru = nn.GRUCell(in_dim, hidden_dim)
+        self.ln = nn.LayerNorm(hidden_dim)
+        self.head = nn.Sequential(nn.Linear(hidden_dim, 32), nn.GELU(), nn.Linear(32, 2))
+
+    def forward(self, x, hx=None, base_vel=None):
+        #x: (B, in_dim), hx: (B, hidden_dim), base_vel: optional (B, 2)
+        if hx is None:
+            hx = torch.zeros(x.shape[0], self.hidden_dim, device=x.device, dtype=x.dtype)
+        hx = self.gru(x, hx)
+        out = self.head(self.ln(hx))
+        if base_vel is not None: out = out + base_vel
+        return out, hx
+
+    def forward_sequence(self, x_seq, hx=None, base_vel_seq=None):
+        """Unroll GRU over sequence (B, T, D) for BPTT training."""
+        B, T, _ = x_seq.shape
+        if hx is None:
+            hx = torch.zeros(B, self.hidden_dim, device=x_seq.device, dtype=x_seq.dtype)
+        out_list = []
+        for t in range(T):
+            hx = self.gru(x_seq[:, t], hx)
+            out_t = self.head(self.ln(hx))
+            if base_vel_seq is not None:
+                out_t = out_t + base_vel_seq[:, t]
+            out_list.append(out_t)
+        return torch.stack(out_list, dim=1), hx

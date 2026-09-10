@@ -1,5 +1,6 @@
 import glob
 import math
+import random
 import sys
 import time
 import json
@@ -16,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from net    import GhostActor, GhostCritic
+from net    import GhostActor, GhostCritic, MovementPredictor, PREDICTOR_IN_DIM, PREDICTOR_HIDDEN_DIM
 from worker import Env
 from obs    import MAX_H, MAX_W, MAX_GHOSTS, SPATIAL_CH, VEC_DIM, CRITIC_VEC_DIM
 from curriculum import CurriculumScheduler, STAGES
@@ -107,6 +108,7 @@ def push_to_discord(metrics_row):
     else:
         phase = "Pure RL"
     ret_str = f"{metrics_row['mean_return']:.3f}" if metrics_row['mean_return'] is not None else "—"
+    kill_str = f"{metrics_row['kill_rate']:.1%}" if metrics_row.get('kill_rate') is not None else "—"
     pac_str = f"{metrics_row['pacman_score']:.1f}" if metrics_row['pacman_score'] is not None else "—"
     msg = (f"**Update {metrics_row['update']}** | Stage {metrics_row['curriculum_stage']} ({metrics_row['grid_size']}) | Runtime: {runtime}\n"
         f"```ml\n"
@@ -115,6 +117,7 @@ def push_to_discord(metrics_row):
         f"Episodes / Steps: {metrics_row['episodes']} / {metrics_row['steps']}\n"
         f"-----------------------------------------\n"
         f"Mean Return:      {ret_str}\n"
+        f"Kill Rate:        {kill_str}\n"
         f"Pacman Score:     {pac_str}\n"
         f"-----------------------------------------\n"
         f"Policy Loss:      {metrics_row['actor_loss']:+.5f}\n"
@@ -249,6 +252,9 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
                 env.static_pacman = static_pacman
                 obs = env.reset()
                 conn.send(obs)
+            elif cmd == "sync_predictor":
+                env.sync_predictor(data)
+                conn.send(True)
             elif cmd == "close":
                 break
         except Exception as e:
@@ -299,6 +305,13 @@ class VecEnv:
             p.start()
             self.procs.append(p)
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
+
+    def sync_predictor(self, state_dict):
+        """Broadcast MovementPredictor weights to all simulation workers."""
+        cpu_sd = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in state_dict.items()}
+        for p in self.parent:
+            p.send(("sync_predictor", cpu_sd))
+        _ = _recv_unordered(self.parent, procs=self.procs)
 
     def reset(self):
         for p in self.parent:
@@ -377,8 +390,6 @@ def _critic_value(critic, spatial_unique, vector, env_n_ghosts):
 
 def train():
     os.makedirs(LOG_DIR, exist_ok=True)
-    train_thread = None
-    result_queue = queue.Queue()
     os.makedirs(CKPT_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, "metrics.jsonl")
     curriculum = CurriculumScheduler(start_stage=CURRICULUM_START_STAGE)
@@ -398,6 +409,8 @@ def train():
     ret_rms = RunningMeanStd(shape=()).to(DEVICE)
     opt_actor  = torch.optim.Adam(actor.parameters(), lr=LR)
     opt_critic = torch.optim.Adam(critic.parameters(), lr=LR*2)
+    predictor  = MovementPredictor(in_dim=PREDICTOR_IN_DIM, hidden_dim=PREDICTOR_HIDDEN_DIM).to(DEVICE)
+    opt_predictor = torch.optim.Adam(predictor.parameters(), lr=LR)
     start_update = 1
     episodes     = 0
     total_steps  = 0
@@ -424,6 +437,16 @@ def train():
             except Exception as e:
                 print(f"Warning: Could not fully restore critic weights: {e}")
             opt_actor.load_state_dict(ckpt["opt_actor"])
+            if "predictor" in ckpt:
+                try:
+                    predictor.load_state_dict(ckpt["predictor"])
+                except Exception as e:
+                    print(f"Warning: Could not restore predictor weights: {e}")
+            if "opt_predictor" in ckpt:
+                try:
+                    opt_predictor.load_state_dict(ckpt["opt_predictor"])
+                except Exception as e:
+                    print(f"Warning: Could not restore predictor optimizer: {e}")
             if "ret_rms" in ckpt:
                 ret_rms.load_state_dict(ckpt["ret_rms"])
             curriculum.load_state_dict(ckpt["curriculum"])
@@ -448,7 +471,7 @@ def train():
     print("VecEnv initialized. Starting training...")
     t0 = time.time()
 
-    def ppo_worker(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_act, b_spd, b_olp, b_adv, b_ret, lam_bc, anneal_frac, mean_ret, mean_pac, kill_rate, episodes, total_steps, t_rollout, t0_ref, bc_prob, realized_merge_rate, ret_rms):
+    def run_ppo(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_act, b_spd, b_olp, b_adv, b_ret, lam_bc, ret_rms):
         t_ppo_start = time.time()
         metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "approx_kl": 0, "clip_fraction": 0, "n_batches": 0}    
         N_total = b_sp.shape[0]
@@ -611,9 +634,7 @@ def train():
         t_ppo = time.time() - t_ppo_start
         if critic_warmup_remaining > 0:
             critic_warmup_remaining -= 1
-        result_queue.put({"update": update, "metrics": metrics,"mean_ret": mean_ret, "mean_pac": mean_pac,
-        "kill_rate": kill_rate,
-        "episodes": episodes,"total_steps": total_steps, "t_rollout": t_rollout, "t_ppo": t_ppo, "lam_bc": lam_bc, "bc_prob": bc_prob, "realized_merge_rate": realized_merge_rate, "wall_s": round(time.time() - t0_ref, 1)})
+        return metrics, t_ppo
     current_returns = [0.0] * NUM_ENVS
     rollout_transfer = BatchTransfer(DEVICE)
     train_transfer   = BatchTransfer(DEVICE)
@@ -644,6 +665,8 @@ def train():
         ep_kills         = []
         ep_heuristic_merges = 0
         ep_total_auctions = 0
+        env_pred_trajs = [[] for _ in range(NUM_ENVS)]
+        completed_pred_seqs = []
         for _ in range(ROLLOUT_STEPS):
             step_actions = [{} for _ in range(NUM_ENVS)]
             #collect all alive ghosts across all environments
@@ -774,6 +797,13 @@ def train():
                     offset += n_g
             obs_list, rew_list, done_list, info_list = vec_env.step(step_actions, bc_prob)
             for e in range(NUM_ENVS):
+                if "pred_samples" in info_list[e] and info_list[e]["pred_samples"]:
+                    env_pred_trajs[e].extend(info_list[e]["pred_samples"])
+                if done_list[e]:
+                    while len(env_pred_trajs[e]) >= 8:
+                        completed_pred_seqs.append(env_pred_trajs[e][:8])
+                        env_pred_trajs[e] = env_pred_trajs[e][8:]
+                    env_pred_trajs[e].clear()
                 r = rew_list[e]
                 mean_r = sum(r.values()) / max(1, len(r)) if r else 0.0
                 current_returns[e] += mean_r
@@ -788,6 +818,53 @@ def train():
                     ep_total_auctions += info_list[e].get("total_auctions", 0)
                     current_returns[e] = 0.0
         total_steps += ROLLOUT_STEPS * NUM_ENVS
+        for e in range(NUM_ENVS):
+            while len(env_pred_trajs[e]) >= 8:
+                completed_pred_seqs.append(env_pred_trajs[e][:8])
+                env_pred_trajs[e] = env_pred_trajs[e][8:]
+        if completed_pred_seqs:
+            try:
+                seq_feats, seq_base_v, seq_gt_v = [], [], []
+                if len(completed_pred_seqs) > 64:
+                    sub_idx = random.sample(range(len(completed_pred_seqs)), 64)
+                    sampled_seqs = [completed_pred_seqs[i] for i in sub_idx]
+                else:
+                    sampled_seqs = completed_pred_seqs
+                for chunk in sampled_seqs:
+                    seq_feats.append([s[0] for s in chunk])
+                    seq_base_v.append([s[1] for s in chunk])
+                    seq_gt_v.append([s[2] for s in chunk])
+                t_x = torch.from_numpy(np.array(seq_feats, dtype=np.float32)).to(DEVICE)
+                t_bv = torch.from_numpy(np.array(seq_base_v, dtype=np.float32)).to(DEVICE)
+                t_gt = torch.from_numpy(np.array(seq_gt_v, dtype=np.float32)).to(DEVICE)
+                pred_v_seq, _ = predictor.forward_sequence(t_x, base_vel_seq=t_bv)
+                l1_loss = F.smooth_l1_loss(pred_v_seq, t_gt)
+                cos_sim = F.cosine_similarity(pred_v_seq, t_gt, dim=-1)
+                pred_loss = l1_loss + 0.3 * (1.0 - cos_sim.mean())
+                opt_predictor.zero_grad()
+                pred_loss.backward()
+                nn.utils.clip_grad_norm_(predictor.parameters(), MAX_GRAD_NORM)
+                opt_predictor.step()
+                vec_env.sync_predictor(predictor.state_dict())
+            except Exception as e:
+                print(f"Warning: Predictor update failed: {e}")
+        else:
+            remaining_samples = [s for traj in env_pred_trajs for s in traj]
+            if remaining_samples:
+                try:
+                    samples = remaining_samples[:512]
+                    t_feats = torch.from_numpy(np.array([s[0] for s in samples], dtype=np.float32)).to(DEVICE)
+                    t_base_v = torch.from_numpy(np.array([s[1] for s in samples], dtype=np.float32)).to(DEVICE)
+                    t_gt_v = torch.from_numpy(np.array([s[2] for s in samples], dtype=np.float32)).to(DEVICE)
+                    pred_v, _ = predictor(t_feats, base_vel=t_base_v)
+                    pred_loss = F.smooth_l1_loss(pred_v, t_gt_v) + 0.3 * (1.0 - F.cosine_similarity(pred_v, t_gt_v, dim=-1).mean())
+                    opt_predictor.zero_grad()
+                    pred_loss.backward()
+                    nn.utils.clip_grad_norm_(predictor.parameters(), MAX_GRAD_NORM)
+                    opt_predictor.step()
+                    vec_env.sync_predictor(predictor.state_dict())
+                except Exception as e:
+                    print(f"Warning: Predictor single-step update failed: {e}")
         boot_sp, boot_gsp_unique, boot_ve, boot_cve, boot_vm = [], [], [], [], []
         boot_env_idx, boot_gids_list, boot_n_ghosts = [], [], []
         for e in range(NUM_ENVS):
@@ -804,15 +881,14 @@ def train():
                 for i, gid in enumerate(gids):
                     joint_ve[gid] = ve[i]
                 joint_ve_flat = joint_ve.flatten()
-                cve_batch = []
-                for gid in gids:
-                    one_hot = np.zeros(MAX_GHOSTS, dtype=np.float32)
-                    one_hot[gid] = 1.0
-                    cve_batch.append(np.concatenate([joint_ve_flat, one_hot]))
+                cve_batch = np.zeros((len(gids), MAX_GHOSTS * VEC_DIM + MAX_GHOSTS), dtype=np.float32)
+                cve_batch[:, :MAX_GHOSTS * VEC_DIM] = joint_ve_flat
+                for i, gid in enumerate(gids):
+                    cve_batch[i, MAX_GHOSTS * VEC_DIM + gid] = 1.0
                 boot_sp.append(sp_padded)
                 boot_gsp_unique.append(gsp_padded[np.newaxis, ...])
                 boot_ve.append(ve)
-                boot_cve.append(np.array(cve_batch, dtype=np.float32))
+                boot_cve.append(cve_batch)
                 boot_vm.append(vm_padded)
                 boot_gids_list.append(gids)
         all_last_v = [{} for _ in range(NUM_ENVS)]
@@ -915,136 +991,136 @@ def train():
                 ema_return = 0.95 * ema_return + 0.05 * mean_ret
             if mean_ret >= 0.95 * ema_return:
                 bc_decay_step += 1
-        if train_thread is not None:
-            train_thread.join()
-            train_thread = None
-            res = result_queue.get()
-            #sync weights to rollout actors
-            actor_rollout.load_state_dict(actor.state_dict())
-            critic_rollout.load_state_dict(critic.state_dict())
-            p_up = res["update"]
-            m = res["metrics"]
-            nb = max(1, m["n_batches"])
-            row = {"update":     p_up,
-                "episodes":   res["episodes"],
-                "steps":      res["total_steps"],
-                "wall_s":     res["wall_s"],
-                "actor_loss": round(m["actor_loss"] / nb, 5),
-                "value_loss": round(m["value_loss"] / nb, 5),
-                "bc_loss":    round(m["bc_loss"] / nb, 5),
-                "entropy":    round(m["entropy"] / nb, 5),
-                "approx_kl":  round(m["approx_kl"] / nb, 5),
-                "clip_frac":  round(m["clip_fraction"] / nb, 4),
-                "bc_coef":    round(res["lam_bc"], 4),
-                "bc_prob":    round(res["bc_prob"], 4),
-                "merge_rate": round(res["realized_merge_rate"], 4),
-                "mean_return": res["mean_ret"],
-                "pacman_score": res["mean_pac"],
-                "kill_rate": res.get("kill_rate", 0.0),
-                "curriculum_stage": curriculum.stage_idx,
-                "grid_size": f"{curriculum.stage.rows}x{curriculum.stage.cols}",
-                "lr":         opt_actor.param_groups[0]['lr'],
-                "t_rollout":  round(res["t_rollout"], 1),
-                "t_ppo":      round(res["t_ppo"], 1)}
-            with open(log_path, "a") as f:
-                f.write(json.dumps(row) + "\n")
-            curriculum.record_return(res["mean_ret"] if res["lam_bc"] <= BC_ADVANCE_GATE else None, kill_rate=res.get("kill_rate", 0.0))
-            if curriculum.should_advance():
-                curriculum.advance()
-                stage = curriculum.stage
-                print(f"\n{'='*60}")
-                print(f"CURRICULUM ADVANCE → Stage {curriculum.stage_idx} "
-                      f"({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts)")
-                print(f"{'='*60}\n")
-                vec_env.set_curriculum(curriculum.stage_idx, static_pacman=False)
-                torch.cuda.empty_cache()
-                current_returns = [0.0] * NUM_ENVS
-                for pg in opt_actor.param_groups:
-                    pg['lr'] *= 0.5
-                for pg in opt_critic.param_groups:
-                    pg['lr'] *= 0.5
-                critic_warmup_remaining = 20
-                with open(log_path, "a") as f:
-                    f.write(json.dumps({"curriculum_advance": curriculum.stage_idx, "update": p_up, "new_grid": f"{stage.rows}x{stage.cols}", "new_lr": opt_actor.param_groups[0]['lr']}) + "\n")
-                #save checkpoint when curriculum advances
-                path = os.path.join(CKPT_DIR, f"ckpt_{p_up}_stage_{curriculum.stage_idx}.pt")
-                torch.save({"actor": actor.state_dict(),
-                             "critic": critic.state_dict(),
-                             "opt_actor": opt_actor.state_dict(),
-                             "opt_critic": opt_critic.state_dict(),
-                             "ret_rms": ret_rms.state_dict(),
-                             "update": p_up,
-                             "episodes": res['episodes'],
-                             "total_steps": res['total_steps'],
-                             "curriculum": curriculum.state_dict(),
-                             "critic_warmup_remaining": critic_warmup_remaining,
-                             "ema_return": ema_return,
-                             "bc_decay_step": bc_decay_step,
-                             "rng_state": torch.get_rng_state(),
-                             "np_rng_state": np.random.get_state()}, path)
-                with open(log_path, "a") as f:
-                    f.write(json.dumps({"checkpoint": path, "update": p_up, "reason": "curriculum_advance"}) + "\n")
-            if p_up == 1 or p_up % 10 == 0:
-                if p_up % 10 == 0:
-                    threading.Thread(target=push_to_discord, args=(row,), daemon=True).start()
-                try:
-                    elapsed = res["wall_s"]
-                    mins, secs = divmod(int(elapsed), 60)
-                    hrs, mins = divmod(mins, 60)
-                    runtime = f"{hrs}h {mins:02d}m {secs:02d}s" if hrs else f"{mins}m {secs:02d}s"
-                    if res["lam_bc"] > 0.25:
-                        phase = "\033[95mHybrid RL + IL\033[0m"
-                    elif res["lam_bc"] > 0.06:
-                        phase = "\033[93mIL → RL Transition\033[0m"
-                    else:
-                        phase = "\033[92mReinforcement Learning\033[0m"
-                    stg = curriculum.stage
-                    cur_lr = opt_actor.param_groups[0]['lr']
-                    print(f"\n┌─── Update {p_up:>5} / 50k ── {runtime} ─────────────────────────────────")
-                    print(f"│  Phase: {phase}   Curriculum: Stage {curriculum.stage_idx} ({stg.rows}×{stg.cols}, {stg.n_ghosts}g)")
-                    print(f"│  Episodes: {res['episodes']:<8}  Steps: {res['total_steps']:<10}  LR: {cur_lr:.2e}")
-                    print(f"│  BC Coef:   {res['lam_bc']:.4f}    Policy Loss: {row['actor_loss']:>+.5f}")
-                    print(f"│  BC Prob:   {res['bc_prob']:.4f} ({row['merge_rate']:.1%} merge)    Value Loss: {row['value_loss']:.5f}")
-                    print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f} (KL: {row['approx_kl']:.4f}, Clip: {row['clip_frac']:.1%})")
-                    ret_str = f"{row['mean_return']:.3f}" if row['mean_return'] is not None else "—"
-                    pac_str = f"{row['pacman_score']:.1f}" if row['pacman_score'] is not None else "—"
-                    kill_str = f"{row['kill_rate']:.1%}" if row.get('kill_rate') is not None else "—"
-                    print(f"│  Ghost Return: {ret_str:<10}  Kill Rate: {kill_str:<8}  Pacman Score: {pac_str}")
-                    print(f"│  Timings: Rollout {res['t_rollout']:.1f}s | PPO {res['t_ppo']:.1f}s")
-                    print(f"└{'─'*64}")
-                    sys.stdout.flush()
-                except (BrokenPipeError, OSError):
-                    pass
-            if p_up % 100 == 0:
-                path = os.path.join(CKPT_DIR, f"ckpt_{p_up}.pt")
-                torch.save({"actor": actor.state_dict(),
-                             "critic": critic.state_dict(),
-                             "opt_actor": opt_actor.state_dict(),
-                             "opt_critic": opt_critic.state_dict(),
-                             "ret_rms": ret_rms.state_dict(),
-                             "update": p_up,
-                             "episodes": res['episodes'],
-                             "total_steps": res['total_steps'],
-                             "curriculum": curriculum.state_dict(),
-                             "critic_warmup_remaining": critic_warmup_remaining,
-                             "ema_return": ema_return,
-                             "bc_decay_step": bc_decay_step,
-                             "rng_state": torch.get_rng_state(),
-                             "np_rng_state": np.random.get_state()}, path)
-                with open(log_path, "a") as f:
-                    f.write(json.dumps({"checkpoint": path, "update": p_up}) + "\n")
-                try:
-                    print(f"  💾 Checkpoint saved: {path}")
-                    sys.stdout.flush()
-                except (BrokenPipeError, OSError):
-                    pass
-        ret_rms.update(ds_ret)
-        train_thread = threading.Thread(target=ppo_worker, args=(
+        # Synchronous on-policy PPO optimization
+        metrics, t_ppo = run_ppo(
             update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_olp, ds_adv, ds_ret,
-            lam_bc, anneal_frac, mean_ret, mean_pac, kill_rate, episodes, total_steps, t_rollout, t0, bc_prob, realized_merge_rate, ret_rms))
-        train_thread.start()
-    if train_thread is not None:
-        train_thread.join()
+            lam_bc, ret_rms
+        )
+        actor_rollout.load_state_dict(actor.state_dict())
+        critic_rollout.load_state_dict(critic.state_dict())
+        ret_rms.update(ds_ret)
+
+        nb = max(1, metrics["n_batches"])
+        wall_s = round(time.time() - t0, 1)
+        row = {
+            "update":     update,
+            "episodes":   episodes,
+            "steps":      total_steps,
+            "wall_s":     wall_s,
+            "actor_loss": round(metrics["actor_loss"] / nb, 5),
+            "value_loss": round(metrics["value_loss"] / nb, 5),
+            "bc_loss":    round(metrics["bc_loss"] / nb, 5),
+            "entropy":    round(metrics["entropy"] / nb, 5),
+            "approx_kl":  round(metrics["approx_kl"] / nb, 5),
+            "clip_frac":  round(metrics["clip_fraction"] / nb, 4),
+            "bc_coef":    round(lam_bc, 4),
+            "bc_prob":    round(bc_prob, 4),
+            "merge_rate": round(realized_merge_rate, 4),
+            "mean_return": mean_ret,
+            "pacman_score": mean_pac,
+            "kill_rate": kill_rate,
+            "curriculum_stage": curriculum.stage_idx,
+            "grid_size": f"{curriculum.stage.rows}x{curriculum.stage.cols}",
+            "lr":         opt_actor.param_groups[0]['lr'],
+            "t_rollout":  round(t_rollout, 1),
+            "t_ppo":      round(t_ppo, 1)
+        }
+        with open(log_path, "a") as f:
+            f.write(json.dumps(row) + "\n")
+        curriculum.record_return(mean_ret if lam_bc <= BC_ADVANCE_GATE else None, kill_rate=kill_rate)
+        if curriculum.should_advance():
+            curriculum.advance()
+            stage = curriculum.stage
+            print(f"\n{'='*60}")
+            print(f"CURRICULUM ADVANCE → Stage {curriculum.stage_idx} "
+                  f"({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts)")
+            print(f"{'='*60}\n")
+            vec_env.set_curriculum(curriculum.stage_idx, static_pacman=False)
+            vec_env.sync_predictor(predictor.state_dict())
+            torch.cuda.empty_cache()
+            current_returns = [0.0] * NUM_ENVS
+            for pg in opt_actor.param_groups:
+                pg['lr'] *= 0.5
+            for pg in opt_critic.param_groups:
+                pg['lr'] *= 0.5
+            critic_warmup_remaining = 20
+            with open(log_path, "a") as f:
+                f.write(json.dumps({"curriculum_advance": curriculum.stage_idx, "update": update, "new_grid": f"{stage.rows}x{stage.cols}", "new_lr": opt_actor.param_groups[0]['lr']}) + "\n")
+            path = os.path.join(CKPT_DIR, f"ckpt_{update}_stage_{curriculum.stage_idx}.pt")
+            torch.save({"actor": actor.state_dict(),
+                         "critic": critic.state_dict(),
+                         "opt_actor": opt_actor.state_dict(),
+                         "opt_critic": opt_critic.state_dict(),
+                         "predictor": predictor.state_dict(),
+                         "opt_predictor": opt_predictor.state_dict(),
+                         "ret_rms": ret_rms.state_dict(),
+                         "update": update,
+                         "episodes": episodes,
+                         "total_steps": total_steps,
+                         "curriculum": curriculum.state_dict(),
+                         "critic_warmup_remaining": critic_warmup_remaining,
+                         "ema_return": ema_return,
+                         "bc_decay_step": bc_decay_step,
+                         "rng_state": torch.get_rng_state(),
+                         "np_rng_state": np.random.get_state()}, path)
+            with open(log_path, "a") as f:
+                f.write(json.dumps({"checkpoint": path, "update": update, "reason": "curriculum_advance"}) + "\n")
+        if update == 1 or update % 10 == 0:
+            if update % 10 == 0:
+                threading.Thread(target=push_to_discord, args=(row,), daemon=True).start()
+            try:
+                elapsed = wall_s
+                mins, secs = divmod(int(elapsed), 60)
+                hrs, mins = divmod(mins, 60)
+                runtime = f"{hrs}h {mins:02d}m {secs:02d}s" if hrs else f"{mins}m {secs:02d}s"
+                if lam_bc > 0.25:
+                    phase = "\033[95mHybrid RL + IL\033[0m"
+                elif lam_bc > 0.06:
+                    phase = "\033[93mIL → RL Transition\033[0m"
+                else:
+                    phase = "\033[92mReinforcement Learning\033[0m"
+                stg = curriculum.stage
+                cur_lr = opt_actor.param_groups[0]['lr']
+                print(f"\n┌─── Update {update:>5} / 50k ── {runtime} ─────────────────────────────────")
+                print(f"│  Phase: {phase}   Curriculum: Stage {curriculum.stage_idx} ({stg.rows}×{stg.cols}, {stg.n_ghosts}g)")
+                print(f"│  Episodes: {episodes:<8}  Steps: {total_steps:<10}  LR: {cur_lr:.2e}")
+                print(f"│  BC Coef:   {lam_bc:.4f}    Policy Loss: {row['actor_loss']:>+.5f}")
+                print(f"│  BC Prob:   {bc_prob:.4f} ({row['merge_rate']:.1%} merge)    Value Loss: {row['value_loss']:.5f}")
+                print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f} (KL: {row['approx_kl']:.4f}, Clip: {row['clip_frac']:.1%})")
+                ret_str = f"{row['mean_return']:.3f}" if row['mean_return'] is not None else "—"
+                pac_str = f"{row['pacman_score']:.1f}" if row['pacman_score'] is not None else "—"
+                kill_str = f"{row['kill_rate']:.1%}" if row.get('kill_rate') is not None else "—"
+                print(f"│  Ghost Return: {ret_str:<10}  Kill Rate: {kill_str:<8}  Pacman Score: {pac_str}")
+                print(f"│  Timings: Rollout {t_rollout:.1f}s | PPO {t_ppo:.1f}s")
+                print(f"└{'─'*64}")
+                sys.stdout.flush()
+            except (BrokenPipeError, OSError):
+                pass
+        if update % 100 == 0:
+            path = os.path.join(CKPT_DIR, f"ckpt_{update}.pt")
+            torch.save({"actor": actor.state_dict(),
+                         "critic": critic.state_dict(),
+                         "opt_actor": opt_actor.state_dict(),
+                         "opt_critic": opt_critic.state_dict(),
+                         "predictor": predictor.state_dict(),
+                         "opt_predictor": opt_predictor.state_dict(),
+                         "ret_rms": ret_rms.state_dict(),
+                         "update": update,
+                         "episodes": episodes,
+                         "total_steps": total_steps,
+                         "curriculum": curriculum.state_dict(),
+                         "critic_warmup_remaining": critic_warmup_remaining,
+                         "ema_return": ema_return,
+                         "bc_decay_step": bc_decay_step,
+                         "rng_state": torch.get_rng_state(),
+                         "np_rng_state": np.random.get_state()}, path)
+            with open(log_path, "a") as f:
+                f.write(json.dumps({"checkpoint": path, "update": update}) + "\n")
+            try:
+                print(f"  💾 Checkpoint saved: {path}")
+                sys.stdout.flush()
+            except (BrokenPipeError, OSError):
+                pass
     vec_env.close()
 
 if __name__ == "__main__":
