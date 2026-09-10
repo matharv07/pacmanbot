@@ -57,15 +57,27 @@ def _get_cutoff_candidates(ghost, pr: float, pc: float) -> list[tuple[float, flo
     candidates = []
     p_dir = getattr(ghost, '_player_dir', (0, 0))
     p_speed = math.hypot(p_dir[0], p_dir[1])
+    min_dim = min(ghost.world.height, ghost.world.width) if (getattr(ghost, 'world', None) and hasattr(ghost.world, 'height')) else 10.0
+    #scale lead distances down on small grids (e.g. 7x9) to prevent projecting through outer walls
+    d1 = min(3.0, max(1.5, min_dim * 0.25))
+    d2 = min(5.0, max(2.5, min_dim * 0.40))
     if p_speed > 0.01:
         dy, dx = p_dir[0] / p_speed, p_dir[1] / p_speed
-        offsets = [(dy * 3.0, dx * 3.0), (dy * 5.0, dx * 5.0), (-dx * 3.0, dy * 3.0), (dx * 3.0, -dy * 3.0)]
+        offsets = [(dy * d1, dx * d1), (dy * d2, dx * d2), (-dx * d1, dy * d1), (dx * d1, -dy * d1)]
     else:
-        offsets = [(-3.0, 0.0), (3.0, 0.0), (0.0, -3.0), (0.0, 3.0)]
+        offsets = [(-d1, 0.0), (d1, 0.0), (0.0, -d1), (0.0, d1)]
     for dr, dc in offsets:
         cr, cc = float(pr + dr), float(pc + dc)
         if ghost.world and ghost.world.is_passable(cc, cr, radius=0.4):
             candidates.append((cr, cc))
+    #fallback to close cardinal offsets if directional projections are blocked by walls
+    if len(candidates) < 2:
+        for dr, dc in [(-1.5, 0.0), (1.5, 0.0), (0.0, -1.5), (0.0, 1.5)]:
+            cr, cc = float(pr + dr), float(pc + dc)
+            if ghost.world and ghost.world.is_passable(cc, cr, radius=0.4):
+                cand = (cr, cc)
+                if cand not in candidates:
+                    candidates.append(cand)
     return candidates
 
 def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
@@ -90,7 +102,8 @@ def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
         cutoff_info = dists.get(cutoff_key) or dists.get((cr, cc))
         if cutoff_info and cutoff_info[0] != math.inf:
             cutoff_score = _dist_score(cutoff_info[0], HUNT_SCALE) * 0.85
-            tasks.append(Task(task_type=TaskType.HUNT, target_pos=(cr, cc), score=cutoff_score, created_frame=frame, owner=ghost.gid, target_speed=1.0))
+            #pincer bonus: incentivize flanking ghosts to cut off Pacman ahead of path
+            tasks.append(Task(task_type=TaskType.HUNT, target_pos=(cr, cc), score=1.15 * cutoff_score, created_frame=frame, owner=ghost.gid, target_speed=1.0))
     return tasks
 
 def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
@@ -105,7 +118,8 @@ def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
         dist, _ = info
         if dist == math.inf:
             continue
-        score = _dist_score(dist, CONVERT_SCALE) * 0.60
+        #high priority to deny Pacman invincibility
+        score = _dist_score(dist, CONVERT_SCALE) + 1.20
         tasks.append(Task(task_type=TaskType.CONVERT, target_pos=yx_pos, score=score, created_frame=frame, target_speed=1.0))
     return tasks
 
@@ -141,7 +155,7 @@ def _find_flee_pos(ghost, pacman_pos: tuple) -> Optional[tuple]:
 def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
     if not ghost.pacman_powered:
         return None
-    target = ghost.known_pacman
+    target = ghost.known_pacman or ghost.last_lost_pacman
     if target is None:
         return None
     info = dists.get(target)
@@ -186,10 +200,12 @@ def generate_tasks(ghost, frame: int) -> tuple[List[Task], dict]:
         targets.add((pr, pc))
         for cr, cc in _get_cutoff_candidates(ghost, pr, pc):
             targets.add((cr, cc))
-    if getattr(ghost, 'pacman_powered', False) and ghost.known_pacman:
-        flee_p = _find_flee_pos(ghost, ghost.known_pacman)
-        if flee_p is not None:
-            targets.add(flee_p)
+    if getattr(ghost, 'pacman_powered', False):
+        evade_target = ghost.known_pacman or ghost.last_lost_pacman
+        if evade_target is not None:
+            flee_p = _find_flee_pos(ghost, evade_target)
+            if flee_p is not None:
+                targets.add(flee_p)
     for p in getattr(ghost, 'known_power_pellets', []):
         targets.add((p[1], p[0]))
     explore_tasks = _score_explore(ghost, frame)

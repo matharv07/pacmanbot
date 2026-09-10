@@ -992,15 +992,12 @@ def train():
             slack = 0.05 * abs(ema_return)
             if mean_ret >= (ema_return - slack):
                 bc_decay_step += 1
-        # Synchronous on-policy PPO optimization
-        metrics, t_ppo = run_ppo(
-            update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_olp, ds_adv, ds_ret,
-            lam_bc, ret_rms
-        )
+        #update return running statistics before PPO optimization so value targets are normalized
+        ret_rms.update(ds_ret)
+        #synchronous on-policy PPO optimization
+        metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms)
         actor_rollout.load_state_dict(actor.state_dict())
         critic_rollout.load_state_dict(critic.state_dict())
-        ret_rms.update(ds_ret)
-
         nb = max(1, metrics["n_batches"])
         wall_s = round(time.time() - t0, 1)
         row = {
@@ -1024,8 +1021,7 @@ def train():
             "grid_size": f"{curriculum.stage.rows}x{curriculum.stage.cols}",
             "lr":         opt_actor.param_groups[0]['lr'],
             "t_rollout":  round(t_rollout, 1),
-            "t_ppo":      round(t_ppo, 1)
-        }
+            "t_ppo":      round(t_ppo, 1)}
         with open(log_path, "a") as f:
             f.write(json.dumps(row) + "\n")
         curriculum.record_return(mean_ret if lam_bc <= BC_ADVANCE_GATE else None, kill_rate=kill_rate if lam_bc <= BC_ADVANCE_GATE else None)

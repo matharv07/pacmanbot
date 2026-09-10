@@ -38,8 +38,8 @@ STAGES = [
     Stage(world_height=7,  world_width=9,  obs_resolution=1.0, n_ghosts=3, n_power=2,  advance_return=-7.0, min_updates=150, target_kill_rate=0.34),
     Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=4, n_power=6,  advance_return=-6.0, min_updates=150, target_kill_rate=0.38),
     Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=14, advance_return=-2.0, min_updates=200, target_kill_rate=0.45),
-    Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=24, advance_return=5.0,  min_updates=250, target_kill_rate=0.55),
-    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0, target_kill_rate=0.65)]
+    Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=24, advance_return=0.0,  min_updates=250, target_kill_rate=0.50),
+    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0, target_kill_rate=0.60)]
 
 ADVANCE_WINDOW = 50    #rolling window of updates achieving return/kill threshold required to clear a stage
 

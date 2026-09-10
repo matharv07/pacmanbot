@@ -256,8 +256,7 @@ class Env:
                         map_height=self.world.height,
                         known_ghosts=[(g.y, g.x) for g in self.ghosts.values() if not g.dead],
                         known_pellets=best_ghost.known_pellets,
-                        is_powered=self.player.powered
-                    )
+                        is_powered=self.player.powered)
                     base_v = new_pac_v.copy()
                     self._pending_pred = (feats, base_v)
                 else:
@@ -318,7 +317,7 @@ class Env:
                             for other_gid, other_ghost in self.ghosts.items():
                                 if other_gid != gid and not other_ghost.dead and other_gid in rewards:
                                     dist = math.hypot(other_ghost.y - self.player.y, other_ghost.x - self.player.x)
-                                    # Decay slower for continuous space, base reward ensures credit assignment
+                                    #decay slower for continuous space, base reward ensures credit assignment
                                     proximity_scale = math.exp(-dist / 10.0)
                                     rewards[other_gid] += TEAM_KILL_BASE + TEAM_KILL_PROX * proximity_scale
                             break
@@ -342,26 +341,30 @@ class Env:
                         continue
                     if not self.player.powered:
                         dist = math.hypot(ghost_prox.y - self.player.y, ghost_prox.x - self.player.x)
-                        #reward peaks at 0.20 when adjacent, decays to about 0 beyond 8 cells
-                        prox = 0.20 * math.exp(-dist / 3.0)
+                        #attenuated proximity reward to avoid disincentivizing catch completion
+                        prox = 0.05 * math.exp(-dist / 3.0)
                         rewards[gid_prox] += prox
 
-            grid_area = self.world.height * self.world.width
-            base_area = 33 * 41
-            step_cost = 0.05 * (grid_area / base_area)   #0.009 on 7x9, scales to 0.05 on 33x41
+            step_cost = 0.01   #uniform per-frame step cost across all grid sizes
             for gid in rewards:
                 if self.ghosts[gid].dead:
                     continue
                 rewards[gid] -= step_cost    #per-frame step cost
                 conv = getattr(self.ghosts[gid], 'power_pellets_converted_this_frame', 0)
                 if conv > 0:
-                    rewards[gid] += 5.0 * conv
+                    rewards[gid] += 10.0 * conv
                     self.ghosts[gid].power_pellets_converted_this_frame = 0
         for gid, g in self.ghosts.items():
-            if not g.dead and gid in rewards:
+            if gid not in rewards:
+                continue
+            if g.dead:
+                if gid in self.shaper._prev:
+                    #for Ng et al. shaping, terminal potential upon death must be 0
+                    rewards[gid] += (0.0 - self.shaper._prev.pop(gid, 0.0))
+            else:
                 if done:
-                    # For Ng et al. shaping, terminal potential must be 0
-                    rewards[gid] += (0.0 - self.shaper._prev.get(gid, 0.0))
+                    #terminal potential must be 0 for absorbing end-of-episode state
+                    rewards[gid] += (0.0 - self.shaper._prev.pop(gid, 0.0))
                 else:
                     rewards[gid] += self.shaper.shaping(g, self.ghosts)
         obs = self.observe() if not done else None
