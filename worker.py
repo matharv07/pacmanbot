@@ -46,6 +46,8 @@ class Env:
         self.recent_nom: dict[int, np.ndarray] = {}
         self._cached_ht: dict[int, np.ndarray] = {}   #heuristic targets cached at auction boundary
         self._cached_hspeed: dict[int, float] = {}
+        self._cached_htasks: dict[int, list] = {}
+        self._cached_hdists: dict[int, dict] = {}
         self.static_pacman = False
         self.max_frames = int(world_height * world_width * 2) + 1000
         self._pending_pred = None
@@ -64,7 +66,7 @@ class Env:
     def reset(self):
         self.grid, self._player_start, self.world = generate_map(
             world_height=self.world_height, world_width=self.world_width, n_power=self.n_power, random_spawn=self.static_pacman, obs_resolution=self.obs_resolution)
-        self.player = Player(self.grid, self._player_start, self.world)
+        self.player = Player(self.grid, self._player_start, self.world, obs_resolution=self.obs_resolution)
         if self.static_pacman:
             self.player.stationary = True
         open_cells = np.array(self.world.prm_nodes) if hasattr(self.world, 'prm_nodes') and self.world.prm_nodes else np.array([[float(self._player_start[0]), float(self._player_start[1])]])
@@ -99,11 +101,16 @@ class Env:
         c = int(self.world_width * self.obs_resolution)
         self.recent_nom = { i: np.zeros((r, c), dtype=np.float32) for i in range(self.num_ghosts) }
         self._cached_ht = {}
+        self._cached_hspeed = {}
+        self._cached_htasks = {}
+        self._cached_hdists = {}
         #pre-populate heuristic targets for the initial observation
         for gid in self.ghosts:
             g = self.ghosts[gid]
             if not g.dead:
-                h_tasks, _ = heuristic_generate_tasks(g, self.frame)
+                h_tasks, h_task_dists = heuristic_generate_tasks(g, self.frame)
+                self._cached_htasks[gid] = h_tasks
+                self._cached_hdists[gid] = h_task_dists
                 target = np.zeros((r, c), dtype=np.float32)
                 for t in h_tasks[:3]:
                     r_t, c_t = int(t.target_pos[0] * self.obs_resolution), int(t.target_pos[1] * self.obs_resolution)
@@ -169,10 +176,10 @@ class Env:
             g = self.ghosts[gid]
             HEURISTIC_EVERY = DECISION_INTERVAL * 2
             need_h_tasks = (self.frame % HEURISTIC_EVERY == 0) or (gid not in self._cached_ht)
-            h_tasks = []
-            h_dists = {}
             if need_h_tasks:
-                h_tasks = heuristic_generate_tasks(g, self.frame)[0]
+                h_tasks, h_task_dists = heuristic_generate_tasks(g, self.frame)
+                self._cached_htasks[gid] = h_tasks
+                self._cached_hdists[gid] = h_task_dists
                 target = np.zeros((R, C), dtype=np.float32)
                 if h_tasks:
                     self._cached_hspeed[gid] = h_tasks[0].target_speed
@@ -180,9 +187,20 @@ class Env:
                         r_t, c_t = int(t.target_pos[0] * self.obs_resolution), int(t.target_pos[1] * self.obs_resolution)
                         if 0 <= r_t < R and 0 <= c_t < C:
                             target[r_t, c_t] = t.score
+                            for dr in (-1, 0, 1):
+                                for dc in (-1, 0, 1):
+                                    if dr == 0 and dc == 0: continue
+                                    nr, nc = r_t + dr, c_t + dc
+                                    if 0 <= nr < R and 0 <= nc < C:
+                                        wy = (float(nr) + 0.5) / self.obs_resolution
+                                        wx = (float(nc) + 0.5) / self.obs_resolution
+                                        if self.world.is_passable(wx, wy, radius=0.35):
+                                            target[nr, nc] += t.score * 0.5
                 else:
                     self._cached_hspeed[gid] = 1.0
                 self._cached_ht[gid] = target
+            else:
+                h_tasks = self._cached_htasks.get(gid, [])
             if gid in action_dict:      #merge RL tasks with CBBA
                 indices, scores_map, speed = action_dict[gid]
                 g.current_speed_mult = speed
@@ -195,6 +213,7 @@ class Env:
                     g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
                     if random.random() < bc_prob and h_tasks:
                         all_tasks = h_tasks + tasks
+                        h_dists = dict(self._cached_hdists.get(gid, {}))
                         info_heuristic_merges += 1
                     else:
                         all_tasks = tasks

@@ -989,7 +989,8 @@ def train():
                 ema_return = mean_ret
             else:
                 ema_return = 0.95 * ema_return + 0.05 * mean_ret
-            if mean_ret >= 0.95 * ema_return:
+            slack = 0.05 * abs(ema_return)
+            if mean_ret >= (ema_return - slack):
                 bc_decay_step += 1
         # Synchronous on-policy PPO optimization
         metrics, t_ppo = run_ppo(
@@ -1027,7 +1028,7 @@ def train():
         }
         with open(log_path, "a") as f:
             f.write(json.dumps(row) + "\n")
-        curriculum.record_return(mean_ret if lam_bc <= BC_ADVANCE_GATE else None, kill_rate=kill_rate)
+        curriculum.record_return(mean_ret if lam_bc <= BC_ADVANCE_GATE else None, kill_rate=kill_rate if lam_bc <= BC_ADVANCE_GATE else None)
         if curriculum.should_advance():
             curriculum.advance()
             stage = curriculum.stage

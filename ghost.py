@@ -67,6 +67,7 @@ def find_closest_pellet(p, world_obj, is_power=False):      #O(1) lookup to reco
 class Ghost:
     def __init__(self, gid, grid, pos, color, player_start, world=None):
         self.gid = gid
+        self.grid = grid
         self.world = world
         self.color = color
         self.radius = 0.4
@@ -427,12 +428,26 @@ class Ghost:
                     if pt is None:
                         pt = (float(arr_xy[0]), float(arr_xy[1]))
                     if getattr(self, 'world', None):
-                        if pt in self.world.power_pellets:
-                            self.world.power_pellets.remove(pt)
+                        # Use tolerance to remove exact matching power pellet
+                        for pp in list(self.world.power_pellets):
+                            if abs(pp[0] - pt[0]) < 0.05 and abs(pp[1] - pt[1]) < 0.05:
+                                self.world.power_pellets.remove(pp)
+                                pt = pp
+                                break
+                        else:
+                            if pt in self.world.power_pellets:
+                                self.world.power_pellets.remove(pt)
                         if pt not in self.world.pellets:
                             self.world.pellets.append(pt)
                         if hasattr(self.world, '_update_pellet_arrays'):
                             self.world._update_pellet_arrays()
+                    if getattr(self, 'grid', None) is not None:
+                        obs_res = len(self.grid) / self.world.height if getattr(self, 'world', None) else 1.0
+                        gr = int(pt[1] * obs_res)
+                        gc = int(pt[0] * obs_res)
+                        if 0 <= gr < len(self.grid) and 0 <= gc < len(self.grid[0]):
+                            if self.grid[gr][gc] == POWER:
+                                self.grid[gr][gc] = PELLET
                     self.known_power_pellets.discard(pt)
                     if pt not in self.known_pellets:
                         self.known_pellets.add(pt)

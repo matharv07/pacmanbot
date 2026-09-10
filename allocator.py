@@ -53,6 +53,21 @@ class Task:
 def _dist_score(d: float, scale: float) -> float:   #normalize the distances received from dijkstra
     return math.exp(-d/scale) if d != math.inf and d >= 0 else 0.0
 
+def _get_cutoff_candidates(ghost, pr: float, pc: float) -> list[tuple[float, float]]:
+    candidates = []
+    p_dir = getattr(ghost, '_player_dir', (0, 0))
+    p_speed = math.hypot(p_dir[0], p_dir[1])
+    if p_speed > 0.01:
+        dy, dx = p_dir[0] / p_speed, p_dir[1] / p_speed
+        offsets = [(dy * 3.0, dx * 3.0), (dy * 5.0, dx * 5.0), (-dx * 3.0, dy * 3.0), (dx * 3.0, -dy * 3.0)]
+    else:
+        offsets = [(-3.0, 0.0), (3.0, 0.0), (0.0, -3.0), (0.0, 3.0)]
+    for dr, dc in offsets:
+        cr, cc = float(pr + dr), float(pc + dc)
+        if ghost.world and ghost.world.is_passable(cc, cr, radius=0.4):
+            candidates.append((cr, cc))
+    return candidates
+
 def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
     if ghost.pacman_powered:
         return []
@@ -70,14 +85,12 @@ def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
     tasks = []
     score = _dist_score(dist, HUNT_SCALE)
     tasks.append(Task(task_type=TaskType.HUNT, target_pos=(pr, pc), score=score, created_frame=frame, owner=ghost.gid, target_speed=1.0))
-    for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
-        cr, cc = float(pr + dr*4), float(pc + dc*4)
-        if ghost.world and ghost.world.is_passable(cc, cr, radius=0.4):
-            cutoff_key = (round(cr, 2), round(cc, 2))
-            cutoff_info = dists.get(cutoff_key) or dists.get((cr, cc))
-            if cutoff_info and cutoff_info[0] != math.inf:
-                cutoff_score = _dist_score(cutoff_info[0], HUNT_SCALE) * 0.85
-                tasks.append(Task(task_type=TaskType.HUNT, target_pos=(cr, cc), score=1.2 * cutoff_score, created_frame=frame, owner=ghost.gid, target_speed=1.0))
+    for cr, cc in _get_cutoff_candidates(ghost, pr, pc):
+        cutoff_key = (round(cr, 2), round(cc, 2))
+        cutoff_info = dists.get(cutoff_key) or dists.get((cr, cc))
+        if cutoff_info and cutoff_info[0] != math.inf:
+            cutoff_score = _dist_score(cutoff_info[0], HUNT_SCALE) * 0.85
+            tasks.append(Task(task_type=TaskType.HUNT, target_pos=(cr, cc), score=cutoff_score, created_frame=frame, owner=ghost.gid, target_speed=1.0))
     return tasks
 
 def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
@@ -92,18 +105,34 @@ def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
         dist, _ = info
         if dist == math.inf:
             continue
-        score = _dist_score(dist, CONVERT_SCALE) + 2.0
+        score = _dist_score(dist, CONVERT_SCALE) * 0.60
         tasks.append(Task(task_type=TaskType.CONVERT, target_pos=yx_pos, score=score, created_frame=frame, target_speed=1.0))
     return tasks
 
 def _find_flee_pos(ghost, pacman_pos: tuple) -> Optional[tuple]:
     pr, pc = pacman_pos
     if getattr(ghost, 'world', None) is None: return None
+    prm_nodes = getattr(ghost.world, 'prm_nodes', None)
+    if prm_nodes:
+        best_node = None
+        best_safety = -math.inf
+        for n in prm_nodes:
+            pac_d = math.hypot(n[0] - pr, n[1] - pc)
+            ghost_d = math.hypot(n[0] - ghost.y, n[1] - ghost.x)
+            safety = pac_d - 0.5 * ghost_d
+            if pac_d >= SAFE_RADIUS:
+                safety += 10.0
+            if safety > best_safety:
+                best_safety = safety
+                best_node = (float(n[0]), float(n[1]))
+        if best_node is not None:
+            return best_node
     corners = [(1.5, 1.5), (1.5, float(ghost.world.width - 2)), (float(ghost.world.height - 2), 1.5), (float(ghost.world.height - 2), float(ghost.world.width - 2))]
+    passable_corners = [c for c in corners if ghost.world.is_passable(c[1], c[0], radius=0.4)] or corners
     best_corner = None
     best_dist = -1
-    for cr, cc in corners:
-        d = abs(cr - pr) + abs(cc - pc)
+    for cr, cc in passable_corners:
+        d = math.hypot(cr - pr, cc - pc)
         if d > best_dist:
             best_dist = d
             best_corner = (cr, cc)
@@ -155,15 +184,14 @@ def generate_tasks(ghost, frame: int) -> tuple[List[Task], dict]:
     if pac_pos is not None:
         pr, pc = float(pac_pos[0]), float(pac_pos[1])
         targets.add((pr, pc))
-        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
-            cr, cc = pr + dr*4, pc + dc*4
-            if ghost.world and ghost.world.is_passable(cc, cr, radius=0.4):
-                targets.add((cr, cc))
+        for cr, cc in _get_cutoff_candidates(ghost, pr, pc):
+            targets.add((cr, cc))
+    if getattr(ghost, 'pacman_powered', False) and ghost.known_pacman:
+        flee_p = _find_flee_pos(ghost, ghost.known_pacman)
+        if flee_p is not None:
+            targets.add(flee_p)
     for p in getattr(ghost, 'known_power_pellets', []):
         targets.add((p[1], p[0]))
-    corners = [(1.5, 1.5), (1.5, float(ghost.world.width - 2)), (float(ghost.world.height - 2), 1.5), (float(ghost.world.height - 2), float(ghost.world.width - 2))]
-    for cn in corners:
-        targets.add(cn)
     explore_tasks = _score_explore(ghost, frame)
     for et in explore_tasks:
         targets.add((float(et.target_pos[0]), float(et.target_pos[1])))

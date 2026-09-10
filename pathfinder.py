@@ -36,7 +36,8 @@ def _connect_temp_nodes_batch(world, nodes_list):
             if len(valid_indices) > 0:
                 valid_nodes = prm_arr[valid_indices]
                 valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
-                p1_arr = np.full((len(valid_targets), 2), origin, dtype=np.float32)
+                origin_xy = (origin[1], origin[0])
+                p1_arr = np.full((len(valid_targets), 2), origin_xy, dtype=np.float32)
                 all_p1s.append(p1_arr)
                 all_p2s.append(valid_targets)
                 all_dists.append(dist[valid_indices])
