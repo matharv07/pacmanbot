@@ -21,7 +21,7 @@ from net import GhostActor
 from world import World
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--stage", type=int, default=4, help="Curriculum stage index to visualize")
+parser.add_argument("--stage", type=int, default=3, help="Curriculum stage index to visualize")
 parser.add_argument("--checkpoint", type=int, default=-1, help="Checkpoint to load")
 args, _ = parser.parse_known_args()
 

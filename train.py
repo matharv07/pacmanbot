@@ -40,11 +40,11 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-NUM_ENVS        = int(os.environ.get("NUM_ENVS", "14"))       # Sized for 8-core / 16-thread CPU (14 sim workers + 2 threads for coordinator/training)
+NUM_ENVS        = int(os.environ.get("NUM_ENVS", "14"))
 ROLLOUT_STEPS   = int(os.environ.get("ROLLOUT_STEPS", "256"))
 MINI_BATCH      = 4096
-MICRO_BATCH     = 4096     # Gradient accumulation chunk size (takes full advantage of 16 GB VRAM)
-ROLLOUT_INFER_CHUNK = 2048 # Max ghosts per rollout inference forward pass (optimized for 16 GB VRAM)
+MICRO_BATCH     = 4096
+ROLLOUT_INFER_CHUNK = 2048
 #adaptive OOM-safe chunk sizes — halved automatically on cuda OOM, never grow back
 _eff_infer_chunk = ROLLOUT_INFER_CHUNK
 _eff_micro_batch = MICRO_BATCH
@@ -52,17 +52,17 @@ PPO_EPOCHS      = 4
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
 CLIP_EPS        = 0.2
-ENT_COEF        = 0.002
+ENT_COEF        = 0.006
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 2e-4
-BC_INIT         = 0.5
+BC_INIT         = 0.25
 BC_FLOOR        = 0.0
 K_NOMINATIONS   = 3
 LOG_DIR         = os.path.join(os.path.dirname(__file__), "logs")
 CKPT_DIR        = os.path.join(os.path.dirname(__file__), "checkpoints")
-BC_ANNEAL_UPDATES = 150
-BC_ADVANCE_GATE = 0.35
+BC_ANNEAL_UPDATES = 40
+BC_ADVANCE_GATE = 0.10
 TARGET_KL       = 0.05
 CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
@@ -640,7 +640,7 @@ def train():
     train_transfer   = BatchTransfer(DEVICE)
     max_updates = int(os.environ.get("MAX_UPDATES", "50001"))
     for update in range(start_update, max_updates):
-        anneal_frac = math.exp(-bc_decay_step / BC_ANNEAL_UPDATES)
+        anneal_frac = max(0.0, 1.0 - (update - 1) / BC_ANNEAL_UPDATES)
         bc_prob = anneal_frac if anneal_frac >= 0.05 else 0.0
         # static_pacman transition removed: pacman moves dynamically from update 1
         t_start_rollout = time.time()
