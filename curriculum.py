@@ -34,13 +34,11 @@ class Stage:
     def cols(self) -> int:
         return int(self.world_width * self.obs_resolution)
 
-STAGES = [
-    Stage(world_height=7,  world_width=9,  obs_resolution=1.0, n_ghosts=3, n_power=1,  advance_return=25.0, min_updates=100, target_kill_rate=0.70),
+STAGES = [Stage(world_height=7,  world_width=9,  obs_resolution=1.0, n_ghosts=3, n_power=1,  advance_return=25.0, min_updates=100, target_kill_rate=0.70),
     Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=4, n_power=2,  advance_return=30.0, min_updates=120, target_kill_rate=0.75),
     Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=8,  advance_return=25.0, min_updates=150, target_kill_rate=0.75),
     Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=16, advance_return=25.0, min_updates=180, target_kill_rate=0.75),
-    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0, target_kill_rate=0.80),
-]
+    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0, target_kill_rate=0.80)]
 
 ADVANCE_WINDOW = 50    #rolling window of updates achieving return/kill threshold required to clear a stage
 
@@ -69,23 +67,21 @@ class CurriculumScheduler:
     def should_advance(self) -> bool:
         if self.is_final:
             return False
-        if self._updates_in_stage < self.stage.min_updates:
-            return False
         if len(self._return_history) < ADVANCE_WINDOW:
             return False
         avg_ret = sum(self._return_history) / len(self._return_history)
         avg_kill = (sum(self._kill_history) / len(self._kill_history)) if self._kill_history else 0.0
-
-        # Dominant performance gate: exceeds stage target by 15% relative (or >= 50% for small stages)
+        #dominant performance gate: exceeds stage target by 15% relative (or >= 50% for small stages)
         dominant_gate = max(0.50, min(0.95, self.stage.target_kill_rate * 1.15))
         if avg_kill >= dominant_gate and avg_ret >= (self.stage.advance_return - 2.0):
             return True
-
-        # Solid target: meets both calibrated advance_return and target_kill_rate
+        #enforce min_updates for normal target and plateau detection
+        if self._updates_in_stage < self.stage.min_updates:
+            return False
+        #solid target: meets both calibrated advance_return and target_kill_rate
         if avg_ret >= self.stage.advance_return and avg_kill >= self.stage.target_kill_rate:
             return True
-
-        # Plateau detection: if training has stalled in this stage after min_updates + ADVANCE_WINDOW
+        #plateau detection: if training has stalled in this stage after min_updates + ADVANCE_WINDOW
         if self._updates_in_stage >= self.stage.min_updates + ADVANCE_WINDOW:
             half = ADVANCE_WINDOW // 2
             hist = list(self._return_history)
