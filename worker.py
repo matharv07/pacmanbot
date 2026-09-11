@@ -175,7 +175,7 @@ class Env:
         for gid in alive:
             g = self.ghosts[gid]
             HEURISTIC_EVERY = DECISION_INTERVAL * 2
-            need_h_tasks = (self.frame % HEURISTIC_EVERY == 0) or (gid not in self._cached_ht)
+            need_h_tasks = (bc_prob > 0.0) and ((self.frame % HEURISTIC_EVERY == 0) or (gid not in self._cached_ht))
             if need_h_tasks:
                 h_tasks, h_task_dists = heuristic_generate_tasks(g, self.frame)
                 self._cached_htasks[gid] = h_tasks
@@ -200,7 +200,10 @@ class Env:
                     self._cached_hspeed[gid] = 1.0
                 self._cached_ht[gid] = target
             else:
-                h_tasks = self._cached_htasks.get(gid, [])
+                h_tasks = self._cached_htasks.get(gid, []) if bc_prob > 0.0 else []
+                if gid not in self._cached_ht:
+                    self._cached_ht[gid] = np.zeros((R, C), dtype=np.float32)
+                    self._cached_hspeed[gid] = 1.0
             if gid in action_dict:      #merge RL tasks with CBBA
                 indices, scores_map, speed = action_dict[gid]
                 g.current_speed_mult = speed

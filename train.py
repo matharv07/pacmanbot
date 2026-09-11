@@ -498,13 +498,16 @@ def train():
                     idx.extend(uid_to_indices[uid])
                 idx = np.array(idx)
                 n_idx = len(idx)
-                #pre-compute valid_bc fraction across the FULL mini-batch
-                full_ht  = b_ht[idx]
-                full_vm  = b_vm[idx]
-                full_ht_masked = full_ht * full_vm.float()
-                full_ht_sums   = full_ht_masked.view(n_idx, -1).sum(dim=1)
-                bc_valid_frac  = (full_ht_sums > 1e-6).float().mean().item()
-                del full_ht, full_vm, full_ht_masked, full_ht_sums
+                #pre-compute valid_bc fraction across the FULL mini-batch (only when BC is active)
+                if lam_bc > 1e-6:
+                    full_ht  = b_ht[idx]
+                    full_vm  = b_vm[idx]
+                    full_ht_masked = full_ht * full_vm.float()
+                    full_ht_sums   = full_ht_masked.view(n_idx, -1).sum(dim=1)
+                    bc_valid_frac  = (full_ht_sums > 1e-6).float().mean().item()
+                    del full_ht, full_vm, full_ht_masked, full_ht_sums
+                else:
+                    bc_valid_frac  = 0.0
                 #OOM-adaptive micro-batch loop: halves chunk size on crash and retries
                 global _eff_micro_batch
                 oom_retry = True
@@ -552,32 +555,32 @@ def train():
                                 log_ratio = torch.clamp(new_lp - mb_olp, -10.0, 10.0)
                                 ratio = torch.exp(log_ratio)
                                 with torch.no_grad():
-                                    approx_kl = 0.5 * (new_lp - mb_olp).pow(2).mean()
+                                    approx_kl = 0.5 * log_ratio.pow(2).mean()
                                     clip_fraction = (torch.abs(ratio - 1.0) > CLIP_EPS).float().mean()
                                 s1 = ratio * mb_adv
                                 s2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * mb_adv
                                 a_loss = -torch.min(s1, s2).mean()
                                 v_loss = F.smooth_l1_loss(v_pred, ret_rms(mb_ret))
-                                mb_ht_masked = mb_ht * mb_vm.float()
-                                ht_flat     = mb_ht_masked.view(mb_ht_masked.shape[0], -1)
-                                ht_row_sums = ht_flat.sum(dim=1)
-                                valid_bc    = ht_row_sums > 1e-6
-                                if valid_bc.any():
-                                    ht_valid  = ht_flat[valid_bc]
-                                    ht_prob   = (ht_valid / ht_valid.sum(dim=1, keepdim=True)).detach()
-                                    fl_bc     = flat_logits[valid_bc].clamp(min=-1e4)
-                                    log_pi    = F.log_softmax(fl_bc, dim=-1)
-                                    bc        = -(ht_prob * log_pi).sum(dim=-1).mean()
-                                    #speed BC loss using Beta distribution log-prob
-                                    #mb_hs is the target heuristic speed
-                                    #speed_params is (alpha, beta) of the predicted Beta
-                                    #we can maximize log-prob of target speed:
-                                    target_speed = mb_hs[valid_bc].squeeze(-1).clamp(0.05, 0.95)
-                                    alpha = speed_params[valid_bc, 0]
-                                    beta = speed_params[valid_bc, 1]
-                                    dist_speed = torch.distributions.Beta(alpha, beta)
-                                    bc_speed = -dist_speed.log_prob(target_speed).mean()
-                                    bc = (bc + bc_speed * 0.2) * bc_valid_frac
+                                if lam_bc > 1e-6:
+                                    mb_ht_masked = mb_ht * mb_vm.float()
+                                    ht_flat     = mb_ht_masked.view(mb_ht_masked.shape[0], -1)
+                                    ht_row_sums = ht_flat.sum(dim=1)
+                                    valid_bc    = ht_row_sums > 1e-6
+                                    if valid_bc.any():
+                                        ht_valid  = ht_flat[valid_bc]
+                                        ht_prob   = (ht_valid / ht_valid.sum(dim=1, keepdim=True)).detach()
+                                        fl_bc     = flat_logits[valid_bc].clamp(min=-1e4)
+                                        log_pi    = F.log_softmax(fl_bc, dim=-1)
+                                        bc        = -(ht_prob * log_pi).sum(dim=-1).mean()
+                                        #speed BC loss using Beta distribution log-prob
+                                        target_speed = mb_hs[valid_bc].squeeze(-1).clamp(0.05, 0.95)
+                                        alpha = speed_params[valid_bc, 0]
+                                        beta = speed_params[valid_bc, 1]
+                                        dist_speed = torch.distributions.Beta(alpha, beta)
+                                        bc_speed = -dist_speed.log_prob(target_speed).mean()
+                                        bc = (bc + bc_speed * 0.2) * bc_valid_frac
+                                    else:
+                                        bc = torch.tensor(0.0, device=DEVICE)
                                 else:
                                     bc = torch.tensor(0.0, device=DEVICE)
                                 loss_actor = a_loss - ENT_COEF * ent.mean() + lam_bc * bc
