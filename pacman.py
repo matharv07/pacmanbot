@@ -21,7 +21,7 @@ from net import GhostActor
 from world import World
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--stage", type=int, default=3, help="Curriculum stage index to visualize")
+parser.add_argument("--stage", type=int, default=4, help="Curriculum stage index to visualize")
 parser.add_argument("--checkpoint", type=int, default=-1, help="Checkpoint to load")
 args, _ = parser.parse_known_args()
 
@@ -125,7 +125,7 @@ def generate_map(world_height: float = ROWS, world_width: float = COLS, n_power:
     world = World(world_width, world_height, resolution=0.5)
     area_ratio = (world_height * world_width) / (33 * 41)
     n_obs = max(2, int(25 * area_ratio))
-    world.generate(n_obstacles=n_obs)
+    world.generate(n_obstacles=n_obs, n_power=n_power)
     rows = int(world_height * obs_resolution)
     cols = int(world_width * obs_resolution)
     grid = np.full((rows, cols), WALL, dtype=np.int8)
@@ -172,6 +172,25 @@ def generate_map(world_height: float = ROWS, world_width: float = COLS, n_power:
             py_val = (float(r) + 0.5) / obs_resolution
             if grid[r][c] == PELLET: world.pellets.append((px_val, py_val))
             elif grid[r][c] == POWER: world.power_pellets.append((px_val, py_val))
+    if n_power is not None:
+        target_n_pow = max(0, min(int(n_power), len(world.pellets) + len(world.power_pellets)))
+        while len(world.power_pellets) < target_n_pow and len(world.pellets) > 0:
+            if len(world.power_pellets) == 0:
+                p_idx = random.randint(0, len(world.pellets) - 1)
+            else:
+                p_arr = np.array(world.pellets)
+                pow_arr = np.array(world.power_pellets)
+                dists = np.min(np.sum((p_arr[:, None, :] - pow_arr[None, :, :]) ** 2, axis=2), axis=1)
+                p_idx = int(np.argmax(dists))
+            promoted = world.pellets.pop(p_idx)
+            world.power_pellets.append(promoted)
+            gr, gc = int(promoted[1] * obs_resolution), int(promoted[0] * obs_resolution)
+            grid[gr, gc] = POWER
+        while len(world.power_pellets) > target_n_pow:
+            demoted = world.power_pellets.pop()
+            world.pellets.append(demoted)
+            gr, gc = int(demoted[1] * obs_resolution), int(demoted[0] * obs_resolution)
+            grid[gr, gc] = PELLET
     world._update_pellet_arrays()
 
     valid_spawns = []

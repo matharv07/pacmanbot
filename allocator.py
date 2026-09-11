@@ -95,13 +95,17 @@ def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
     if dist == math.inf:
         return []    
     tasks = []
-    score = _dist_score(dist, HUNT_SCALE)
+    #gradient-based hunt score: linear base + steep acceleration as distance decreases
+    base_score = _dist_score(dist, HUNT_SCALE)
+    close_gradient = 2.0 * math.exp(-dist / 6.0)
+    score = base_score + close_gradient
     tasks.append(Task(task_type=TaskType.HUNT, target_pos=(pr, pc), score=score, created_frame=frame, owner=ghost.gid, target_speed=1.0))
     for cr, cc in _get_cutoff_candidates(ghost, pr, pc):
         cutoff_key = (round(cr, 2), round(cc, 2))
         cutoff_info = dists.get(cutoff_key) or dists.get((cr, cc))
         if cutoff_info and cutoff_info[0] != math.inf:
-            cutoff_score = _dist_score(cutoff_info[0], HUNT_SCALE) * 0.85
+            c_dist = cutoff_info[0]
+            cutoff_score = (_dist_score(c_dist, HUNT_SCALE) + 2.0 * math.exp(-c_dist / 6.0)) * 0.85
             #pincer bonus: incentivize flanking ghosts to cut off Pacman ahead of path
             tasks.append(Task(task_type=TaskType.HUNT, target_pos=(cr, cc), score=1.15 * cutoff_score, created_frame=frame, owner=ghost.gid, target_speed=1.0))
     return tasks
@@ -118,8 +122,8 @@ def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
         dist, _ = info
         if dist == math.inf:
             continue
-        #high priority to deny Pacman invincibility
-        score = _dist_score(dist, CONVERT_SCALE) + 1.20
+        #distance-dependent conversion score that rewards opportunistic defense without overriding close-range hunting
+        score = 1.0 * _dist_score(dist, CONVERT_SCALE)
         tasks.append(Task(task_type=TaskType.CONVERT, target_pos=yx_pos, score=score, created_frame=frame, target_speed=1.0))
     return tasks
 

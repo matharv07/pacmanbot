@@ -34,10 +34,13 @@ class Stage:
     def cols(self) -> int:
         return int(self.world_width * self.obs_resolution)
 
-STAGES = [Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=4, n_power=6,  advance_return=-5.0, min_updates=120, target_kill_rate=0.35),
-    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=14, advance_return=-2.0, min_updates=150, target_kill_rate=0.42),
-    Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=24, advance_return=0.0,  min_updates=200, target_kill_rate=0.48),
-    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0, target_kill_rate=0.55)]
+STAGES = [
+    Stage(world_height=7,  world_width=9,  obs_resolution=1.0, n_ghosts=3, n_power=1,  advance_return=25.0, min_updates=100, target_kill_rate=0.70),
+    Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=4, n_power=2,  advance_return=30.0, min_updates=120, target_kill_rate=0.75),
+    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=8,  advance_return=25.0, min_updates=150, target_kill_rate=0.75),
+    Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=16, advance_return=25.0, min_updates=180, target_kill_rate=0.75),
+    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0, target_kill_rate=0.80),
+]
 
 ADVANCE_WINDOW = 50    #rolling window of updates achieving return/kill threshold required to clear a stage
 
@@ -88,10 +91,10 @@ class CurriculumScheduler:
             hist = list(self._return_history)
             avg_first = sum(hist[:half]) / half
             avg_second = sum(hist[half:]) / half
-            competency_kill = self.stage.target_kill_rate * 0.85
-            # If returns have flattened out (< 0.5 improvement) and policy maintains competent baseline (>= 90% of target kill rate)
-            if (avg_second - avg_first) < 0.5 and (avg_kill >= competency_kill or avg_ret >= self.stage.advance_return):
-                print(f"Curriculum advancing due to plateau: improvement {avg_second - avg_first:.2f} < 0.5 (Current avg ret: {avg_second:.2f}, kill: {avg_kill:.1%})")
+            competency_kill = self.stage.target_kill_rate * 0.90
+            #if returns have flattened out (< 0.5 change) and policy maintains competent baseline
+            if abs(avg_second - avg_first) < 0.5 and avg_kill >= competency_kill and avg_ret >= (self.stage.advance_return - 5.0):
+                print(f"Curriculum advancing due to plateau: change {avg_second - avg_first:.2f} < 0.5 (Current avg ret: {avg_second:.2f}, kill: {avg_kill:.1%})")
                 return True
         return False
 

@@ -52,16 +52,16 @@ PPO_EPOCHS      = 4
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
 CLIP_EPS        = 0.2
-ENT_COEF        = 0.01
+ENT_COEF        = 0.002
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 2e-4
-BC_INIT         = 0.25
+BC_INIT         = 0.5
 BC_FLOOR        = 0.0
 K_NOMINATIONS   = 3
 LOG_DIR         = os.path.join(os.path.dirname(__file__), "logs")
 CKPT_DIR        = os.path.join(os.path.dirname(__file__), "checkpoints")
-BC_ANNEAL_UPDATES = 40
+BC_ANNEAL_UPDATES = 80
 BC_ADVANCE_GATE = 0.10
 TARGET_KL       = 0.05
 CURRICULUM_START_STAGE = 0
@@ -156,7 +156,7 @@ class RunningMeanStd(nn.Module):
         new_var = M2 / total_count
         self.mean.copy_(new_mean)
         self.var.copy_(new_var)
-        self.count.copy_(total_count)
+        self.count.copy_(torch.clamp(total_count, max=100000.0))
 
     def forward(self, x, unnorm=False):
         if unnorm:
@@ -320,13 +320,9 @@ class VecEnv:
         return self.current_obs
 
     def set_curriculum(self, current_stage_idx, static_pacman=False):
-        import random
         from curriculum import STAGES
+        s = STAGES[current_stage_idx]
         for p in self.parent:
-            if current_stage_idx == 0 or random.random() < 0.8:
-                s = STAGES[current_stage_idx]
-            else:
-                s = STAGES[random.randint(0, current_stage_idx - 1)]
             p.send(("set_curriculum", (s.rows, s.cols, s.n_ghosts, s.n_power, static_pacman)))
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
         return self.current_obs
@@ -640,7 +636,10 @@ def train():
     train_transfer   = BatchTransfer(DEVICE)
     max_updates = int(os.environ.get("MAX_UPDATES", "50001"))
     for update in range(start_update, max_updates):
-        anneal_frac = max(0.0, 1.0 - (update - 1) / BC_ANNEAL_UPDATES)
+        if bc_decay_step < BC_ANNEAL_UPDATES:
+            anneal_frac = 0.5 * (1.0 + math.cos(math.pi * bc_decay_step / BC_ANNEAL_UPDATES))
+        else:
+            anneal_frac = 0.0
         bc_prob = anneal_frac if anneal_frac >= 0.05 else 0.0
         # static_pacman transition removed: pacman moves dynamically from update 1
         t_start_rollout = time.time()
@@ -1037,9 +1036,10 @@ def train():
             torch.cuda.empty_cache()
             current_returns = [0.0] * NUM_ENVS
             for pg in opt_actor.param_groups:
-                pg['lr'] *= 0.5
+                pg['lr'] = max(4e-5, pg['lr'] * 0.75)
             for pg in opt_critic.param_groups:
-                pg['lr'] *= 0.5
+                pg['lr'] = max(4e-5, pg['lr'] * 0.75)
+            ret_rms.count.clamp_(max=10000.0)
             critic_warmup_remaining = 20
             with open(log_path, "a") as f:
                 f.write(json.dumps({"curriculum_advance": curriculum.stage_idx, "update": update, "new_grid": f"{stage.rows}x{stage.cols}", "new_lr": opt_actor.param_groups[0]['lr']}) + "\n")

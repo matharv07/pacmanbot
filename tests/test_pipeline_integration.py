@@ -14,21 +14,21 @@ def test_curriculum_logic():
     print("Testing curriculum logic...")
     cs = CurriculumScheduler(start_stage=0)
     assert cs.stage_idx == 0
-    for _ in range(120):
-        cs.record_return(mean_return=-6.5, kill_rate=0.55)
-    assert cs.should_advance(), "Curriculum should advance with 55% kill rate (dominant gate)"
+    for _ in range(100):
+        cs.record_return(mean_return=24.0, kill_rate=0.82)
+    assert cs.should_advance(), "Curriculum should advance with 82% kill rate (dominant gate)"
     cs.advance()
     assert cs.stage_idx == 1, f"Expected Stage 1, got {cs.stage_idx}"
     cs0 = CurriculumScheduler(start_stage=0)
-    for _ in range(120):
-        cs0.record_return(mean_return=-4.5, kill_rate=0.36)
-    assert cs0.should_advance(), "Curriculum should advance with return=-4.5 >= -5.0 and kill=36% >= 35%"
+    for _ in range(100):
+        cs0.record_return(mean_return=26.0, kill_rate=0.72)
+    assert cs0.should_advance(), "Curriculum should advance with return=26.0 >= 25.0 and kill=72% >= 70%"
     cs0.advance()
     assert cs0.stage_idx == 1
     cs_plateau = CurriculumScheduler(start_stage=0)
-    for _ in range(170):
-        cs_plateau.record_return(mean_return=-8.0, kill_rate=0.31)
-    assert cs_plateau.should_advance(), "Curriculum should advance via plateau detection with stalled return and 31% kill rate"
+    for _ in range(150):
+        cs_plateau.record_return(mean_return=21.0, kill_rate=0.65)
+    assert cs_plateau.should_advance(), "Curriculum should advance via plateau detection with stalled return and 65% kill rate"
     cs_plateau.advance()
     assert cs_plateau.stage_idx == 1
     print("✓ Curriculum test passed!")

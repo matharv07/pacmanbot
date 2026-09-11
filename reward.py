@@ -45,7 +45,7 @@ class RewardShaper:
     def _phi_hunt(self, ghost, target) -> float:
         if getattr(ghost, 'pacman_powered', False) or target is None:
             return 0.0
-        # Use cached Dijkstra distance if available (from CBBA auction)
+        #using cached Dijkstra distance if available (from CBBA auction)
         if hasattr(ghost, 'cbba_agent') and target in ghost.cbba_agent._dist_cache:
             d = ghost.cbba_agent._dist_cache[target]
             if math.isinf(d) or math.isnan(d):
@@ -55,7 +55,8 @@ class RewardShaper:
         if math.isinf(d) or math.isnan(d):
             d = 999.0
         diag = math.hypot(ghost.world.width, ghost.world.height)
-        return -self.alpha * (d / diag)
+        #gradient-based hunt potential: global linear slope + steep exponential surge as distance closes
+        return -self.alpha * (d / diag + 1.5 * (1.0 - math.exp(-d / 8.0)))
 
     def _phi_flee(self, ghost, target) -> float:
         if not getattr(ghost, 'pacman_powered', False) or target is None:
@@ -68,8 +69,8 @@ class RewardShaper:
             d = abs(ghost.y - target[0]) + abs(ghost.x - target[1])
         if math.isinf(d) or math.isnan(d):
             d = 999.0
-        diag = math.hypot(ghost.world.width, ghost.world.height)
-        return self.alpha * (d / diag)
+        #danger potential: strongly negative when close to powered Pacman, vanishing to 0 as ghost escapes
+        return -self.alpha * 2.0 * math.exp(-d / 6.0)
 
     def _phi_surround(self, ghost, all_ghosts, target) -> float:
         """Rewards multi-angle pincer/encirclement around Pacman using circular variance."""

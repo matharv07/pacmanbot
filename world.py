@@ -328,7 +328,7 @@ class World:
         py = max(radius, min(self.height - radius, py))
         return px, py
 
-    def generate(self, n_obstacles=25, complexity=2):
+    def generate(self, n_obstacles=25, complexity=2, n_power=None):
         cols = int(self.width / self.resolution)
         rows = int(self.height / self.resolution)
         target_area = cols * rows * 0.35
@@ -476,13 +476,16 @@ class World:
                 if (gx, gy) not in spatial_hash:
                     spatial_hash[(gx, gy)] = []
                 spatial_hash[(gx, gy)].append(p)
-        n_power = min(28, len(self.pellets) // 4)
-        if n_power > 0:
+        if n_power is not None:
+            n_pow = max(0, min(int(n_power), len(self.pellets)))
+        else:
+            n_pow = min(28, len(self.pellets) // 4)
+        if n_pow > 0:
             pellets_arr = np.array(self.pellets)
             #Farthest Point Sampling (FPS) to maximize distance between power pellets
             power_indices = [random.randint(0, len(self.pellets)-1)]
             distances = np.sum((pellets_arr - pellets_arr[power_indices[0]])**2, axis=1)
-            for _ in range(1, n_power):
+            for _ in range(1, n_pow):
                 farthest = int(np.argmax(distances))
                 power_indices.append(farthest)
                 new_dists = np.sum((pellets_arr - pellets_arr[farthest])**2, axis=1)
