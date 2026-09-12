@@ -50,6 +50,14 @@ def test_curriculum_logic():
     cs_plateau.advance()
     assert cs_plateau.stage_idx == 1
 
+    # Test Stage 2 large-grid calibration advancement (mean return ~5.0, kill rate ~84%)
+    cs2 = CurriculumScheduler(start_stage=2)
+    for _ in range(150):
+        cs2.record_return(mean_return=5.0, kill_rate=0.84)
+    assert cs2.should_advance(), "Curriculum Stage 2 should advance with return=5.0 >= 0.0 and kill=84% >= 75%"
+    cs2.advance()
+    assert cs2.stage_idx == 3, f"Expected Stage 3, got {cs2.stage_idx}"
+
     # Test state_dict recovery with desynchronized history
     cs_load = CurriculumScheduler(start_stage=1)
     corrupted_state = {
