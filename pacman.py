@@ -21,12 +21,33 @@ from net import GhostActor
 from world import World
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--stage", type=int, default=4, help="Curriculum stage index to visualize")
+parser.add_argument("--stage", type=int, default=None, help="Curriculum stage index to visualize (default: matches checkpoint stage)")
 parser.add_argument("--checkpoint", type=int, default=-1, help="Checkpoint to load")
 args, _ = parser.parse_known_args()
 
 check = args.checkpoint
-STAGE = STAGES[args.stage] if args.stage != -1 and 0 <= args.stage < len(STAGES) else None
+stage_choice = args.stage
+if stage_choice is None:
+    ckpts = glob.glob("checkpoints/ckpt_*.pt")
+    if ckpts:
+        def _ckpt_score(f):
+            try:
+                num = int(f.split('ckpt_')[-1].split('.pt')[0])
+                return (num > 0 and num % 100 == 0, num)
+            except ValueError:
+                return (False, -1)
+        latest_ckpt = max(ckpts, key=_ckpt_score)
+        if check != -1 and os.path.exists(f"checkpoints/ckpt_{check}.pt"):
+            latest_ckpt = f"checkpoints/ckpt_{check}.pt"
+        try:
+            c_data = torch.load(latest_ckpt, map_location='cpu', weights_only=False)
+            stage_choice = c_data.get("curriculum", {}).get("stage_idx", 2)
+        except Exception:
+            stage_choice = 2
+    else:
+        stage_choice = 2
+
+STAGE = STAGES[stage_choice] if stage_choice != -1 and 0 <= stage_choice < len(STAGES) else None
 if STAGE:
     ROWS = STAGE.rows
     COLS = STAGE.cols
@@ -86,10 +107,11 @@ TOGGLE_WIDTH, TOGGLE_HEIGHT = 160, 32
 TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH * 2 - 20, ROWS * CELL + 8, TOGGLE_WIDTH, TOGGLE_HEIGHT)
 RL_TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH - 10, ROWS * CELL + 8, TOGGLE_WIDTH, TOGGLE_HEIGHT)
 RL_ACTOR = None
+RL_PREDICTOR_WEIGHTS = None
 RL_DEVICE = None
 
 def load_rl_model():
-    global RL_ACTOR, RL_DEVICE, RL_MODE
+    global RL_ACTOR, RL_PREDICTOR_WEIGHTS, RL_DEVICE, RL_MODE
     if RL_ACTOR is not None:
         return True
     print("Loading RL Model...")
@@ -114,6 +136,7 @@ def load_rl_model():
         checkpoint = torch.load(latest, map_location=RL_DEVICE, weights_only=False)
         RL_ACTOR.load_state_dict(checkpoint["actor"])
         RL_ACTOR.eval()
+        RL_PREDICTOR_WEIGHTS = checkpoint.get("predictor", None)
         print("RL Model loaded successfully.")
         return True
     except Exception as e:
@@ -693,6 +716,13 @@ class Game:
         self._bg_surface = None
         if RL_MODE:
             load_rl_model()
+            if RL_PREDICTOR_WEIGHTS is not None:
+                for g in self.ghosts.values():
+                    if hasattr(g, 'belief_map') and hasattr(g.belief_map, 'predictor'):
+                        try:
+                            g.belief_map.predictor.load_state_dict(RL_PREDICTOR_WEIGHTS)
+                        except Exception:
+                            pass
 
     def pellets_left(self):
         return int(np.sum(np.isin(self.grid, (PELLET, POWER))))
@@ -791,7 +821,7 @@ class Game:
                             if 0 <= r < R and 0 <= c < C:
                                 self.recent_nom[gid][r, c] = 1.0
                         tasks = actions_to_tasks(g, scores_map, indices, self.frame_counter, obs_resolution=1.0)
-                        g.cbba_agent._last_auction = self.frame_counter
+                        g.cbba_agent._last_auction = self.frame_counter + 6
                         all_tasks = tasks
                         h_dists = {}
                         g.cbba_agent._task_map.clear()
@@ -804,7 +834,7 @@ class Game:
         self.player.update(self.ghosts)
         powered = self.player.powered
         for ghost in self.ghosts.values():
-            ghost.update((self.player.y, self.player.x), powered, self.ghosts)
+            ghost.update((self.player.y, self.player.x), powered, self.ghosts, speed_mult=getattr(ghost, 'current_speed_mult', 1.0))
         if not self.player.dead:
             for gid, ghost in list(self.ghosts.items()):
                 if ghost.dead:
