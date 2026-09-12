@@ -5,6 +5,7 @@ Builds the 16-channel spatial tensor and ~100-dim vector tensor per ghost,
 and converts the RL actor's sampled waypoints back into CBBA Task objects.
 """
 
+import math
 import numpy as np
 from allocator import Task, TaskType
 
@@ -17,7 +18,7 @@ MAX_W = 41
 MAX_GHOSTS   = 7
 SPATIAL_CH   = 16        #number of spatial channels (see channel map below)
 GLOBAL_SPATIAL_CH = 11   #number of channels in the omniscient global state
-VEC_DIM      = 110
+VEC_DIM      = 117
 CRITIC_VEC_DIM = MAX_GHOSTS * VEC_DIM + MAX_GHOSTS
 
 """
@@ -41,6 +42,31 @@ def _pacman_target(ghost):
             return top[0]
     return None
 
+_INV_TWO_SIGMA_SQ = 1.0 / (2.0 * 0.6 * 0.6)
+
+def _place_single_pixel(channel, fx, fy, rows: int, cols: int, obs_res: float):
+    r, c = int(fy * obs_res), int(fx * obs_res)
+    if 0 <= r < rows and 0 <= c < cols:
+        channel[r, c] = 1.0
+
+def _place_blob(channel, fy, fx, rows: int, cols: int, obs_res: float):
+    y_scaled = fy * obs_res
+    x_scaled = fx * obs_res
+    cr, cc = int(y_scaled), int(x_scaled)
+    for dr in (-1, 0, 1):
+        nr = cr + dr
+        if 0 <= nr < rows:
+            dy = y_scaled - (nr + 0.5)
+            dy2 = dy * dy
+            for dc in (-1, 0, 1):
+                nc = cc + dc
+                if 0 <= nc < cols:
+                    dx = x_scaled - (nc + 0.5)
+                    d2 = dy2 + dx * dx
+                    val = math.exp(-d2 * _INV_TWO_SIGMA_SQ)
+                    if val > channel[nr, nc]:
+                        channel[nr, nc] = val
+
 def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_resolution: float = 1.0) -> np.ndarray:
     """Returns (SPATIAL_CH, rows, cols) float32 tensor."""
     out = np.zeros((SPATIAL_CH, rows, cols), dtype=np.float32)
@@ -54,60 +80,55 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_reso
             if c_idx > 0: out[0, r_idx, c_idx-1] = 1.0
             if c_idx < cols-1: out[0, r_idx, c_idx+1] = 1.0
 
-    def _place_single_pixel(channel, fx, fy):
-        r, c = int(fy * obs_resolution), int(fx * obs_resolution)
-        if 0 <= r < rows and 0 <= c < cols:
-            channel[r, c] = 1.0
-
     for p in ghost.known_pellets:
-        _place_single_pixel(out[1], p[0], p[1])
+        _place_single_pixel(out[1], p[0], p[1], rows, cols, obs_resolution)
     for p in ghost.known_power_pellets:
-        _place_single_pixel(out[2], p[0], p[1])
+        _place_single_pixel(out[2], p[0], p[1], rows, cols, obs_resolution)
     bm = ghost.belief_map
     if hasattr(bm, '_open_arr') and len(bm._open_arr) > 0:
-        r_arr = (bm._open_arr[:, 0] * obs_resolution).astype(np.int32)
-        c_arr = (bm._open_arr[:, 1] * obs_resolution).astype(np.int32)
+        cache = getattr(bm, '_spatial_rc_cache', None)
+        cache_key = (obs_resolution, rows, cols)
+        if cache is None or cache[0] != cache_key:
+            r_arr = (bm._open_arr[:, 0] * obs_resolution).astype(np.int32)
+            c_arr = (bm._open_arr[:, 1] * obs_resolution).astype(np.int32)
+            valid = (r_arr >= 0) & (r_arr < rows) & (c_arr >= 0) & (c_arr < cols)
+            valid_indices = np.where(valid)[0]
+            bm._spatial_rc_cache = (cache_key, r_arr[valid], c_arr[valid], valid_indices)
+        _, r_valid, c_valid, valid_indices = bm._spatial_rc_cache
         if hasattr(bm, '_b_flat') and bm._initialised:
-            valid = (r_arr >= 0) & (r_arr < rows) & (c_arr >= 0) & (c_arr < cols) & (np.arange(len(r_arr)) < len(bm._b_flat))
-            np.maximum.at(out[4], (r_arr[valid], c_arr[valid]), bm._b_flat[valid])
+            if len(valid_indices) <= len(bm._b_flat):
+                np.maximum.at(out[4], (r_valid, c_valid), bm._b_flat[valid_indices])
         if hasattr(bm, '_safety'):
-            valid = (r_arr >= 0) & (r_arr < rows) & (c_arr >= 0) & (c_arr < cols) & (np.arange(len(r_arr)) < len(bm._safety))
-            np.maximum.at(out[5], (r_arr[valid], c_arr[valid]), bm._safety[valid])
-    _BLOB_SIGMA = 0.6
-
-    def _place_blob(channel, fy, fx):
-        cr, cc = int(fy * obs_resolution), int(fx * obs_resolution)
-        for dr in range(-1, 2):
-            for dc in range(-1, 2):
-                nr, nc = cr + dr, cc + dc
-                if 0 <= nr < rows and 0 <= nc < cols:
-                    d2 = (fy * obs_resolution - (nr + 0.5))**2 + (fx * obs_resolution - (nc + 0.5))**2
-                    channel[nr, nc] = max(channel[nr, nc], np.exp(-d2 / (2 * _BLOB_SIGMA**2)))
+            if len(valid_indices) <= len(bm._safety):
+                np.maximum.at(out[5], (r_valid, c_valid), bm._safety[valid_indices])
                     
-    _place_blob(out[6], ghost.y, ghost.x)
+    _place_blob(out[6], ghost.y, ghost.x, rows, cols, obs_resolution)
     target = _pacman_target(ghost)
     if target is not None:
         tr, tc = target
-        _place_blob(out[7], float(tr), float(tc))
+        _place_blob(out[7], float(tr), float(tc), rows, cols, obs_resolution)
     for gid in range(MAX_GHOSTS):
         if gid == ghost.gid:
             continue
         ch = 8 + (gid if gid < ghost.gid else gid - 1)
         pos = ghost.known_agents.get(gid)
         if pos is not None and pos != "UNKNOWN":
-            _place_blob(out[ch], float(pos[0]), float(pos[1]))
+            _place_blob(out[ch], float(pos[0]), float(pos[1]), rows, cols, obs_resolution)
             
     stale_ch = np.ones((rows, cols), dtype=np.float32)
     if ghost.prm_last_seen:
-        nodes = np.array(list(ghost.prm_last_seen.keys()))
-        last_seen = np.array(list(ghost.prm_last_seen.values()))
-        ri = (nodes[:, 0] * obs_resolution).astype(np.int32)
-        ci = (nodes[:, 1] * obs_resolution).astype(np.int32)
-        valid = (ri >= 0) & (ri < rows) & (ci >= 0) & (ci < cols)
-        v_ri, v_ci, v_ls = ri[valid], ci[valid], last_seen[valid]
-        seen_mask = v_ls >= 0
-        stale_vals = np.clip(ghost.frame - v_ls[seen_mask], 0, 200) / 200.0
-        stale_ch[v_ri[seen_mask], v_ci[seen_mask]] = stale_vals
+        cur_frame = ghost.frame
+        for (pr, pc), ls in ghost.prm_last_seen.items():
+            if ls >= 0:
+                ri = int(pr * obs_resolution)
+                ci = int(pc * obs_resolution)
+                if 0 <= ri < rows and 0 <= ci < cols:
+                    stale_val = (cur_frame - ls) / 200.0
+                    if stale_val < 0.0:
+                        stale_val = 0.0
+                    elif stale_val > 1.0:
+                        stale_val = 1.0
+                    stale_ch[ri, ci] = stale_val
     out[14] = stale_ch
     out[15] = recent_noms[:rows, :cols]
     return out
@@ -126,7 +147,12 @@ def build_vector(ghost) -> np.ndarray:
         if gid == ghost.gid:
             continue
         st = ghost.known_agents.get(gid)
-        f.append(1.0 if st == "UNKNOWN" or st is None else 0.0)
+        is_dead = 1.0 if (hasattr(ghost, 'is_agent_dead') and ghost.is_agent_dead(gid)) or (hasattr(ghost, 'dead_agents') and gid in ghost.dead_agents) else 0.0
+        is_unknown = 1.0 if (st == "UNKNOWN" or st is None) and not is_dead else 0.0
+        f.append(is_unknown)
+        f.append(is_dead)
+    n_dead = sum(1.0 for gid in range(MAX_GHOSTS) if gid != ghost.gid and ((hasattr(ghost, 'is_agent_dead') and ghost.is_agent_dead(gid)) or (hasattr(ghost, 'dead_agents') and gid in ghost.dead_agents)))
+    f.append(n_dead / float(MAX_GHOSTS - 1))
     f.append(min(ghost.frame, 2000) / 2000.0)
     f.append(1.0 if getattr(ghost, 'in_fallback_mode', False) else 0.0)
     import math
@@ -196,6 +222,17 @@ def build_valid_mask(ghost, rows: int, cols: int, obs_resolution: float = 1.0, s
     return mask
 
 def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int, obs_resolution: float = 1.0) -> list:
+    if not isinstance(scores_map, np.ndarray):
+        scores_map = np.array(scores_map, dtype=np.float32)
+    if scores_map.ndim < 2:
+        rows = int(getattr(ghost.world, 'height', 10) * obs_resolution)
+        cols = int(getattr(ghost.world, 'width', 10) * obs_resolution)
+        new_map = np.zeros((rows, cols), dtype=np.float32)
+        for idx_i, (r, c) in enumerate(indices):
+            if 0 <= r < rows and 0 <= c < cols:
+                val = float(scores_map[idx_i]) if idx_i < len(scores_map) else 1.0
+                new_map[r, c] = val
+        scores_map = new_map
     rows, cols = scores_map.shape
     tasks = []
     target = _pacman_target(ghost)

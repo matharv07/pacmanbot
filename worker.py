@@ -64,6 +64,7 @@ class Env:
                     pass
 
     def reset(self):
+        self.max_frames = int(self.world_height * self.world_width * 2) + 1000
         self.grid, self._player_start, self.world = generate_map(
             world_height=self.world_height, world_width=self.world_width, n_power=self.n_power, random_spawn=self.static_pacman, obs_resolution=self.obs_resolution)
         self.player = Player(self.grid, self._player_start, self.world, obs_resolution=self.obs_resolution)
@@ -89,6 +90,8 @@ class Env:
         self.ghosts = { i: Ghost(i, self.grid, pos, GHOST_COLORS[i % len(GHOST_COLORS)], self._player_start, self.world) for i, pos in enumerate(starts) }
         self.frame = 0
         self.shaper.reset()
+        for g in self.ghosts.values():
+            g._had_los_prev = False
         self._pending_pred = None
         if self._stored_predictor_weights is not None:
             for g in self.ghosts.values():
@@ -211,31 +214,53 @@ class Env:
                 for r, c in indices:
                     if 0 <= r < R and 0 <= c < C:
                         self.recent_nom[gid][r, c] = 1.0
-                if self.frame % DECISION_INTERVAL == 0:
-                    tasks = actions_to_tasks(g, scores_map, indices, self.frame, self.obs_resolution)
-                    g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
-                    if random.random() < bc_prob and h_tasks:
-                        all_tasks = h_tasks + tasks
-                        h_dists = dict(self._cached_hdists.get(gid, {}))
-                        info_heuristic_merges += 1
-                    else:
-                        all_tasks = tasks
-                        h_dists = {}
-                    info_total_auctions += 1
-                    g.cbba_agent._task_map.clear()
-                    #only calculate Dijkstra for RL tasks, h_dists already has heuristic distances
-                    if tasks:
-                        all_targets = [t.target_pos for t in tasks]
-                        from pathfinder import dijkstra_multi
-                        dists = dijkstra_multi(g.world, (g.y, g.x), all_targets)
-                        h_dists.update(dists)  
-                    g.cbba_agent._phase1(g, all_tasks, h_dists)
+        if self.frame % DECISION_INTERVAL == 0:
+            from cbba import _task_key
+            from pathfinder import dijkstra_multi
+            pooled_tasks = {}
+            for gid in alive:
+                if gid not in action_dict:
+                    continue
+                g = self.ghosts[gid]
+                indices, scores_map, _ = action_dict[gid]
+                tasks = actions_to_tasks(g, scores_map, indices, self.frame, self.obs_resolution)
+                h_tasks = self._cached_htasks.get(gid, []) if bc_prob > 0.0 else []
+                if random.random() < bc_prob and h_tasks:
+                    cand_tasks = h_tasks + tasks
+                    info_heuristic_merges += 1
+                else:
+                    cand_tasks = tasks
+                cur_active = g.cbba_agent.get_active_task()
+                if cur_active is not None and (self.frame - cur_active.created_frame < 24):
+                    d_cur = math.hypot(cur_active.target_pos[0] - g.y, cur_active.target_pos[1] - g.x)
+                    if d_cur > 0.6 and cur_active not in cand_tasks:
+                        cand_tasks.append(cur_active)
+                for t in cand_tasks:
+                    k = _task_key(t)
+                    if k not in pooled_tasks or t.score > pooled_tasks[k].score:
+                        pooled_tasks[k] = t
+            if pooled_tasks:
+                all_pooled_tasks = list(pooled_tasks.values())
+                all_targets = [t.target_pos for t in all_pooled_tasks]
+                for gid in alive:
+                    if gid in action_dict:
+                        g = self.ghosts[gid]
+                        g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
+                        info_total_auctions += 1
+                        h_dists = dijkstra_multi(g.world, (g.y, g.x), all_targets)
+                        g.cbba_agent._phase1(g, all_pooled_tasks, h_dists)
         rewards = {gid: 0.0 for gid in alive}
         done = False
         pred_samples = []
         for _ in range(DECISION_INTERVAL):
             self.frame += 1
+            score_before = getattr(self.player, 'score', 0)
             self.player.update(self.ghosts)
+            score_diff = getattr(self.player, 'score', 0) - score_before
+            if score_diff > 0:
+                for a_gid in alive:
+                    if a_gid in rewards and not self.ghosts[a_gid].dead:
+                        rewards[a_gid] -= 0.05 * score_diff
             powered = self.player.powered
             new_pac_v = np.array([float(self.player.vy), float(self.player.vx)], dtype=np.float32)
             if self._pending_pred is not None:
@@ -245,6 +270,11 @@ class Env:
             for gid, ghost in list(self.ghosts.items()):
                 if ghost.dead:
                     continue
+                has_los = (ghost.known_pacman is not None)
+                if has_los and not getattr(ghost, '_had_los_prev', False) and not powered:
+                    if gid in rewards:
+                        rewards[gid] += 2.0
+                ghost._had_los_prev = has_los
                 ghost.update((self.player.y, self.player.x), powered, self.ghosts, speed_mult=getattr(ghost, 'current_speed_mult', 1.0))
             if not self.player.dead:
                 seeing_ghosts = [g for g in self.ghosts.values() if not g.dead and g.known_pacman is not None]
@@ -307,22 +337,61 @@ class Env:
                             break
                     if collided:
                         if self.player.powered:
+                            kill_y, kill_x = ghost.y, ghost.x
                             ghost.kill()
+                            for other_gid, og in self.ghosts.items():
+                                if other_gid != gid and not og.dead:
+                                    d_w = math.hypot(og.y - kill_y, og.x - kill_x)
+                                    witnesses = False
+                                    if d_w <= 12.0:
+                                        if og.world and hasattr(og.world, 'line_of_sight'):
+                                            witnesses = og.world.line_of_sight((og.x, og.y), (kill_x, kill_y), radius=og.radius, step_size=0.5)
+                                        else:
+                                            witnesses = True
+                                    if witnesses:
+                                        og.witness_death(gid, self.ghosts)
                             if gid in rewards:
                                 rewards[gid] -= 40.0
                         else:
                             self.player.die()
                             done = True
+                            time_decay = math.exp(-self.frame / 100.0)
+                            speed_mult = 1.0 + 1.5 * time_decay
+                            pac_score = getattr(self.player, 'score', 0)
+                            score_dock = min(pac_score * 0.15, 60.0)
+                            direct_kill_award = max(50.0, 100.0 * speed_mult - score_dock)
                             if gid in rewards:
-                                rewards[gid] += 100.0
-                            TEAM_KILL_BASE = 40.0
-                            TEAM_KILL_PROX = 40.0
+                                rewards[gid] += direct_kill_award
+                            TEAM_KILL_BASE = 40.0 * speed_mult
+                            TEAM_KILL_PROX = 40.0 * speed_mult
                             for other_gid, other_ghost in self.ghosts.items():
                                 if other_gid != gid and not other_ghost.dead and other_gid in rewards:
                                     dist = math.hypot(other_ghost.y - self.player.y, other_ghost.x - self.player.x)
-                                    #decay slower for continuous space, base reward ensures credit assignment
-                                    proximity_scale = math.exp(-dist / 10.0)
-                                    rewards[other_gid] += TEAM_KILL_BASE + TEAM_KILL_PROX * proximity_scale
+                                    proximity_scale = math.exp(-dist / 8.0)
+                                    team_award = max(15.0, TEAM_KILL_BASE + TEAM_KILL_PROX * proximity_scale - score_dock * 0.5)
+                                    rewards[other_gid] += team_award
+                            #multi-agent swarming / pincer group catch bonus
+                            swarm_ghosts = []
+                            angles = []
+                            for cand_gid, cand_ghost in self.ghosts.items():
+                                if not cand_ghost.dead:
+                                    cd = math.hypot(cand_ghost.y - self.player.y, cand_ghost.x - self.player.x)
+                                    if cd <= 6.0:
+                                        swarm_ghosts.append(cand_gid)
+                                        dy = cand_ghost.y - self.player.y
+                                        dx = cand_ghost.x - self.player.x
+                                        if dy != 0 or dx != 0:
+                                            angles.append(math.atan2(dy, dx))
+                            if len(swarm_ghosts) >= 2 and len(angles) >= 2:
+                                N = len(angles)
+                                R = math.hypot(sum(math.cos(a) for a in angles) / N,
+                                               sum(math.sin(a) for a in angles) / N)
+                                angular_enclosure = 1.0 - R
+                                swarm_mult = angular_enclosure * (len(swarm_ghosts) / max(len(self.ghosts), 1))
+                                swarm_bonus = 60.0 * swarm_mult * speed_mult
+                                for sg_id in swarm_ghosts:
+                                    if sg_id in rewards:
+                                        rewards[sg_id] += swarm_bonus
                             break
                 if not any(not g.dead for g in self.ghosts.values()):
                     done = True
@@ -338,16 +407,43 @@ class Env:
                 for o in rewards:
                     rewards[o] -= 10.0
                 break
-            if not done and not self.player.dead:
-                for gid_prox, ghost_prox in self.ghosts.items():
-                    if ghost_prox.dead or gid_prox not in rewards:
+            #extended mesh connectivity awards / penalties
+            alive_now = [g for g in self.ghosts.values() if not g.dead]
+            n_alive_now = len(alive_now)
+            if n_alive_now >= 2:
+                for gid in alive:
+                    if gid not in rewards or self.ghosts[gid].dead:
                         continue
-                    if not self.player.powered:
-                        dist = math.hypot(ghost_prox.y - self.player.y, ghost_prox.x - self.player.x)
-                        #attenuated proximity reward to avoid disincentivizing catch completion
-                        prox = 0.05 * math.exp(-dist / 3.0)
-                        rewards[gid_prox] += prox
-            step_cost = 0.01   #uniform per-frame step cost across all grid sizes
+                    g_self = self.ghosts[gid]
+                    visited = {gid}
+                    q = [g_self]
+                    while q:
+                        curr = q.pop(0)
+                        for og in alive_now:
+                            if og.gid not in visited:
+                                if math.hypot(curr.y - og.y, curr.x - og.x) <= 12.0:
+                                    visited.add(og.gid)
+                                    q.append(og)
+                    if len(visited) == 1:
+                        rewards[gid] -= 0.02   #isolated ghost penalty
+                    elif len(visited) == n_alive_now:
+                        rewards[gid] += 0.005  #full mesh team connectivity reward
+            #corridor anti-clustering / traffic jam penalty
+            alive_ghosts = [g for g in self.ghosts.values() if not g.dead]
+            if len(alive_ghosts) >= 2:
+                for i in range(len(alive_ghosts)):
+                    g1 = alive_ghosts[i]
+                    for j in range(i + 1, len(alive_ghosts)):
+                        g2 = alive_ghosts[j]
+                        d_peer = math.hypot(g1.y - g2.y, g1.x - g2.x)
+                        if d_peer < 0.85:
+                            jam_penalty = 0.015 * (1.0 - d_peer / 0.85)
+                            if g1.gid in rewards:
+                                rewards[g1.gid] -= jam_penalty
+                            if g2.gid in rewards:
+                                rewards[g2.gid] -= jam_penalty
+
+            step_cost = 0.015
             for gid in rewards:
                 if self.ghosts[gid].dead:
                     continue

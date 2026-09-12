@@ -57,7 +57,7 @@ VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 2e-4
 BC_INIT         = 0.5
-BC_FLOOR        = 0.0
+BC_FLOOR        = 0.05
 K_NOMINATIONS   = 3
 LOG_DIR         = os.path.join(os.path.dirname(__file__), "logs")
 CKPT_DIR        = os.path.join(os.path.dirname(__file__), "checkpoints")
@@ -643,7 +643,7 @@ def train():
             anneal_frac = 0.5 * (1.0 + math.cos(math.pi * bc_decay_step / BC_ANNEAL_UPDATES))
         else:
             anneal_frac = 0.0
-        bc_prob = anneal_frac if anneal_frac >= 0.05 else 0.0
+        bc_prob = max(BC_FLOOR, anneal_frac)
         # static_pacman transition removed: pacman moves dynamically from update 1
         t_start_rollout = time.time()
         #per-env, per-step storage (lists of length ROLLOUT_STEPS)
@@ -985,7 +985,7 @@ def train():
         t_rollout = time.time() - t_start_rollout
         mean_ret = round(float(np.mean(ep_returns)), 3) if ep_returns else None
         mean_pac = round(float(np.mean(ep_pacman_scores)), 1) if ep_pacman_scores else None
-        kill_rate = round(float(np.mean(ep_kills)), 3) if ep_kills else 0.0
+        kill_rate = round(float(np.mean(ep_kills)), 3) if ep_kills else None
         if mean_ret is not None:
             if ema_return == 0.0:
                 ema_return = mean_ret
@@ -1026,7 +1026,8 @@ def train():
             "t_ppo":      round(t_ppo, 1)}
         with open(log_path, "a") as f:
             f.write(json.dumps(row) + "\n")
-        curriculum.record_return(mean_ret if lam_bc <= BC_ADVANCE_GATE else None, kill_rate=kill_rate if lam_bc <= BC_ADVANCE_GATE else None)
+        has_eval = (mean_ret is not None and kill_rate is not None and lam_bc <= BC_ADVANCE_GATE)
+        curriculum.record_return(mean_ret if has_eval else None, kill_rate=kill_rate if has_eval else None)
         if curriculum.should_advance():
             curriculum.advance()
             stage = curriculum.stage

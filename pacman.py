@@ -21,7 +21,7 @@ from net import GhostActor
 from world import World
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--stage", type=int, default=None, help="Curriculum stage index to visualize (default: matches checkpoint stage)")
+parser.add_argument("--stage", type=int, default=4, help="Curriculum stage index to visualize (default: 4)")
 parser.add_argument("--checkpoint", type=int, default=-1, help="Checkpoint to load")
 args, _ = parser.parse_known_args()
 
@@ -41,11 +41,11 @@ if stage_choice is None:
             latest_ckpt = f"checkpoints/ckpt_{check}.pt"
         try:
             c_data = torch.load(latest_ckpt, map_location='cpu', weights_only=False)
-            stage_choice = c_data.get("curriculum", {}).get("stage_idx", 2)
+            stage_choice = c_data.get("curriculum", {}).get("stage_idx", 4)
         except Exception:
-            stage_choice = 2
+            stage_choice = 4
     else:
-        stage_choice = 2
+        stage_choice = 4
 
 STAGE = STAGES[stage_choice] if stage_choice != -1 and 0 <= stage_choice < len(STAGES) else None
 if STAGE:
@@ -399,7 +399,7 @@ class Player:
                         has_pp = (self._route_target in self.world.power_pellets) or any(abs(p[0] - tx) < 0.2 and abs(p[1] - ty) < 0.2 for p in self.world.power_pellets)
                         target_eaten = not (has_p or has_pp)
                 else:
-                    tr, tc = int(self._route_target[0]), int(self._route_target[1])
+                    tr, tc = int(self._route_target[1]), int(self._route_target[0])
                     if 0 <= tr < len(self.grid) and 0 <= tc < len(self.grid[0]):
                         target_eaten = (self.grid[tr][tc] not in (PELLET, POWER))
                     else:
@@ -467,19 +467,40 @@ class Player:
                 cells = grid_arr[safe_r, safe_c]
                 passable = valid & (cells != WALL)
             hit_mask = ~passable
-            if heading_len > 0:
-                alignment = ray_vx_arr * desired_vx + ray_vy_arr * desired_vy
-                safe_beyond = heading_len + self.radius + 0.15
-                for r_idx in range(_NUM_STEERING_RAYS):
-                    if alignment[r_idx] > 0.5:
-                        hit_mask[r_idx, _STEERING_STEP_DISTS > safe_beyond] = False
             hit_indices = np.argmax(hit_mask, axis=1)
             has_hit = np.any(hit_mask, axis=1)
             hit_fracs = (hit_indices + 1) / _STEERING_N_STEPS
             ray_penalties = np.where(has_hit, 1000.0 / hit_fracs, 0.0)
             interests = ray_vx_arr * desired_vx + ray_vy_arr * desired_vy
             hysteresis = 0.2 * (ray_vx_arr * cur_vx_norm + ray_vy_arr * cur_vy_norm)
-            scores = interests + hysteresis - ray_penalties
+            if not self.powered and ghosts:
+                ghost_penalties = np.zeros(_NUM_STEERING_RAYS)
+                for g in ghosts.values():
+                    if not g.dead:
+                        g_dx = g.x - self.x
+                        g_dy = g.y - self.y
+                        g_dist = math.hypot(g_dx, g_dy)
+                        if g_dist < 4.0:
+                            g_dir_x = g_dx / (g_dist + 1e-6)
+                            g_dir_y = g_dy / (g_dist + 1e-6)
+                            align = ray_vx_arr * g_dir_x + ray_vy_arr * g_dir_y
+                            ghost_penalties += np.where(align > 0.1, (align ** 2) * (600.0 / max(g_dist, 0.4)), 0.0)
+                scores = interests + hysteresis - ray_penalties - ghost_penalties
+            elif self.powered and ghosts:
+                ghost_attract = np.zeros(_NUM_STEERING_RAYS)
+                for g in ghosts.values():
+                    if not g.dead:
+                        g_dx = g.x - self.x
+                        g_dy = g.y - self.y
+                        g_dist = math.hypot(g_dx, g_dy)
+                        if g_dist < 5.0:
+                            g_dir_x = g_dx / (g_dist + 1e-6)
+                            g_dir_y = g_dy / (g_dist + 1e-6)
+                            align = ray_vx_arr * g_dir_x + ray_vy_arr * g_dir_y
+                            ghost_attract += np.where(align > 0.2, align * 3.0, 0.0)
+                scores = interests + hysteresis - ray_penalties + ghost_attract
+            else:
+                scores = interests + hysteresis - ray_penalties
             best_idx = np.argmax(scores)
             best_vx, best_vy = ray_vx_arr[best_idx], ray_vy_arr[best_idx]
             target_vy = best_vy * self.max_speed * speed_mult
@@ -801,7 +822,7 @@ class Game:
                     g = self.ghosts[gid]
                     sp.append(build_spatial(g, self.recent_nom[gid], R, C, obs_resolution=1.0))
                     ve.append(build_vector(g))
-                    vm.append(build_valid_mask(g, R, C, obs_resolution=1.0))
+                    vm.append(build_valid_mask(g, R, C, obs_resolution=1.0, spatial_walls=sp[-1][0]))
                 if alive:
                     t_sp = torch.tensor(np.stack(sp), device=RL_DEVICE, dtype=torch.float32)
                     t_ve = torch.tensor(np.stack(ve), device=RL_DEVICE, dtype=torch.float32)
@@ -811,6 +832,9 @@ class Game:
                     idx_np = idx.cpu().numpy()
                     sc_np  = scores.cpu().numpy()
                     spd_np = speed.cpu().numpy()
+                    from cbba import _task_key
+                    from pathfinder import dijkstra_multi
+                    pooled_tasks = {}
                     for i, gid in enumerate(alive):
                         g = self.ghosts[gid]
                         indices = [(int(x // C), int(x % C)) for x in idx_np[i]]
@@ -821,16 +845,18 @@ class Game:
                             if 0 <= r < R and 0 <= c < C:
                                 self.recent_nom[gid][r, c] = 1.0
                         tasks = actions_to_tasks(g, scores_map, indices, self.frame_counter, obs_resolution=1.0)
-                        g.cbba_agent._last_auction = self.frame_counter + 6
-                        all_tasks = tasks
-                        h_dists = {}
-                        g.cbba_agent._task_map.clear()
-                        if tasks:
-                            all_targets = [t.target_pos for t in tasks]
-                            from pathfinder import dijkstra_multi
+                        for t in tasks:
+                            k = _task_key(t)
+                            if k not in pooled_tasks or t.score > pooled_tasks[k].score:
+                                pooled_tasks[k] = t
+                    if pooled_tasks:
+                        all_pooled_tasks = list(pooled_tasks.values())
+                        all_targets = [t.target_pos for t in all_pooled_tasks]
+                        for gid in alive:
+                            g = self.ghosts[gid]
+                            g.cbba_agent._last_auction = self.frame_counter + 6
                             dists = dijkstra_multi(g.world, (g.y, g.x), all_targets)
-                            h_dists.update(dists)
-                        g.cbba_agent._phase1(g, all_tasks, h_dists)
+                            g.cbba_agent._phase1(g, all_pooled_tasks, dists)
         self.player.update(self.ghosts)
         powered = self.player.powered
         for ghost in self.ghosts.values():
@@ -873,7 +899,19 @@ class Game:
                         break
                 if collided:
                     if self.player.powered:
+                        kill_x, kill_y = ghost.x, ghost.y
                         ghost.kill()
+                        for other_gid, og in list(self.ghosts.items()):
+                            if other_gid != gid and not og.dead:
+                                d_w = math.hypot(og.y - kill_y, og.x - kill_x)
+                                witnesses = False
+                                if d_w <= 12.0:
+                                    if og.world and hasattr(og.world, 'line_of_sight'):
+                                        witnesses = og.world.line_of_sight((og.x, og.y), (kill_x, kill_y), radius=og.radius, step_size=0.5)
+                                    else:
+                                        witnesses = True
+                                if witnesses:
+                                    og.witness_death(gid, self.ghosts)
                         del self.ghosts[gid]
                         self.player.score += 200
                     else:
@@ -938,8 +976,15 @@ class Game:
         self.screen.set_clip(pygame.Rect(ox, 0, WIDTH, ROWS * CELL))
         pygame.draw.rect(self.screen, BLACK, (ox, 0, WIDTH, ROWS * CELL))
         if hasattr(ghost, 'lidar_memory'):
-            for r, c in ghost.lidar_memory:
-                pygame.draw.rect(self.screen, PURPLE, (int(ox + c * CELL - 2), int(r * CELL - 2), 4, 4))
+            if not hasattr(ghost, '_lidar_surf') or ghost._lidar_surf is None:
+                ghost._lidar_surf = pygame.Surface((WIDTH, ROWS * CELL), pygame.SRCALPHA)
+                ghost._lidar_drawn = set()
+            new_pts = ghost.lidar_memory - getattr(ghost, '_lidar_drawn', set())
+            if new_pts:
+                for r, c in new_pts:
+                    pygame.draw.rect(ghost._lidar_surf, PURPLE, (int(c * CELL - 2), int(r * CELL - 2), 4, 4))
+                ghost._lidar_drawn.update(new_pts)
+            self.screen.blit(ghost._lidar_surf, (ox, 0))
         if hasattr(ghost, 'known_pellets'):
             for px, py in ghost.known_pellets:
                 pygame.draw.circle(self.screen, WHITE, (int(ox + px * CELL), int(py * CELL)), 2)
@@ -962,6 +1007,9 @@ class Game:
                 if max_p > 1e-9:
                     if not hasattr(self, '_heat_cache'):
                         self._heat_cache = {}
+                    if len(active_indices) > 80:
+                        top_sub = np.argpartition(bm._b_flat[active_indices], -80)[-80:]
+                        active_indices = active_indices[top_sub]
                     for idx in active_indices:
                         r, c = bm._open_cells[idx]
                         p = float(bm._b_flat[idx])

@@ -14,23 +14,53 @@ def test_curriculum_logic():
     print("Testing curriculum logic...")
     cs = CurriculumScheduler(start_stage=0)
     assert cs.stage_idx == 0
-    for _ in range(100):
+    # Test that partial/None updates do not corrupt the rolling window
+    cs.record_return(mean_return=None, kill_rate=None)
+    cs.record_return(mean_return=25.0, kill_rate=None)
+    cs.record_return(mean_return=None, kill_rate=0.8)
+    assert len(cs._return_history) == 0
+    assert len(cs._kill_history) == 0
+    assert cs._updates_in_stage == 3
+
+    # Test dominant gate advancement
+    for _ in range(50):
         cs.record_return(mean_return=24.0, kill_rate=0.82)
+    assert len(cs._return_history) == 50
+    assert len(cs._kill_history) == 50
     assert cs.should_advance(), "Curriculum should advance with 82% kill rate (dominant gate)"
     cs.advance()
     assert cs.stage_idx == 1, f"Expected Stage 1, got {cs.stage_idx}"
+    assert STAGES[1].advance_return == 25.0, f"Expected Stage 1 advance_return=25.0, got {STAGES[1].advance_return}"
+
+    # Test normal target gate
     cs0 = CurriculumScheduler(start_stage=0)
     for _ in range(100):
         cs0.record_return(mean_return=26.0, kill_rate=0.72)
     assert cs0.should_advance(), "Curriculum should advance with return=26.0 >= 25.0 and kill=72% >= 70%"
     cs0.advance()
     assert cs0.stage_idx == 1
+
+    # Test plateau detection with realistic RL variance (stagnation with slight dip)
     cs_plateau = CurriculumScheduler(start_stage=0)
-    for _ in range(150):
-        cs_plateau.record_return(mean_return=21.0, kill_rate=0.65)
+    for i in range(150):
+        # first 25 of the 50 window: mean return ~21.5, second 25: mean return ~21.0 (dip of 0.5, lack of improvement)
+        ret = 21.5 if i < 125 else 21.0
+        cs_plateau.record_return(mean_return=ret, kill_rate=0.65)
     assert cs_plateau.should_advance(), "Curriculum should advance via plateau detection with stalled return and 65% kill rate"
     cs_plateau.advance()
     assert cs_plateau.stage_idx == 1
+
+    # Test state_dict recovery with desynchronized history
+    cs_load = CurriculumScheduler(start_stage=1)
+    corrupted_state = {
+        "stage_idx": 1,
+        "updates_in_stage": 40,
+        "return_history": [20.0] * 30,
+        "kill_history": [0.7] * 40
+    }
+    cs_load.load_state_dict(corrupted_state)
+    assert len(cs_load._return_history) == 30
+    assert len(cs_load._kill_history) == 30
     print("✓ Curriculum test passed!")
 
 def test_actor_critic_shapes_and_logprobs():

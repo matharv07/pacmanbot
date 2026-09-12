@@ -5,7 +5,7 @@ import numpy as np
 def _euclidean(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
-def _connect_temp_nodes_batch(world, nodes_list):
+def _connect_temp_nodes_batch(world, nodes_list, radius=0.3):
     results = []
     prm_arr = world.prm_nodes_arr
     if prm_arr is None or len(prm_arr) == 0:
@@ -15,7 +15,7 @@ def _connect_temp_nodes_batch(world, nodes_list):
     misses = []
     results_map = {}
     for i, origin in enumerate(nodes_list):
-        origin_tup = (round(origin[0], 2), round(origin[1], 2))
+        origin_tup = (round(float(origin[0]), 2), round(float(origin[1]), 2), round(float(radius), 2))
         if origin_tup in world._conn_cache:
             results_map[i] = world._conn_cache[origin_tup]
         else:
@@ -52,7 +52,7 @@ def _connect_temp_nodes_batch(world, nodes_list):
             dists = np.concatenate(all_dists)
             indices = np.concatenate(all_indices)
             if hasattr(world, 'batch_line_of_sight_pairs'):
-                los = world.batch_line_of_sight_pairs(p1s, p2s, radius=0.4, step_size=0.5)
+                los = world.batch_line_of_sight_pairs(p1s, p2s, radius=radius, step_size=0.5)
             elif hasattr(world, 'batch_line_of_sight'):   #fallback if pairs isn't available
                 los = np.zeros(len(p1s), dtype=bool)
                 for start, p1 in zip(range(0, len(p1s), current_offset), all_p1s):
@@ -83,15 +83,15 @@ def _reconstruct(came_from, node):
     path.reverse()
     return path
 
-def astar(world, start, goal):
+def astar(world, start, goal, radius=0.3):
     if start == goal:
         return [start]
     if not hasattr(world, 'apsp') or not hasattr(world, 'prm_node_idx'):
         return []
-    start_conns, goal_conns = _connect_temp_nodes_batch(world, [start, goal])
+    start_conns, goal_conns = _connect_temp_nodes_batch(world, [start, goal], radius=radius)
     best_dist = math.inf
     if hasattr(world, 'line_of_sight'):
-        if world.line_of_sight((start[1], start[0]), (goal[1], goal[0]), radius=0.4, step_size=0.5):
+        if world.line_of_sight((start[1], start[0]), (goal[1], goal[0]), radius=radius, step_size=0.5):
             best_dist = _euclidean(start, goal)
     best_i, best_j = None, None
     sd, si = start_conns
@@ -120,12 +120,12 @@ def astar(world, start, goal):
     path.append(goal)
     return path
 
-def dijkstra_multi(world, start, targets):
+def dijkstra_multi(world, start, targets, radius=0.3):
     if not targets or not hasattr(world, 'apsp') or not hasattr(world, 'prm_node_idx'):
         return {}
     target_set = list(set(targets))
     all_nodes = [start] + target_set
-    all_conns = _connect_temp_nodes_batch(world, all_nodes)
+    all_conns = _connect_temp_nodes_batch(world, all_nodes, radius=radius)
     sd, si = all_conns[0]
     results = {}
     #precalculate batch LOS for targets within 15 units
@@ -140,7 +140,7 @@ def dijkstra_multi(world, start, targets):
         if np.any(close_mask):
             close_targets = target_arr[close_mask]
             target_xy = np.column_stack((close_targets[:, 1], close_targets[:, 0]))
-            los_res = world.batch_line_of_sight(start_xy, target_xy, radius=0.4, step_size=0.5)
+            los_res = world.batch_line_of_sight(start_xy, target_xy, radius=radius, step_size=0.5)
             close_indices = np.where(close_mask)[0]
             for i, is_los in zip(close_indices, los_res):
                 direct_los[target_set[i]] = is_los        

@@ -92,6 +92,7 @@ class Ghost:
         self.seen_message_ids = {}
         self.seq = 0
         self.known_agents = {}                  #(row, col) | UNKNOWN for dead/out of reach agents
+        self.dead_agents = set()                #set of gids confirmed dead
         self.last_heartbeat = {}                #frame of last received heartbeat from every ghost
         self.last_sync_frame = {}               #frame of last full sync sent to every ghost
         self.known_pacman = None                #(row, col) | None for not seen yet
@@ -112,22 +113,18 @@ class Ghost:
         self._proximity_channel_frame = -1
         self._proximity_channel_target = None
         self._last_synced_map: dict[int, np.ndarray] = {}   # per-peer snapshot for delta sync
-        self._tail_pacman_remaining = 0         #post-pop number of ghosts that will be tailing
         self.power_pellets_converted_this_frame = 0
+        self.callout: Optional[str] = None
+        self.callout_timer: int = 0
+        self._prev_seen_pacman: Optional[tuple] = None
+        self._player_dir = (0.0, 0.0)
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False, speed_mult=1.0):
         self.frame += 1
-        if player_pos:
-            if not hasattr(self, '_prev_player_pos'):
-                self._prev_player_pos = player_pos
-                self._player_dir = (0, 0)
-            else:
-                dy = player_pos[0] - self._prev_player_pos[0]
-                dx = player_pos[1] - self._prev_player_pos[1]
-                n = math.hypot(dx, dy)
-                if n > 0.01:
-                    self._player_dir = (dy/n, dx/n)
-                self._prev_player_pos = player_pos
+        if self.callout_timer > 0:
+            self.callout_timer -= 1
+            if self.callout_timer == 0:
+                self.callout = None
         if getattr(self, 'pacman_power_timer', 0) > 0:
             self.pacman_power_timer -= 1
             if self.pacman_power_timer <= 0:
@@ -145,40 +142,66 @@ class Ghost:
             diffs.append(("heartbeat", self.gid, int(self.y), int(self.x), self.frame))
         self._broadcast(diffs, all_ghosts)
         self._process_messages(all_ghosts)
-        if hasattr(self, '_last_visible_belief_idxs'):
-            self.belief_map.observe_clear(self._last_visible_belief_idxs, [], self.known_pacman)
-        self.belief_map.update_safety_map(self.known_agents, self.frame, powered=self.pacman_powered)
+        self.belief_map.update_safety_map(self.known_agents, self.frame, powered=self.pacman_powered, pacman_pos=self.known_pacman or self.last_lost_pacman)
         if skip_movement:
-            if skip_movement:
-                self.pos_history.append((self.y, self.x))
-                self._check_oscillation()
+            self.pos_history.append((self.y, self.x))
+            self._check_oscillation()
             return newly_discovered, stale_refreshed
         active_task = self.cbba_agent.step(self, self.frame)
-        if active_task and self.pacman_powered and active_task.task_type == TaskType.HUNT:
-            active_task = None
+        if self.pacman_powered:
+            hunt_keys = [k for k in self.cbba_agent.bundle if k[0] == TaskType.HUNT]
+            for hk in hunt_keys:
+                self.cbba_agent.bundle.remove(hk)
+                if hk in self.cbba_agent.path:
+                    self.cbba_agent.path.remove(hk)
+            active_task = self.cbba_agent.get_active_task()
         #use tolerance-based comparison
         if active_task is not None:
             tpr, tpc = active_task.target_pos
             if abs(self.y - tpr) < 0.5 and abs(self.x - tpc) < 0.5:
-                #if this is a pursuit task and pacman is still in reach, dynamically track him rather than dropping task
-                is_hunt_task = (active_task.task_type in (TaskType.HUNT, TaskType.DYNAMIC))
-                pacman_in_reach = False
-                if self.known_pacman is not None and not self.pacman_powered:
-                    d_p = math.hypot(self.known_pacman[0] - self.y, self.known_pacman[1] - self.x)
-                    if d_p < 4.5:
-                        pacman_in_reach = True
-                if is_hunt_task and pacman_in_reach:
-                    active_task.target_pos = (float(self.known_pacman[0]), float(self.known_pacman[1]))
-                else:
-                    rounded_pos = (round(float(tpr), 2), round(float(tpc), 2))
-                    key = (int(active_task.task_type), rounded_pos, getattr(active_task, 'owner', -1))
-                    if key in self.cbba_agent.path: self.cbba_agent.path.remove(key)
-                    if key in self.cbba_agent.bundle: self.cbba_agent.bundle.remove(key)
-                    active_task = self.cbba_agent.get_active_task()
+                #cleanly remove completed task without mutating task_pos in place (preserves CBBA key matching)
+                self.cbba_agent.remove_task(active_task)
+                active_task = self.cbba_agent.get_active_task()
         desired_vx = 0.0
         desired_vy = 0.0
         moved = False
         dist_pac = 999.0
+        #Terminal Evasion: actively flee away from powered Pacman when nearby
+        if not moved and self.pacman_powered:
+            pac_target = self.known_pacman or self.last_lost_pacman
+            if pac_target is None and hasattr(self, 'belief_map') and self.belief_map is not None:
+                top = self.belief_map.top_cells(n=1)
+                pac_target = top[0] if top else None
+            if pac_target is not None:
+                pr, pc = float(pac_target[0]), float(pac_target[1])
+                dist_pac = math.hypot(pr - self.y, pc - self.x)
+                if dist_pac < 8.0:
+                    best_evade_vx, best_evade_vy = 0.0, 0.0
+                    best_evade_score = -math.inf
+                    d_away_x = self.x - pc
+                    d_away_y = self.y - pr
+                    d_mag = math.hypot(d_away_x, d_away_y) + 1e-6
+                    dir_away_x = d_away_x / d_mag
+                    dir_away_y = d_away_y / d_mag
+                    for angle in np.linspace(0, 2 * math.pi, 16, endpoint=False):
+                        rvx, rvy = math.cos(angle), math.sin(angle)
+                        chk_x = self.x + rvx * 1.2
+                        chk_y = self.y + rvy * 1.2
+                        if self.world and not self.world.is_passable(chk_x, chk_y, radius=self.radius):
+                            continue
+                        new_dist = math.hypot(chk_y - pr, chk_x - pc)
+                        align = rvx * dir_away_x + rvy * dir_away_y
+                        evade_score = new_dist * 2.0 + align * 3.0
+                        if evade_score > best_evade_score:
+                            best_evade_score = evade_score
+                            best_evade_vx = rvx
+                            best_evade_vy = rvy
+                    if best_evade_score > -math.inf:
+                        desired_vx = best_evade_vx
+                        desired_vy = best_evade_vy
+                        moved = True
+                        if hasattr(self, '_committed_path'):
+                            self._committed_path = []
         #Dynamic Terminal Pursuit & Lead Interception (active when Pacman is in LOS or near)
         if not moved and not self.pacman_powered and self.known_pacman:
             pr, pc = self.known_pacman
@@ -264,20 +287,35 @@ class Ghost:
                 elif prev_target and math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 3.0:
                     replan = True
             if replan:
-                from pathfinder import astar_belief
-                full_path = astar_belief(self.belief_map, (float(self.y), float(self.x)), target)
+                if self.world is not None:
+                    from pathfinder import astar
+                    full_path = astar(self.world, (float(self.y), float(self.x)), target)
+                else:
+                    from pathfinder import astar_belief
+                    full_path = astar_belief(self.belief_map, (float(self.y), float(self.x)), target)
                 if len(full_path) >= 2:
                     self._committed_path = full_path[1:]
                     self._committed_target = target
                     self._last_replan_frame = self.frame
                 else:
                     self._committed_path = []
+                    d_target = math.hypot(self.y - target[0], self.x - target[1])
+                    if d_target < 1.0:
+                        self.cbba_agent.remove_task(active_task)
+                        active_task = None
+                    else:
+                        self.cbba_agent.mark_unreachable(target, self.frame)
+                        self.cbba_agent.remove_task(active_task)
+                        active_task = None
             if hasattr(self, '_committed_path') and self._committed_path:
                 next_cell = self._committed_path[0]
                 if abs(self.y - next_cell[0]) < 0.4 and abs(self.x - next_cell[1]) < 0.4:
                     self._committed_path.pop(0)
                     if self._committed_path:
                         next_cell = self._committed_path[0]
+                    else:
+                        self.cbba_agent.remove_task(active_task)
+                        active_task = None
                 if self._committed_path:
                     target_y, target_x = next_cell[0], next_cell[1]
                     dx, dy = target_x - self.x, target_y - self.y
@@ -285,17 +323,26 @@ class Ghost:
                     if d > 0:
                         desired_vx = dx / d
                         desired_vy = dy / d
-                moved = True
-        if not moved and active_task is None:
+                        moved = True
+        if not moved:
             target = None
-            if self.known_pacman is not None and not self.pacman_powered:
-                pr, pc = self.known_pacman
-                target = (float(pr), float(pc))
-            elif self.belief_map._initialised and len(self.belief_map._b_flat) > 0:
-                best_idx = int(np.argmax(self.belief_map._b_flat))
-                if self.belief_map._b_flat[best_idx] > 1e-4:
-                    best_r, best_c = self.belief_map._open_cells[best_idx]
-                    target = (float(best_r), float(best_c))
+            if self.pacman_powered:
+                pac_pos = self.known_pacman or self.last_lost_pacman
+                if pac_pos is None and hasattr(self, 'belief_map') and self.belief_map is not None:
+                    top = self.belief_map.top_cells(n=1)
+                    pac_pos = top[0] if top else None
+                if pac_pos is not None:
+                    from allocator import _find_flee_pos
+                    target = _find_flee_pos(self, pac_pos)
+            else:
+                if self.known_pacman is not None:
+                    pr, pc = self.known_pacman
+                    target = (float(pr), float(pc))
+                elif self.belief_map._initialised and len(self.belief_map._b_flat) > 0:
+                    best_idx = int(np.argmax(self.belief_map._b_flat))
+                    if self.belief_map._b_flat[best_idx] > 1e-4:
+                        best_r, best_c = self.belief_map._open_cells[best_idx]
+                        target = (float(best_r), float(best_c))
             if target is not None:
                 replan = False
                 prev_target = getattr(self, '_committed_target', None)
@@ -307,8 +354,12 @@ class Ghost:
                 elif self.frame - getattr(self, '_last_replan_frame', -999) >= 30:
                     replan = True
                 if replan:
-                    from pathfinder import astar_belief
-                    full_path = astar_belief(self.belief_map, (float(self.y), float(self.x)), target)
+                    if self.world is not None:
+                        from pathfinder import astar
+                        full_path = astar(self.world, (float(self.y), float(self.x)), target)
+                    else:
+                        from pathfinder import astar_belief
+                        full_path = astar_belief(self.belief_map, (float(self.y), float(self.x)), target)
                     if len(full_path) >= 2:
                         self._committed_path = full_path[1:]
                         self._committed_target = target
@@ -474,12 +525,28 @@ class Ghost:
             self.cbba_agent.path.clear()
             self.pos_history.clear()
 
+    def is_agent_dead(self, gid: int) -> bool:
+        if gid == self.gid:
+            return self.dead
+        if gid in self.dead_agents:
+            return True
+        return False
+
     def _check_liveness(self, all_ghosts):
         for gid in list(self.last_heartbeat.keys()):
-            if self.frame - self.last_heartbeat[gid] > HEARTBEAT_TIMEOUT:
+            silence = self.frame - self.last_heartbeat[gid]
+            if silence > HEARTBEAT_TIMEOUT:
                 if self.known_agents.get(gid) != "UNKNOWN":
                     self.known_agents[gid] = "UNKNOWN"
                     self._broadcast([("agent_lost", gid)], all_ghosts)
+
+    def witness_death(self, dead_gid: int, all_ghosts: dict):
+        """Called when this ghost directly witnesses a peer ghost getting eaten by Pacman."""
+        self.dead_agents.add(dead_gid)
+        self.known_agents[dead_gid] = "UNKNOWN"
+        self.callout = f"Ghost {dead_gid} DOWN!"
+        self.callout_timer = 60
+        self._broadcast([("agent_dead", dead_gid)], all_ghosts)
 
     def _lidar_sweep(self, all_ghosts, player_pos, powered=False):
         directions = np.column_stack((_DX, _DY))
@@ -605,6 +672,7 @@ class Ghost:
                 los_gids = []
             for gid, ghost in zip(alive_gids, alive_ghosts):
                 if gid in los_gids:
+                    self.last_heartbeat[gid] = self.frame
                     old = self.known_agents.get(gid)
                     if old != (ghost.y, ghost.x):
                         self.known_agents[gid] = (ghost.y, ghost.x)
@@ -615,12 +683,23 @@ class Ghost:
                 pr, pc = pos
                 dist = math.hypot(pr - self.y, pc - self.x)
                 if dist <= MAX_RAY_DIST and self.world.line_of_sight((self.x, self.y), (pc, pr), radius=0.4, step_size=0.5):
+                    #direct visual confirmation that peer ghost is NOT at last known position
                     self.known_agents[gid] = "UNKNOWN"
-                    agent_diffs.append(("agent_lost", gid))
+                    if self.is_agent_dead(gid):
+                        agent_diffs.append(("agent_dead", gid))
+                    else:
+                        agent_diffs.append(("agent_lost", gid))
         pacman_diff = None
         pr, pc = player_pos
         pac_d = math.hypot(pr - self.y, pc - self.x)
         if pac_d <= MAX_RAY_DIST and self.world.line_of_sight((self.x, self.y), (pc, pr), radius=0.4, step_size=0.5):
+            if getattr(self, '_prev_seen_pacman', None) is not None:
+                dy = pr - self._prev_seen_pacman[0]
+                dx = pc - self._prev_seen_pacman[1]
+                n = math.hypot(dx, dy)
+                if n > 0.01:
+                    self._player_dir = (dy / n, dx / n)
+            self._prev_seen_pacman = (pr, pc)
             if self.known_pacman != (pr, pc) or self.pacman_powered != powered:
                 self.known_pacman = (pr, pc)
                 if powered and not self.pacman_powered:
@@ -632,6 +711,7 @@ class Ghost:
             else:
                 self.pacman_last_seen = self.frame
         else:
+            self._prev_seen_pacman = None
             if self.known_pacman is not None:
                 kr, kc = self.known_pacman
                 self.last_lost_pacman = (kr, kc)
@@ -671,7 +751,7 @@ class Ghost:
             known_ghost_coords = [pos for gid, pos in self.known_agents.items() if pos != "UNKNOWN"]
             self.belief_map.observe((float(pr), float(pc)), pac_dir, current_vel=cur_v, prev_vel=p_v, 
                                 known_ghosts=known_ghost_coords, known_pellets=self.known_pellets,
-                                known_walls=self.lidar_memory, is_powered=powered)
+                                known_walls=self.lidar_memory, is_powered=self.pacman_powered)
             self.prev_pac_row, self.prev_pac_col = pr, pc
         elif pacman_just_lost:
             _, kr, kc, _ = pacman_diff
@@ -680,7 +760,7 @@ class Ghost:
         if (self.frame + self.gid) % BELIEF_DIFFUSE_EVERY == 0:
             known_ghost_coords = [pos for gid, pos in self.known_agents.items() if pos != "UNKNOWN"]
             self.belief_map.diffuse((float(self.y), float(self.x)), self.known_pellets, self.known_power_pellets,
-                                    ghost_positions=known_ghost_coords, is_powered=powered)
+                                    ghost_positions=known_ghost_coords, is_powered=self.pacman_powered)
         pac_pos = (float(pr), float(pc)) if pacman_in_los else None
         self.belief_map.observe_clear(visible_belief_idxs, impassable_belief_nodes, pac_pos)
         #cleanup eaten pellets from memory only if within LOS (sensor-scoped eviction)
@@ -767,6 +847,8 @@ class Ghost:
         for w in self.lidar_memory:
             if w not in tgt_lidar:
                 sync_diffs.append(("wall", w))
+        for dead_gid in self.dead_agents:
+            sync_diffs.append(("agent_dead", dead_gid))
         for gid, pos in self.known_agents.items():
             if pos == "UNKNOWN":
                 sync_diffs.append(("agent_lost", gid))
@@ -830,13 +912,21 @@ class Ghost:
                         self.lidar_memory.add(w)
                         new_peer_walls.append(w)
                         relay_diffs.append(diff)
+                elif dtype == "agent_dead":
+                    _, gid = diff
+                    self.dead_agents.add(gid)
+                    self.known_agents[gid] = "UNKNOWN"
+                    relay_diffs.append(diff)
                 elif dtype == "agent_lost":
                     _, gid = diff
                     if gid == self.gid:
                         continue
-                    if self.known_agents.get(gid) != "UNKNOWN":
+                    if gid in self.dead_agents:
                         self.known_agents[gid] = "UNKNOWN"
-                        relay_diffs.append(diff)
+                    elif self.frame - self.last_heartbeat.get(gid, -1) > HEARTBEAT_TIMEOUT:
+                        if self.known_agents.get(gid) != "UNKNOWN":
+                            self.known_agents[gid] = "UNKNOWN"
+                            relay_diffs.append(diff)
                 elif dtype == "heartbeat":
                     _, gid, r, c, origin_frame = diff
                     if gid == self.gid:
@@ -844,6 +934,7 @@ class Ghost:
                     existing = self.last_heartbeat.get(gid, -1)
                     if origin_frame > existing:
                         self.last_heartbeat[gid] = origin_frame
+                    self.dead_agents.discard(gid)
                     if r != 0 or c != 0:
                         old = self.known_agents.get(gid)
                         if old != (r, c):
@@ -883,16 +974,13 @@ class Ghost:
                     _, sender_gid, payload = diff
                     if sender_gid == self.gid:
                         continue
-                    changed = self.cbba_agent.receive_consensus(sender_gid, payload["y"], payload["z"], payload["s"], self.frame)
-                    if changed:
-                        relay_diffs.append(diff)
+                    self.cbba_agent.receive_consensus(sender_gid, payload["y"], payload["z"], payload["s"], self.frame, payload.get("meta"))
                 elif dtype == "belief":
                     _, sender_gid, payload = diff
                     if sender_gid == self.gid:
                         continue
                     self.belief_map.merge(sender_gid, payload, self.frame)
-                    relay_diffs.append(diff)  #always relay — belief spreads like heartbeats
-            if relay_diffs:
+            if relay_diffs and hop < 2:
                 MAX_RELAY_SIZE = 50
                 for idx, i in enumerate(range(0, len(relay_diffs), MAX_RELAY_SIZE)):
                     chunk = relay_diffs[i : i + MAX_RELAY_SIZE]
@@ -913,6 +1001,7 @@ class Ghost:
 
     def kill(self):
         self.dead = True
+        self.dead_agents.add(self.gid)
 
     def draw(self, surf, scale=None, offset_x=0, offset_y=0):
         if scale is None:
@@ -946,3 +1035,17 @@ class Ghost:
         py_off = int(dy_n * pupil_off)
         pygame.draw.circle(surf, BLACK, (x - eye_sep + px_off, y - eye_sep // 2 + py_off), pupil_r)
         pygame.draw.circle(surf, BLACK, (x + eye_sep + px_off, y - eye_sep // 2 + py_off), pupil_r)
+        if getattr(self, 'callout_timer', 0) > 0 and getattr(self, 'callout', None):
+            font = getattr(self, '_callout_font', None)
+            if font is None:
+                try:
+                    font = pygame.font.SysFont('Arial', 10, bold=True)
+                except Exception:
+                    font = pygame.font.Font(None, 12)
+                self._callout_font = font
+            txt_surf = font.render(self.callout, True, (255, 255, 50))
+            tw, th = txt_surf.get_size()
+            bubble_rect = pygame.Rect(x - tw // 2 - 4, y - r - th - 8, tw + 8, th + 4)
+            pygame.draw.rect(surf, (180, 20, 20), bubble_rect, border_radius=3)
+            pygame.draw.rect(surf, (255, 255, 255), bubble_rect, width=1, border_radius=3)
+            surf.blit(txt_surf, (x - tw // 2, y - r - th - 6))

@@ -5,3 +5,4 @@ discord_webhook.txt
 .env
 *.pyc
 profile.txt
+.pytest_cache/

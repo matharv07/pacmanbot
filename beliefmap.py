@@ -151,6 +151,7 @@ class BeliefMap:
         self._disabled_wall_nodes: set = set()
         self._disabled_wall_idxs: list = []
         self._disabled_wall_arr: np.ndarray = np.empty((0, 2), dtype=np.float32)
+        self._observed_wall_coords: set = set()
         self._grid_dirty: bool = True
         self._last_safety_frame: int = -999
         self._last_powered: bool = False
@@ -173,6 +174,7 @@ class BeliefMap:
         self._disabled_wall_nodes = set()
         self._disabled_wall_idxs = []
         self._disabled_wall_arr = np.empty((0, 2), dtype=np.float32)
+        self._observed_wall_coords = set()
         self._grid_dirty = True
         self._topology_dirty = True
         self._tree = None
@@ -324,6 +326,16 @@ class BeliefMap:
         and redistributes trapped probability without cascading full topology rebuilds."""
         if not wall_positions:
             return
+        if not hasattr(self, '_observed_wall_coords'):
+            self._observed_wall_coords = set()
+        unseen_walls = []
+        for w in wall_positions:
+            w_tup = (round(float(w[0]), 2), round(float(w[1]), 2))
+            if w_tup not in self._observed_wall_coords:
+                self._observed_wall_coords.add(w_tup)
+                unseen_walls.append(w)
+        if not unseen_walls:
+            return
         self._ensure_initialised()
         if self.n_nodes == 0 or len(self._open_arr) == 0:
             return
@@ -331,7 +343,7 @@ class BeliefMap:
             self._tree = cKDTree(self._open_arr)
 
         newly_disabled = []
-        for wall_pos in wall_positions:
+        for wall_pos in unseen_walls:
             wy, wx = float(wall_pos[0]), float(wall_pos[1])
             close_idxs = self._tree.query_ball_point([wy, wx], r=0.6)
             if not close_idxs:
@@ -663,7 +675,7 @@ class BeliefMap:
             self._grid_dirty = False
         return self._b_grid.flatten().tolist()
 
-    def update_safety_map(self, known_agents: dict, current_frame: int, powered: bool = False, hunt_mode: str = "blend"):
+    def update_safety_map(self, known_agents: dict, current_frame: int, powered: bool = False, hunt_mode: str = "blend", pacman_pos: Optional[tuple] = None):
         new_snapshot = {gid: (int(pos[0]), int(pos[1])) for gid, pos in known_agents.items() if pos != "UNKNOWN"}
         positions_changed = (new_snapshot != self._last_ghost_snapshot)
         mode_changed = (powered != self._last_powered)
@@ -679,21 +691,35 @@ class BeliefMap:
         n_open = self.n_nodes
         if n_open == 0 or len(self._open_arr) == 0:
             return
-        known_positions = []
-        for gid, pos in known_agents.items():
-            if pos == "UNKNOWN":
-                continue
-            gr, gc = pos
-            age = current_frame - self._ghost_last_seen.get(gid, current_frame)
-            weight = math.exp(-age / STALENESS_DECAY)
-            known_positions.append((float(gr), float(gc), weight))
-        sigma = HUNT_SIGMA if powered else DANGER_SIGMA
-        cutoff_steps = float(3.0 * sigma)
         scores = np.zeros(self.n_nodes, dtype=np.float32)
-        for gr, gc, weight in known_positions:
-            dists = np.hypot(self._open_arr[:, 0] - gr, self._open_arr[:, 1] - gc)
-            mask = dists <= cutoff_steps
-            scores[mask] += weight * np.exp(-dists[mask] / sigma)
+        if powered:             #when Pacman is powered, danger emanates from Pacman
+            p_pos = pacman_pos or self.last_known_pos
+            if p_pos is None and len(self._b_flat) > 0:
+                top = self.top_cells(n=1)
+                if top:
+                    p_pos = top[0]
+            if p_pos is not None:
+                pr, pc = float(p_pos[0]), float(p_pos[1])
+                sigma = DANGER_SIGMA
+                cutoff = float(3.0 * sigma)
+                dists = np.hypot(self._open_arr[:, 0] - pr, self._open_arr[:, 1] - pc)
+                mask = dists <= cutoff
+                scores[mask] += 3.0 * np.exp(-dists[mask] / sigma)
+        else:
+            known_positions = []
+            for gid, pos in known_agents.items():
+                if pos == "UNKNOWN":
+                    continue
+                gr, gc = pos
+                age = current_frame - self._ghost_last_seen.get(gid, current_frame)
+                weight = math.exp(-age / STALENESS_DECAY)
+                known_positions.append((float(gr), float(gc), weight))
+            sigma = DANGER_SIGMA
+            cutoff_steps = float(3.0 * sigma)
+            for gr, gc, weight in known_positions:
+                dists = np.hypot(self._open_arr[:, 0] - gr, self._open_arr[:, 1] - gc)
+                mask = dists <= cutoff_steps
+                scores[mask] += weight * np.exp(-dists[mask] / sigma)
         self._danger = scores
         self._safety = np.exp(-scores / 3.0)
         self._W_dirty = True
