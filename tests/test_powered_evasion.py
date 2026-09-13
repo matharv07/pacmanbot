@@ -174,6 +174,7 @@ def test_dead_callout_and_line_of_sight_witnessing():
     g0.y, g0.x = float(pos0[0]) + 0.5, float(pos0[1]) + 0.5
     g1.y, g1.x = float(pos1[0]) + 0.5, float(pos1[1]) + 0.5
     g2.y, g2.x = float(pos2[0]) + 0.5, float(pos2[1]) + 0.5
+    g2.max_speed = 0.0
 
     # Position powered Pacman on top of Ghost 0 to trigger a kill
     env.player.y, env.player.x = g0.y, g0.x

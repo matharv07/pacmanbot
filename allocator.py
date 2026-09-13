@@ -165,8 +165,8 @@ def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
         dist, _ = info
         if dist == math.inf:
             continue
-        #distance-dependent conversion score that rewards opportunistic defense without overriding close-range hunting
-        score = 1.0 * _dist_score(dist, CONVERT_SCALE)
+        #distance-dependent conversion score that prioritizes power pellet denial when nearby
+        score = 2.0 + 3.0 * _dist_score(dist, CONVERT_SCALE)
         tasks.append(Task(task_type=TaskType.CONVERT, target_pos=yx_pos, score=score, created_frame=frame, owner=ghost.gid, target_speed=1.0))
     return tasks
 
