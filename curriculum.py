@@ -34,9 +34,9 @@ class Stage:
     def cols(self) -> int:
         return int(self.world_width * self.obs_resolution)
 
-STAGES = [Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=3, n_power=2,  advance_return=55.0, min_updates=80,  target_kill_rate=0.80),
-    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=8,  advance_return=35.0, min_updates=120, target_kill_rate=0.78),
-    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.80)]
+STAGES = [Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=3, n_power=2,  advance_return=34.0, min_updates=60,  target_kill_rate=0.67),
+    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=8,  advance_return=30.0, min_updates=100, target_kill_rate=0.70),
+    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.75)]
 
 ADVANCE_WINDOW = 50    #rolling window of updates achieving return/kill threshold required to clear a stage
 
