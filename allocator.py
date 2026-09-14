@@ -173,6 +173,10 @@ def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
 def _find_flee_pos(ghost, pacman_pos: tuple) -> Optional[tuple]:
     pr, pc = pacman_pos
     if getattr(ghost, 'world', None) is None: return None
+    from pathfinder import find_topological_flee_target
+    top_target = find_topological_flee_target(ghost.world, (ghost.y, ghost.x), (pr, pc), radius=ghost.radius)
+    if top_target is not None:
+        return top_target
     prm_nodes = getattr(ghost.world, 'prm_nodes', None)
     #direction vector from Pacman to Ghost (away from Pacman)
     d_pac_ghost = (ghost.y - pr, ghost.x - pc)

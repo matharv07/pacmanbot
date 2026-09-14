@@ -228,3 +228,48 @@ def astar_belief(belief_map, start: tuple, goal: tuple) -> list:
     if _euclidean(path[-1], goal) > 0.1:
         full_path.append(goal)
     return full_path
+
+def find_topological_flee_target(world, ghost_pos: tuple, pac_pos: tuple, radius: float = 0.35) -> tuple[float, float] | None:
+    """
+    Computes a topologically safe escape node on the maze graph that:
+    1. Maximizes maze graph distance from Pac-Man.
+    2. Ensures a positive lead margin (ghost arrives before Pac-Man).
+    3. Penalizes dead-end corridors (corridor degree 1).
+    4. Rewards branching intersections/loops (corridor degree >= 3).
+    """
+    if world is None or not hasattr(world, 'apsp') or not hasattr(world, 'prm_nodes') or not world.prm_nodes:
+        return None
+    gy, gx = float(ghost_pos[0]), float(ghost_pos[1])
+    py, px = float(pac_pos[0]), float(pac_pos[1])
+    conns = _connect_temp_nodes_batch(world, [(gy, gx), (py, px)], radius=radius)
+    gd, gi = conns[0]
+    pd, pi = conns[1]
+    if len(gi) == 0:
+        return None
+    d_ghost = np.min(gd[:, None] + world.apsp[gi, :], axis=0)
+    if len(pi) > 0:
+        d_pac = np.min(pd[:, None] + world.apsp[pi, :], axis=0)
+    else:
+        prm_arr = getattr(world, 'prm_nodes_arr', None)
+        if prm_arr is not None and len(prm_arr) > 0:
+            d_pac = np.hypot(prm_arr[:, 0] - py, prm_arr[:, 1] - px)
+        else:
+            return None
+    with np.errstate(invalid='ignore'):
+        lead_margin = np.where((d_pac < math.inf) & (d_ghost < math.inf), d_pac - d_ghost, -np.inf)
+    degrees = np.array([len(world.prm_graph.get(n, [])) for n in world.prm_nodes], dtype=np.float32)
+    deg_bonus = np.where(degrees >= 3, 8.0, np.where(degrees == 2, 0.0, -25.0))
+    scores = d_pac * 2.0 + lead_margin * 1.5 - d_ghost * 0.4 + deg_bonus
+    invalid = (lead_margin <= 0) | (d_ghost == math.inf) | (d_pac == math.inf)
+    scores[invalid] = -np.inf
+    best_idx = int(np.argmax(scores))
+    if scores[best_idx] > -np.inf:
+        node = world.prm_nodes[best_idx]
+        return (float(node[0]), float(node[1]))
+    fallback_scores = d_pac * 2.0 - d_ghost * 0.5 + deg_bonus
+    fallback_scores[(d_ghost == math.inf) | (d_pac == math.inf)] = -np.inf
+    if np.any(fallback_scores > -np.inf):
+        best_fb = int(np.argmax(fallback_scores))
+        node = world.prm_nodes[best_fb]
+        return (float(node[0]), float(node[1]))
+    return None

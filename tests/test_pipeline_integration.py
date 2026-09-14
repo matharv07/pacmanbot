@@ -14,7 +14,7 @@ def test_curriculum_logic():
     print("Testing curriculum logic...")
     cs = CurriculumScheduler(start_stage=0)
     assert cs.stage_idx == 0
-    assert len(STAGES) == 2, f"Expected 2 curriculum stages, got {len(STAGES)}"
+    assert len(STAGES) == 3, f"Expected 3 curriculum stages, got {len(STAGES)}"
 
     # Test that partial/None updates do not corrupt the rolling window
     cs.record_return(mean_return=None, kill_rate=None)
@@ -34,11 +34,20 @@ def test_curriculum_logic():
     # Reach min_updates (150 updates) with high performance
     for _ in range(100):
         cs.record_return(mean_return=75.0, kill_rate=0.90)
-    assert cs._updates_in_stage >= 150
+    assert cs._updates_in_stage >= 100
     assert cs.should_advance(), "Curriculum should advance once min_updates is reached with high kill rate"
     cs.advance()
     assert cs.stage_idx == 1, f"Expected Stage 1, got {cs.stage_idx}"
-    assert cs.is_final, "Stage 1 should be the final stage (33x41)"
+    assert not cs.is_final, "Stage 1 is intermediate (21x27)"
+
+    # Advance Stage 1 to Stage 2
+    for _ in range(150):
+        cs.record_return(mean_return=70.0, kill_rate=0.85)
+    assert cs._updates_in_stage >= 150
+    assert cs.should_advance()
+    cs.advance()
+    assert cs.stage_idx == 2, f"Expected Stage 2, got {cs.stage_idx}"
+    assert cs.is_final, "Stage 2 should be the final stage (33x41)"
     assert not cs.should_advance(), "Terminal stage should never advance"
 
     # Test state_dict recovery and clamping
@@ -50,7 +59,7 @@ def test_curriculum_logic():
         "kill_history": [0.7] * 40
     }
     cs_load.load_state_dict(corrupted_state)
-    assert cs_load.stage_idx == 1, "Legacy stage index > 1 should be clamped to terminal stage 1"
+    assert cs_load.stage_idx == 2, "Legacy stage index > 2 should be clamped to terminal stage 2"
     assert len(cs_load._return_history) == 30
     assert len(cs_load._kill_history) == 30
     print("✓ Curriculum test passed!")

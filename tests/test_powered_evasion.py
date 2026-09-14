@@ -339,8 +339,14 @@ def test_peer_not_seen_at_last_known_pos_marked_unknown():
     g0.known_agents[1] = (stale_y, stale_x)
     g0.last_heartbeat[1] = g0.frame - 2
 
-    # But Ghost 1 is actually far away (e.g. around a corner at open_cells[0])
-    g1.y, g1.x = float(open_cells[0][0]) + 0.5, float(open_cells[0][1]) + 0.5
+    # But Ghost 1 is actually far away around a corner (not at stale pos and not in LOS of g0)
+    g1_pos = None
+    for cand in open_cells:
+        if cand != pos1_stale and not env.world.line_of_sight((pos0[1] + 0.5, pos0[0] + 0.5), (cand[1] + 0.5, cand[0] + 0.5), radius=0.4, step_size=0.5):
+            g1_pos = cand
+            break
+    assert g1_pos is not None
+    g1.y, g1.x = float(g1_pos[0]) + 0.5, float(g1_pos[1]) + 0.5
 
     # Ghost 0 scans lidar (run 2 frames so frame % LIDAR_SWEEP_EVERY == 0 triggers sweep)
     g0.update((env.player.y, env.player.x), False, env.ghosts, skip_movement=True)

@@ -189,33 +189,49 @@ class Ghost:
             if pac_target is not None:
                 pr, pc = float(pac_target[0]), float(pac_target[1])
                 dist_pac = math.hypot(pr - self.y, pc - self.x)
-                if dist_pac < 8.0:
-                    best_evade_vx, best_evade_vy = 0.0, 0.0
-                    best_evade_score = -math.inf
-                    d_away_x = self.x - pc
-                    d_away_y = self.y - pr
-                    d_mag = math.hypot(d_away_x, d_away_y) + 1e-6
-                    dir_away_x = d_away_x / d_mag
-                    dir_away_y = d_away_y / d_mag
-                    for angle in np.linspace(0, 2 * math.pi, 16, endpoint=False):
-                        rvx, rvy = math.cos(angle), math.sin(angle)
-                        chk_x = self.x + rvx * 1.2
-                        chk_y = self.y + rvy * 1.2
-                        if self.world and not self.world.is_passable(chk_x, chk_y, radius=self.radius):
-                            continue
-                        new_dist = math.hypot(chk_y - pr, chk_x - pc)
-                        align = rvx * dir_away_x + rvy * dir_away_y
-                        evade_score = new_dist * 2.0 + align * 3.0
-                        if evade_score > best_evade_score:
-                            best_evade_score = evade_score
-                            best_evade_vx = rvx
-                            best_evade_vy = rvy
-                    if best_evade_score > -math.inf:
-                        desired_vx = best_evade_vx
-                        desired_vy = best_evade_vy
-                        moved = True
-                        if hasattr(self, '_committed_path'):
-                            self._committed_path = []
+                if dist_pac < 10.0:
+                    from pathfinder import find_topological_flee_target, astar
+                    flee_target = find_topological_flee_target(self.world, (self.y, self.x), (pr, pc), radius=self.radius)
+                    if flee_target is not None:
+                        path = astar(self.world, (self.y, self.x), flee_target, radius=self.radius)
+                        if len(path) >= 2:
+                            next_pt = path[1]
+                            dx = next_pt[1] - self.x
+                            dy = next_pt[0] - self.y
+                            d = math.hypot(dx, dy)
+                            if d > 0.01:
+                                desired_vx = dx / d
+                                desired_vy = dy / d
+                                moved = True
+                                self._committed_path = path[1:]
+                                self._committed_target = flee_target
+                    if not moved:
+                        best_evade_vx, best_evade_vy = 0.0, 0.0
+                        best_evade_score = -math.inf
+                        d_away_x = self.x - pc
+                        d_away_y = self.y - pr
+                        d_mag = math.hypot(d_away_x, d_away_y) + 1e-6
+                        dir_away_x = d_away_x / d_mag
+                        dir_away_y = d_away_y / d_mag
+                        for angle in np.linspace(0, 2 * math.pi, 16, endpoint=False):
+                            rvx, rvy = math.cos(angle), math.sin(angle)
+                            chk_x = self.x + rvx * 1.2
+                            chk_y = self.y + rvy * 1.2
+                            if self.world and not self.world.is_passable(chk_x, chk_y, radius=self.radius):
+                                continue
+                            new_dist = math.hypot(chk_y - pr, chk_x - pc)
+                            align = rvx * dir_away_x + rvy * dir_away_y
+                            evade_score = new_dist * 2.0 + align * 3.0
+                            if evade_score > best_evade_score:
+                                best_evade_score = evade_score
+                                best_evade_vx = rvx
+                                best_evade_vy = rvy
+                        if best_evade_score > -math.inf:
+                            desired_vx = best_evade_vx
+                            desired_vy = best_evade_vy
+                            moved = True
+                            if hasattr(self, '_committed_path'):
+                                self._committed_path = []
         #Dynamic Terminal Pursuit & Lead Interception (active when Pacman is in LOS or near)
         if not moved and not self.pacman_powered and self.known_pacman:
             pr, pc = self.known_pacman
