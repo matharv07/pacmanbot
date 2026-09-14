@@ -168,11 +168,12 @@ def test_extended_mesh_potential():
 
 def test_env_mesh_rewards_and_common_pool():
     """Verify that Env applies mesh isolation penalties and shares common pooled tasks."""
-    stage = STAGES[2]  # Stage 2: 21x27
+    stage = STAGES[0]  # Stage 0: 21x27
     env = Env(env_id=0, num_ghosts=2, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     env.reset()
 
-    # Move player far away from both ghosts
+    # Move player far away from both ghosts and hold stationary
+    env.player.stationary = True
     env.player.y = 10.0
     env.player.x = 10.0
 
@@ -196,6 +197,7 @@ def test_env_mesh_rewards_and_common_pool():
     env.ghosts[1].x = 24.0
     env.player.y = 10.0
     env.player.x = 10.0
+    env.shaper.reset()
     obs, rewards_isolated, done, info = env.step(actions, bc_prob=0.0)
     # In isolated state, ghosts receive isolation penalty (-0.02/frame) vs connected (+0.005/frame)
     assert rewards_isolated[0] < rewards[0]
@@ -203,7 +205,7 @@ def test_env_mesh_rewards_and_common_pool():
 
 def test_cross_ghost_task_pooling_and_bidding():
     """Verify that ghosts pool nominated tasks and bid on the ones closest to themselves."""
-    stage = STAGES[2]  # Stage 2: 21x27
+    stage = STAGES[0]  # Stage 0: 21x27
     env = Env(env_id=0, num_ghosts=2, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     env.reset()
 
@@ -245,7 +247,7 @@ def test_belief_grounded_heuristic_tasks():
     """Verify that heuristic tasks and BC targets follow the belief map modes when Pacman is lost."""
     from allocator import generate_tasks
 
-    stage = STAGES[2]  # Stage 2: 21x27
+    stage = STAGES[0]  # Stage 0: 21x27
     env = Env(env_id=0, num_ghosts=2, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     env.reset()
 

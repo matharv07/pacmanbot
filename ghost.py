@@ -78,9 +78,9 @@ class Ghost:
         self.target_cell = pos
         self.color = color
         self.dead = False
+        self.rl_mode = False
         self.in_fallback_mode = False
         self.move_every = 1
-        self.last_dir = random.choice(DIRS)
         self.last_dir = random.choice(DIRS)
         self.known_pellets = set()
         self.known_power_pellets = set()
@@ -92,6 +92,8 @@ class Ghost:
         self.seen_message_ids = {}
         self.seq = 0
         self.known_agents = {}                  #(row, col) | UNKNOWN for dead/out of reach agents
+        self._last_known_agent_pos = {}         #last known physical (y, x) coordinates for ghosts
+        self.known_peer_objs = {}               #reference dict to all peer ghost objects
         self.dead_agents = set()                #set of gids confirmed dead
         self.last_heartbeat = {}                #frame of last received heartbeat from every ghost
         self.last_sync_frame = {}               #frame of last full sync sent to every ghost
@@ -121,6 +123,7 @@ class Ghost:
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False, speed_mult=1.0):
         self.frame += 1
+        self.known_peer_objs = all_ghosts
         if self.callout_timer > 0:
             self.callout_timer -= 1
             if self.callout_timer == 0:
@@ -129,6 +132,8 @@ class Ghost:
             self.pacman_power_timer -= 1
             if self.pacman_power_timer <= 0:
                 self.pacman_powered = False
+        if self.last_lost_pacman is not None and (self.frame - self.pacman_last_seen > 25):
+            self.last_lost_pacman = None
         newly_discovered = 0
         stale_refreshed = 0.0
         if self.dead:
@@ -149,11 +154,20 @@ class Ghost:
             return newly_discovered, stale_refreshed
         active_task = self.cbba_agent.step(self, self.frame)
         if self.pacman_powered:
-            hunt_keys = [k for k in self.cbba_agent.bundle if k[0] == TaskType.HUNT]
-            for hk in hunt_keys:
-                self.cbba_agent.bundle.remove(hk)
-                if hk in self.cbba_agent.path:
-                    self.cbba_agent.path.remove(hk)
+            pac_danger_pos = self.known_pacman or self.last_lost_pacman
+            drop_keys = []
+            for k in list(self.cbba_agent.bundle):
+                if k[0] == TaskType.HUNT:
+                    drop_keys.append(k)
+                elif pac_danger_pos is not None:
+                    t_obj = self.cbba_agent._task_map.get(k)
+                    if t_obj is not None and math.hypot(t_obj.target_pos[0] - pac_danger_pos[0], t_obj.target_pos[1] - pac_danger_pos[1]) < 8.0:
+                        drop_keys.append(k)
+            for dk in drop_keys:
+                if dk in self.cbba_agent.bundle:
+                    self.cbba_agent.bundle.remove(dk)
+                if dk in self.cbba_agent.path:
+                    self.cbba_agent.path.remove(dk)
             active_task = self.cbba_agent.get_active_task()
         #use tolerance-based comparison
         if active_task is not None:
@@ -233,25 +247,8 @@ class Ghost:
                             moved = True
                     if moved and hasattr(self, '_committed_path'):
                         self._committed_path = []
-        if not moved and not self.pacman_powered and self.known_pacman:
-            pr, pc = self.known_pacman
-            for p_pos in (self.world.power_pellets if hasattr(self, 'world') and self.world else []):
-                p_r, p_c = float(p_pos[0]), float(p_pos[1])
-                dist_pac_to_power = abs(pr - p_r) + abs(pc - p_c)
-                if dist_pac_to_power < 8:
-                    my_dist = abs(self.y - p_r) + abs(self.x - p_c)
-                    is_closest = True
-                    for _gid, pos in self.known_agents.items():
-                        if pos != "UNKNOWN":
-                            other_dist = abs(pos[0] - p_r) + abs(pos[1] - p_c)
-                            if other_dist < my_dist:
-                                is_closest = False
-                                break
-                    if is_closest:
-                        active_task = type('DummyTask', (), {'target_pos': (p_r, p_c), 'task_type': -1})()
-                        break
         GRAB_DIST = 2.0
-        if not moved and (not self.known_pacman or self.pacman_powered or dist_pac > 4.5):
+        if not getattr(self, 'rl_mode', False) and not moved and (not self.known_pacman or self.pacman_powered or dist_pac > 4.5):
             best_power = None
             best_pd = float('inf')
             power_arr = getattr(self.world, 'power_pellets_arr', None)
@@ -676,6 +673,7 @@ class Ghost:
                     old = self.known_agents.get(gid)
                     if old != (ghost.y, ghost.x):
                         self.known_agents[gid] = (ghost.y, ghost.x)
+                        self._last_known_agent_pos[gid] = (ghost.y, ghost.x)
                         agent_diffs.append(("agent", gid, ghost.y, ghost.x))
             for gid, pos in list(self.known_agents.items()):
                 if pos == "UNKNOWN" or gid in los_gids:
@@ -891,6 +889,7 @@ class Ghost:
                     old = self.known_agents.get(gid)
                     if old != (r, c):
                         self.known_agents[gid] = (r, c)
+                        self._last_known_agent_pos[gid] = (r, c)
                         relay_diffs.append(diff)
                 elif dtype == "pellet":
                     _, p = diff
@@ -939,6 +938,7 @@ class Ghost:
                         old = self.known_agents.get(gid)
                         if old != (r, c):
                             self.known_agents[gid] = (r, c)
+                            self._last_known_agent_pos[gid] = (r, c)
                             relay_diffs.append(("agent", gid, r, c))
                     relay_diffs.append(diff)
                 elif dtype == "hb_sync":

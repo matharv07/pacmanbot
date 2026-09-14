@@ -9,7 +9,7 @@ from ghost import Ghost
 
 def test_stage4_false_death_elimination():
     """Verify that on Stage 4 (33x41, 7 ghosts), prolonged silence does not cause false agent_dead markings."""
-    stage = STAGES[4]
+    stage = STAGES[1]
     env = Env(0, num_ghosts=stage.n_ghosts, world_height=float(stage.rows), world_width=float(stage.cols), n_power=stage.n_power)
     env.reset()
 
@@ -44,7 +44,7 @@ def test_task_metadata_roundtrip_mesh():
     payload = agent0.get_consensus_payload()
     assert "meta" in payload, "Expected 'meta' in CBBA consensus payload"
     assert k in payload["meta"], "Expected task key in meta"
-    assert payload["meta"][k] == (1, 0, 1.0)
+    assert payload["meta"][k] == (1, 0, 1.0, 5.0)
 
     # Agent 1 receives consensus from Agent 0
     agent1.receive_consensus(0, payload["y"], payload["z"], payload["s"], frame=10, task_meta=payload.get("meta"))
@@ -86,7 +86,7 @@ def test_distance_horizon_gate_suppression():
 
 def test_zero_freeze_frames_stage4():
     """Verify that ghosts with active tasks do not freeze with zero velocity on Stage 4."""
-    stage = STAGES[4]
+    stage = STAGES[1]
     env = Env(0, num_ghosts=stage.n_ghosts, world_height=float(stage.rows), world_width=float(stage.cols), n_power=stage.n_power)
     env.reset()
 

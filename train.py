@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from net    import GhostActor, GhostCritic, MovementPredictor, PREDICTOR_IN_DIM, PREDICTOR_HIDDEN_DIM
 from worker import Env
-from obs    import MAX_H, MAX_W, MAX_GHOSTS, SPATIAL_CH, VEC_DIM, CRITIC_VEC_DIM
+from obs    import MAX_H, MAX_W, MAX_GHOSTS, SPATIAL_CH, GLOBAL_SPATIAL_CH, VEC_DIM, CRITIC_VEC_DIM
 from curriculum import CurriculumScheduler, STAGES
 import traceback
 import threading
@@ -40,11 +40,11 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-NUM_ENVS        = int(os.environ.get("NUM_ENVS", "14"))
-ROLLOUT_STEPS   = int(os.environ.get("ROLLOUT_STEPS", "256"))
-MINI_BATCH      = 4096
-MICRO_BATCH     = 4096
-ROLLOUT_INFER_CHUNK = 2048
+NUM_ENVS            = int(os.environ.get("NUM_ENVS", "14"))
+ROLLOUT_STEPS       = int(os.environ.get("ROLLOUT_STEPS", "256"))
+MINI_BATCH          = int(os.environ.get("MINI_BATCH", "4096"))
+MICRO_BATCH         = int(os.environ.get("MICRO_BATCH", "4096"))
+ROLLOUT_INFER_CHUNK = int(os.environ.get("ROLLOUT_INFER_CHUNK", "2048"))
 #adaptive OOM-safe chunk sizes — halved automatically on cuda OOM, never grow back
 _eff_infer_chunk = ROLLOUT_INFER_CHUNK
 _eff_micro_batch = MICRO_BATCH
@@ -52,15 +52,15 @@ PPO_EPOCHS      = 4
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
 CLIP_EPS        = 0.2
-ENT_COEF        = 0.002
+ENT_COEF        = 0.008
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 2e-4
-BC_INIT         = 0.5
+BC_INIT         = 0.0
 BC_FLOOR        = 0.0
 K_NOMINATIONS   = 3
-LOG_DIR         = os.path.join(os.path.dirname(__file__), "logs")
-CKPT_DIR        = os.path.join(os.path.dirname(__file__), "checkpoints")
+LOG_DIR         = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file__), "logs"))
+CKPT_DIR        = os.environ.get("CKPT_DIR", os.path.join(os.path.dirname(__file__), "checkpoints"))
 BC_ANNEAL_UPDATES = 80
 BC_ADVANCE_GATE = 0.10
 TARGET_KL       = 0.05
@@ -202,12 +202,15 @@ def _pad_spatial(arr, target_h=MAX_H, target_w=MAX_W):
         return arr
     out = np.zeros(arr.shape[:-2] + (target_h, target_w), dtype=arr.dtype)
     out[..., :h, :w] = arr
-    if arr.ndim == 4 and out.shape[1] in (SPATIAL_CH, 11):
+    if arr.ndim == 4 and out.shape[1] in (SPATIAL_CH, GLOBAL_SPATIAL_CH):
         out[:, 0, h:, :] = 1.0
         out[:, 0, :, w:] = 1.0
+    elif arr.ndim == 3 and out.shape[0] in (SPATIAL_CH, GLOBAL_SPATIAL_CH):
+        out[0, h:, :] = 1.0
+        out[0, :, w:] = 1.0
     return out
 
-def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
+def _worker(env_id, conn, rows, cols, n_ghosts, n_power):
     os.environ['OMP_NUM_THREADS'] = '1'
     os.environ['MKL_NUM_THREADS'] = '1'
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
@@ -219,7 +222,6 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
         pass
     try:
         env = Env(env_id, num_ghosts=n_ghosts, world_height=float(rows), world_width=float(cols), n_power=n_power)
-        env.static_pacman = static_pacman
         obs = env.reset()
         conn.send(obs)           #send initial observation
     except Exception as e:
@@ -244,12 +246,11 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
                 obs = env.reset()
                 conn.send(obs)
             elif cmd == "set_curriculum":
-                rows, cols, n_ghosts, n_power, static_pacman = data
+                rows, cols, n_ghosts, n_power = data
                 env.world_height = float(rows)
                 env.world_width = float(cols)
                 env.num_ghosts = n_ghosts
                 env.n_power = n_power
-                env.static_pacman = static_pacman
                 obs = env.reset()
                 conn.send(obs)
             elif cmd == "sync_predictor":
@@ -295,13 +296,13 @@ def _recv_unordered(conns, procs=None):
     return results
 
 class VecEnv:
-    def __init__(self, n, rows=33, cols=41, n_ghosts=7, n_power=28, static_pacman=False):
+    def __init__(self, n, rows=33, cols=41, n_ghosts=7, n_power=28):
         self.n = n
         ctx = mp.get_context("spawn")
         self.parent, self.child = zip(*[ctx.Pipe() for _ in range(n)])
         self.procs = []
         for i, c in enumerate(self.child):
-            p = ctx.Process(target=_worker, args=(i, c, rows, cols, n_ghosts, n_power, static_pacman), daemon=True)
+            p = ctx.Process(target=_worker, args=(i, c, rows, cols, n_ghosts, n_power), daemon=True)
             p.start()
             self.procs.append(p)
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
@@ -319,11 +320,11 @@ class VecEnv:
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
         return self.current_obs
 
-    def set_curriculum(self, current_stage_idx, static_pacman=False):
+    def set_curriculum(self, current_stage_idx):
         from curriculum import STAGES
         s = STAGES[current_stage_idx]
         for p in self.parent:
-            p.send(("set_curriculum", (s.rows, s.cols, s.n_ghosts, s.n_power, static_pacman)))
+            p.send(("set_curriculum", (s.rows, s.cols, s.n_ghosts, s.n_power)))
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
         return self.current_obs
 
@@ -392,7 +393,7 @@ def train():
     stage = curriculum.stage
     print(f"Curriculum: starting at Stage {curriculum.stage_idx}\n({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts)")
     print("Initializing VecEnv (spawn before CUDA to prevent hang)...")
-    vec_env = VecEnv(NUM_ENVS, rows=stage.rows, cols=stage.cols, n_ghosts=stage.n_ghosts, n_power=stage.n_power, static_pacman=False)
+    vec_env = VecEnv(NUM_ENVS, rows=stage.rows, cols=stage.cols, n_ghosts=stage.n_ghosts, n_power=stage.n_power)
     print("Initializing networks...")
     actor  = GhostActor().to(DEVICE)
     critic = GhostCritic().to(DEVICE)
@@ -460,7 +461,7 @@ def train():
             actor_rollout.load_state_dict(actor.state_dict())
             critic_rollout.load_state_dict(critic.state_dict())
             stage = curriculum.stage
-            vec_env.set_curriculum(curriculum.stage_idx, static_pacman=False)
+            vec_env.set_curriculum(curriculum.stage_idx)
             print(f"Resumed at update {start_update}, stage {curriculum.stage_idx} ({stage.rows}×{stage.cols}, {stage.n_ghosts}g)")
         else:
             print("No checkpoints found, starting from scratch.")
@@ -643,8 +644,7 @@ def train():
             anneal_frac = 0.5 * (1.0 + math.cos(math.pi * bc_decay_step / BC_ANNEAL_UPDATES))
         else:
             anneal_frac = 0.0
-        bc_prob = max(BC_FLOOR, anneal_frac)
-        # static_pacman transition removed: pacman moves dynamically from update 1
+        bc_prob = max(BC_FLOOR, BC_INIT * anneal_frac)
         t_start_rollout = time.time()
         #per-env, per-step storage (lists of length ROLLOUT_STEPS)
         buf_spatial   = [[] for _ in range(NUM_ENVS)]
@@ -1035,14 +1035,14 @@ def train():
             print(f"CURRICULUM ADVANCE → Stage {curriculum.stage_idx} "
                   f"({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts)")
             print(f"{'='*60}\n")
-            vec_env.set_curriculum(curriculum.stage_idx, static_pacman=False)
+            vec_env.set_curriculum(curriculum.stage_idx)
             vec_env.sync_predictor(predictor.state_dict())
             torch.cuda.empty_cache()
             current_returns = [0.0] * NUM_ENVS
             for pg in opt_actor.param_groups:
-                pg['lr'] = max(4e-5, pg['lr'] * 0.75)
+                pg['lr'] = max(1.2e-4, pg['lr'] * 0.85)
             for pg in opt_critic.param_groups:
-                pg['lr'] = max(4e-5, pg['lr'] * 0.75)
+                pg['lr'] = max(2.4e-4, pg['lr'] * 0.85)
             ret_rms.count.clamp_(max=10000.0)
             critic_warmup_remaining = 20
             with open(log_path, "a") as f:

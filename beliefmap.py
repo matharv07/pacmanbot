@@ -296,18 +296,32 @@ class BeliefMap:
         idx = self._closest_node(last_pos)
         if idx < 0:
             return
-        outgoing = self._b_flat[idx] * LOST_SPREAD
+        outgoing = float(self._b_flat[idx])
         node = self._open_cells[idx]
-        neighbours = self._neighbours.get(node, [])
+        neighbours = [nbr for nbr in self._neighbours.get(node, []) if nbr not in getattr(self, '_disabled_wall_nodes', set())]
         guide_dir = self.predicted_dir if self.predicted_dir != (0, 0) else self.last_known_dir
-        if neighbours and guide_dir != (0, 0):
+        gd_norm = math.hypot(guide_dir[0], guide_dir[1])
+        if gd_norm > 1e-6:
+            dr, dc = guide_dir[0] / gd_norm, guide_dir[1] / gd_norm
+        else:
+            dr, dc = 0.0, 0.0
+        self._protected_lost_idxs = set()
+        if neighbours and outgoing > 0.0:
             r, c = node
-            dr, dc = guide_dir
             weights = {}
             total_w = 0.0
             for nr, nc in neighbours:
-                alignment = (nr - r) * dr + (nc - c) * dc
-                w = max(0.0, alignment + 1.0)
+                d = math.hypot(nr - r, nc - c)
+                if d > 1e-6:
+                    unit_r = (nr - r) / d
+                    unit_c = (nc - c) / d
+                else:
+                    unit_r, unit_c = 0.0, 0.0
+                if dr != 0.0 or dc != 0.0:
+                    alignment = unit_r * dr + unit_c * dc
+                    w = max(0.01, alignment + 1.0)
+                else:
+                    w = 1.0
                 weights[(nr, nc)] = w
                 total_w += w
             if total_w > 0:
@@ -315,7 +329,8 @@ class BeliefMap:
                     nbr_idx = self._open_idx_map.get(nbr_node)
                     if nbr_idx is not None:
                         self._b_flat[nbr_idx] += outgoing * (w / total_w)
-                self._b_flat[idx] -= outgoing
+                        self._protected_lost_idxs.add(nbr_idx)
+                self._b_flat[idx] = 0.0
         self.last_known_pos = last_pos
         self.frames_since_sighting = 0
         self._normalise()
@@ -474,9 +489,15 @@ class BeliefMap:
             if pacman_pos is not None:
                 pac_idx = self._closest_node(pacman_pos)
                 idxs = idxs[idxs != pac_idx]
-            self._b_flat[idxs] = 0.0
+            protected = getattr(self, '_protected_lost_idxs', set())
+            if protected:
+                idxs = np.array([i for i in idxs if i not in protected], dtype=np.int32)
+                self._protected_lost_idxs = set()
+            if len(idxs) > 0:
+                self._b_flat[idxs] = 0.0
         if impassable_nodes:
             self.observe_walls_batch(impassable_nodes)
+        self._normalise()
 
     def _update_pellet_score(self, known_pellets, known_power, is_powered: bool = False):
         new_pellets = set(known_pellets) if known_pellets else set()
@@ -644,13 +665,23 @@ class BeliefMap:
         self._ensure_initialised()
         if len(self._b_flat) == 0:
             return []
+        max_prob = float(np.max(self._b_flat)) if len(self._b_flat) > 0 else 0.0
+        if max_prob <= 1e-6:
+            if self.last_known_pos is not None:
+                return [self.last_known_pos]
+            return []
         if n == 1:
             best_idx = int(np.argmax(self._b_flat))
-            return [self._open_cells[best_idx]]
+            if self._b_flat[best_idx] > 1e-6:
+                return [self._open_cells[best_idx]]
+            return [self.last_known_pos] if self.last_known_pos is not None else []
         k = min(n, len(self._b_flat))
         top_idx = np.argpartition(self._b_flat, -k)[-k:]
         top_idx = top_idx[np.argsort(self._b_flat[top_idx])[::-1]]
-        return [self._open_cells[i] for i in top_idx]
+        res = [self._open_cells[i] for i in top_idx if self._b_flat[i] > 1e-6]
+        if not res and self.last_known_pos is not None:
+            return [self.last_known_pos]
+        return res
 
     def probability_at(self, pos: tuple) -> float:
         self._ensure_initialised()
@@ -803,12 +834,26 @@ class BeliefMap:
         total = float(self._b_flat.sum())
         if total < 1e-12:
             self._b_flat[:] = 0.0
-            if hasattr(self, '_walkable_mask'):
-                valid_count = self._walkable_mask.sum()
-                if valid_count > 0:
-                    self._b_flat[self._walkable_mask] = 1.0 / valid_count
-            else:
-                self._b_flat[:] = 1.0 / self.n_nodes
+            reseeded = False
+            if self.last_known_pos is not None and len(self._open_arr) > 0:
+                dists = np.hypot(self._open_arr[:, 0] - self.last_known_pos[0], self._open_arr[:, 1] - self.last_known_pos[1])
+                sigma = 2.5
+                weights = np.exp(-0.5 * (dists / sigma) ** 2)
+                if hasattr(self, '_walkable_mask'):
+                    weights[~self._walkable_mask] = 0.0
+                elif hasattr(self, '_disabled_wall_idxs') and self._disabled_wall_idxs:
+                    weights[self._disabled_wall_idxs] = 0.0
+                w_sum = float(weights.sum())
+                if w_sum > 1e-6:
+                    self._b_flat[:] = weights / w_sum
+                    reseeded = True
+            if not reseeded:
+                if hasattr(self, '_walkable_mask'):
+                    valid_count = self._walkable_mask.sum()
+                    if valid_count > 0:
+                        self._b_flat[self._walkable_mask] = 1.0 / valid_count
+                else:
+                    self._b_flat[:] = 1.0 / self.n_nodes
         else:
             self._b_flat /= total
         self._grid_dirty = True

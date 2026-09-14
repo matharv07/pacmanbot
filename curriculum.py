@@ -34,17 +34,14 @@ class Stage:
     def cols(self) -> int:
         return int(self.world_width * self.obs_resolution)
 
-STAGES = [Stage(world_height=7,  world_width=9,  obs_resolution=1.0, n_ghosts=3, n_power=1,  advance_return=25.0, min_updates=100, target_kill_rate=0.70),
-    Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=4, n_power=2,  advance_return=25.0, min_updates=120, target_kill_rate=0.75),
-    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=8,  advance_return=0.0,   min_updates=150, target_kill_rate=0.75),
-    Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=16, advance_return=-15.0, min_updates=180, target_kill_rate=0.75),
-    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=0, target_kill_rate=0.80)]
+STAGES = [Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=8,  advance_return=70.0, min_updates=150, target_kill_rate=0.85),
+    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.80)]
 
 ADVANCE_WINDOW = 50    #rolling window of updates achieving return/kill threshold required to clear a stage
 
 class CurriculumScheduler:
     def __init__(self, start_stage: int = 0):
-        self.stage_idx = start_stage
+        self.stage_idx = min(len(STAGES) - 1, start_stage)
         self._return_history: collections.deque = collections.deque(maxlen=ADVANCE_WINDOW)
         self._kill_history: collections.deque = collections.deque(maxlen=ADVANCE_WINDOW)
         self._updates_in_stage: int = 0
@@ -66,19 +63,16 @@ class CurriculumScheduler:
     def should_advance(self) -> bool:
         if self.is_final:
             return False
+        #strictly enforce min_updates before allowing ANY stage advancement
+        if self._updates_in_stage < self.stage.min_updates:
+            return False
         if len(self._return_history) < ADVANCE_WINDOW:
             return False
         avg_ret = sum(self._return_history) / len(self._return_history)
         avg_kill = (sum(self._kill_history) / len(self._kill_history)) if self._kill_history else 0.0
-        #dominant performance gate: exceeds stage target by 15% relative (or >= 50% for small stages)
-        dominant_gate = max(0.50, min(0.95, self.stage.target_kill_rate * 1.15))
+        #dominant performance gate: exceeds stage target by 10% relative
+        dominant_gate = min(0.95, self.stage.target_kill_rate * 1.10)
         if avg_kill >= dominant_gate and avg_ret >= (self.stage.advance_return - 2.0):
-            return True
-        #enforce min_updates for normal target, high-kill gate, and plateau detection
-        if self._updates_in_stage < self.stage.min_updates:
-            return False
-        #if ghosts decisively outhunt Pacman over the full window after satisfying min_updates
-        if self.stage_idx >= 2 and avg_kill >= min(0.95, self.stage.target_kill_rate * 1.10):
             return True
         #solid target: meets both calibrated advance_return and target_kill_rate
         if avg_ret >= self.stage.advance_return and avg_kill >= self.stage.target_kill_rate:
@@ -108,7 +102,7 @@ class CurriculumScheduler:
         return {"stage_idx": self.stage_idx, "updates_in_stage": self._updates_in_stage, "return_history": list(self._return_history), "kill_history": list(self._kill_history)}
 
     def load_state_dict(self, d: dict):
-        self.stage_idx = d.get("stage_idx", 0)
+        self.stage_idx = min(len(STAGES) - 1, d.get("stage_idx", 0))
         self._updates_in_stage = d.get("updates_in_stage", 0)
         ret_hist = d.get("return_history", [])
         kill_hist = d.get("kill_history", [])

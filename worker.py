@@ -48,7 +48,6 @@ class Env:
         self._cached_hspeed: dict[int, float] = {}
         self._cached_htasks: dict[int, list] = {}
         self._cached_hdists: dict[int, dict] = {}
-        self.static_pacman = False
         self.max_frames = int(world_height * world_width * 2) + 1000
         self._pending_pred = None
         self._stored_predictor_weights = None
@@ -66,10 +65,8 @@ class Env:
     def reset(self):
         self.max_frames = int(self.world_height * self.world_width * 2) + 1000
         self.grid, self._player_start, self.world = generate_map(
-            world_height=self.world_height, world_width=self.world_width, n_power=self.n_power, random_spawn=self.static_pacman, obs_resolution=self.obs_resolution)
+            world_height=self.world_height, world_width=self.world_width, n_power=self.n_power, random_spawn=False, obs_resolution=self.obs_resolution)
         self.player = Player(self.grid, self._player_start, self.world, obs_resolution=self.obs_resolution)
-        if self.static_pacman:
-            self.player.stationary = True
         open_cells = np.array(self.world.prm_nodes) if hasattr(self.world, 'prm_nodes') and self.world.prm_nodes else np.array([[float(self._player_start[0]), float(self._player_start[1])]])
         if len(open_cells) < self.num_ghosts:
             open_cells = np.array([self.world.random_open_point() for _ in range(self.num_ghosts * 2)])
@@ -88,6 +85,9 @@ class Env:
             starts.append(tuple(open_cells[best]))
             avail[best] = False
         self.ghosts = { i: Ghost(i, self.grid, pos, GHOST_COLORS[i % len(GHOST_COLORS)], self._player_start, self.world) for i, pos in enumerate(starts) }
+        for g in self.ghosts.values():
+            g.rl_mode = True
+            g.cbba_agent.rl_mode = True
         self.frame = 0
         self.shaper.reset()
         for g in self.ghosts.values():
@@ -222,14 +222,9 @@ class Env:
                 if gid not in action_dict:
                     continue
                 g = self.ghosts[gid]
-                indices, scores_map, _ = action_dict[gid]
-                tasks = actions_to_tasks(g, scores_map, indices, self.frame, self.obs_resolution)
-                h_tasks = self._cached_htasks.get(gid, []) if bc_prob > 0.0 else []
-                if random.random() < bc_prob and h_tasks:
-                    cand_tasks = h_tasks + tasks
-                    info_heuristic_merges += 1
-                else:
-                    cand_tasks = tasks
+                indices, scores_map, speed = action_dict[gid]
+                tasks = actions_to_tasks(g, scores_map, indices, self.frame, self.obs_resolution, target_speed=speed)
+                cand_tasks = tasks
                 cur_active = g.cbba_agent.get_active_task()
                 if cur_active is not None and (self.frame - cur_active.created_frame < 24):
                     d_cur = math.hypot(cur_active.target_pos[0] - g.y, cur_active.target_pos[1] - g.x)
@@ -365,10 +360,10 @@ class Env:
                             pac_score = getattr(self.player, 'score', 0)
                             score_dock = min(pac_score * 0.15, 60.0)
                             min_direct = max(20.0, 50.0 * speed_mult - 20.0)
-                            direct_kill_award = max(min_direct, 120.0 * speed_mult - score_dock)
+                            direct_kill_award = max(min_direct, 80.0 * speed_mult - score_dock)
                             if gid in rewards:
                                 rewards[gid] += direct_kill_award
-                            TEAM_KILL_BASE = 40.0 * speed_mult
+                            TEAM_KILL_BASE = 60.0 * speed_mult
                             TEAM_KILL_PROX = 40.0 * speed_mult
                             for other_gid, other_ghost in self.ghosts.items():
                                 if other_gid != gid and not other_ghost.dead and other_gid in rewards:
@@ -435,20 +430,23 @@ class Env:
                         rewards[gid] -= 0.02   #isolated ghost penalty
                     elif len(visited) == n_alive_now:
                         rewards[gid] += 0.005  #full mesh team connectivity reward
-            #corridor anti-clustering / traffic jam penalty
+            #corridor anti-clustering / traffic jam penalty (masked when near Pacman)
             alive_ghosts = [g for g in self.ghosts.values() if not g.dead]
             if len(alive_ghosts) >= 2:
                 for i in range(len(alive_ghosts)):
                     g1 = alive_ghosts[i]
+                    d_pac1 = math.hypot(g1.y - self.player.y, g1.x - self.player.x)
                     for j in range(i + 1, len(alive_ghosts)):
                         g2 = alive_ghosts[j]
-                        d_peer = math.hypot(g1.y - g2.y, g1.x - g2.x)
-                        if d_peer < 0.85:
-                            jam_penalty = 0.015 * (1.0 - d_peer / 0.85)
-                            if g1.gid in rewards:
-                                rewards[g1.gid] -= jam_penalty
-                            if g2.gid in rewards:
-                                rewards[g2.gid] -= jam_penalty
+                        d_pac2 = math.hypot(g2.y - self.player.y, g2.x - self.player.x)
+                        if min(d_pac1, d_pac2) > 3.5:
+                            d_peer = math.hypot(g1.y - g2.y, g1.x - g2.x)
+                            if d_peer < 0.85:
+                                jam_penalty = 0.015 * (1.0 - d_peer / 0.85)
+                                if g1.gid in rewards:
+                                    rewards[g1.gid] -= jam_penalty
+                                if g2.gid in rewards:
+                                    rewards[g2.gid] -= jam_penalty
 
             step_cost = 0.050
             for gid in rewards:

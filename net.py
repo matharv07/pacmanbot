@@ -51,8 +51,8 @@ class GhostActor(nn.Module):
         self.res1 = ResBlock(64, 128, cond_dim=128)
         self.res2 = ResBlock(128, 128, cond_dim=128)
         self.res3 = ResBlock(128, 128, cond_dim=128)
-        #1×1 conv to logit map
-        self.head = nn.Conv2d(128, 1, 1)
+        #1×1 conv to logit map (combines 128 local spatial channels + 128 global context channels)
+        self.head = nn.Conv2d(256, 1, 1)
         #continuous speed head (alpha, beta for Beta distribution)
         self.speed_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 2))
 
@@ -65,9 +65,12 @@ class GhostActor(nn.Module):
         pool = F.adaptive_avg_pool2d(x, 1).flatten(1)   #(B, 128)
         return x, pool, vec
 
-    def logits_from_features(self, feats, mask):
-        #feats: (B, 128, H, W),  mask: (B, H, W) bool
-        logits = self.head(feats).squeeze(1)              #(B, H, W)
+    def logits_from_features(self, feats, pool, mask):
+        #feats: (B, 128, H, W), pool: (B, 128), mask: (B, H, W) bool
+        H, W = feats.shape[2], feats.shape[3]
+        pool_expanded = pool.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, W)
+        combined = torch.cat([feats, pool_expanded], dim=1)  #(B, 256, H, W)
+        logits = self.head(combined).squeeze(1)              #(B, H, W)
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
         logits = logits.masked_fill(~mask, float('-inf'))
         return logits
@@ -85,7 +88,7 @@ class GhostActor(nn.Module):
         speed_lp : (B, 1)      — log prob of sampled speed
         """
         feats, pool, vec = self.encode(spatial, vector)
-        logits = self.logits_from_features(feats, mask)
+        logits = self.logits_from_features(feats, pool, mask)
         #independent sigmoid scores for CBBA
         scores = torch.sigmoid(logits)
         B = spatial.shape[0]
@@ -132,7 +135,7 @@ class GhostActor(nn.Module):
         speed_params: (B, 2)        — (alpha, beta) for BC loss
         """
         feats, pool, vec = self.encode(spatial, vector)
-        logits = self.logits_from_features(feats, mask)
+        logits = self.logits_from_features(feats, pool, mask)
         B = spatial.shape[0]
         base_invalid = ~mask.reshape(B, -1)
         flat_clean = torch.nan_to_num(

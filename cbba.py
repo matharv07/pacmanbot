@@ -18,6 +18,7 @@ class CBBA_Agent:
         self.gid = gid
         self.lt = lt
         self.lamda = lamda
+        self.rl_mode = False
         self.bundle: list = []             #tasks in agent's bundle
         self.path: list = []               #agent's ordered tasks for execution
         self.y: dict = {}                  #winning bids
@@ -80,15 +81,16 @@ class CBBA_Agent:
                 changed = True
         if changed:
             self._cascade_release()
-        if (frame + self.gid) % AUCTION_EVERY == 0 and frame != self._last_auction:
-            self._last_auction = frame
-            tasks, dists = generate_tasks(ghost, frame)
-            for t in tasks:
-                k = _task_key(t)
-                self._task_map[k] = t
-                if k not in self._task_created_frame:
-                    self._task_created_frame[k] = frame
-            self._phase1(ghost, tasks, dists)
+        if not getattr(ghost, 'rl_mode', False) and not getattr(self, 'rl_mode', False):
+            if (frame + self.gid) % AUCTION_EVERY == 0 and frame != self._last_auction:
+                self._last_auction = frame
+                tasks, dists = generate_tasks(ghost, frame)
+                for t in tasks:
+                    k = _task_key(t)
+                    self._task_map[k] = t
+                    if k not in self._task_created_frame:
+                        self._task_created_frame[k] = frame
+                self._phase1(ghost, tasks, dists)
         return self.get_active_task()
 
     def get_active_task(self) -> Optional[Task]:
@@ -131,7 +133,7 @@ class CBBA_Agent:
         meta = {}
         for k, t in self._task_map.items():
             if t is not None:
-                meta[k] = (getattr(t, 'assigned_to', -1), getattr(t, 'owner', -1), getattr(t, 'target_speed', 1.0))
+                meta[k] = (getattr(t, 'assigned_to', -1), getattr(t, 'owner', -1), getattr(t, 'target_speed', 1.0), getattr(t, 'score', 1.0))
         return {"y": dict(self.y), "z": dict(self.z), "s": dict(self.s), "meta": meta}
 
     def receive_consensus(self, sender_gid: int, y_k: dict, z_k: dict, s_k: dict, frame: int, task_meta: dict = None) -> bool:  #snapshot before updating to pass into _table1
@@ -148,9 +150,13 @@ class CBBA_Agent:
             assigned_to = t_meta[0] if t_meta else -1
             owner = t_meta[1] if t_meta else -1
             speed = t_meta[2] if t_meta else 1.0
+            rec_score = t_meta[3] if (t_meta and len(t_meta) >= 4) else None
             if key not in self._task_map:
                 t_type, t_pos = key[0], key[1]
-                score = max(y_k.get(key, 0.0), self.y.get(key, 0.0), 1.0)
+                if rec_score is not None:
+                    score = float(rec_score)
+                else:
+                    score = max(y_k.get(key, 0.0), self.y.get(key, 0.0), 0.1)
                 self._task_map[key] = Task(task_type=TaskType(t_type), target_pos=t_pos, score=score, assigned_to=assigned_to, owner=owner, target_speed=speed, created_frame=frame)
                 self._task_created_frame[key] = frame
             else:
@@ -159,6 +165,8 @@ class CBBA_Agent:
                     existing.assigned_to = assigned_to
                 if existing.owner == -1 and owner != -1:
                     existing.owner = owner
+                if rec_score is not None and getattr(existing, 'score', 0.0) <= 0.0:
+                    existing.score = float(rec_score)
             z_k_j = z_k.get(key)
             z_i_j = self.z.get(key)
             y_k_j = y_k.get(key, 0.0)
@@ -266,9 +274,41 @@ class CBBA_Agent:
         s_old = self._path_score(self.path, ghost)
         best_gain = -math.inf
         best_n = 0
+        cur_gain = 0.0
+        if len(self.path) > 0 and key != self.path[0]:
+            cur_key = self.path[0]
+            cur_gain = self.y.get(cur_key, 0.0)
+            cur_task = self._task_map.get(cur_key)
+            if cur_gain <= 0.0 and cur_task is not None:
+                cur_gain = getattr(cur_task, 'score', 0.0)
+            if cur_task is not None:
+                d_cur = math.hypot(cur_task.target_pos[0] - ghost.y, cur_task.target_pos[1] - ghost.x)
+                if d_cur < 0.5:
+                    cur_gain = 0.0
+        vx = getattr(ghost, 'vx', 0.0)
+        vy = getattr(ghost, 'vy', 0.0)
+        spd = math.hypot(vx, vy)
+        is_moving = spd > 0.05
+        is_reversal = False
+        if is_moving:
+            tgt = task.target_pos
+            dy = tgt[0] - ghost.y
+            dx = tgt[1] - ghost.x
+            d_t = math.hypot(dy, dx)
+            if d_t > 0.1:
+                dot = (vx / spd) * (dx / d_t) + (vy / spd) * (dy / d_t)
+                if dot < -0.5:
+                    is_reversal = True
         for n in range(len(self.path) + 1):
             new_path = self.path[:n] + [key] + self.path[n:]
             gain = self._path_score(new_path, ghost) - s_old
+            if n == 0:
+                if is_reversal:
+                    gain *= 0.15
+                if len(self.path) > 0 and key != self.path[0]:
+                    req_ratio = 1.6 if is_reversal else 1.35
+                    if cur_gain > 0.0 and gain < req_ratio * cur_gain:
+                        continue
             if gain > best_gain:
                 best_gain = gain
                 best_n = n

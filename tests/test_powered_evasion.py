@@ -110,13 +110,20 @@ def test_safety_map_projects_danger_around_powered_pacman():
 
 def test_ghost_terminal_evasion_in_env():
     """Verify that in the real environment, ghosts close to powered Pacman actively steer away."""
-    stage = STAGES[2]
+    import random
+    random.seed(0)
+    np.random.seed(0)
+    stage = STAGES[0]
     env = Env(env_id=0, num_ghosts=2, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     env.reset()
 
     # Place Pacman and Ghost 0 near each other in an open area
     open_cells = [(r, c) for r in range(stage.rows) for c in range(stage.cols) if env.world.is_passable(float(c) + 0.5, float(r) + 0.5, radius=0.35)]
-    cr, cc = open_cells[30]
+    cr, cc = open_cells[0]
+    for r, c in open_cells:
+        if env.world.is_passable(float(c) - 1.5, float(r) + 0.5, radius=0.35) and env.world.is_passable(float(c) + 3.0, float(r) + 0.5, radius=0.35):
+            cr, cc = r, c
+            break
     
     # Place Ghost at (cr, cc) and Pacman 3 units to the right
     env.ghosts[0].y = float(cr) + 0.5
@@ -140,7 +147,7 @@ def test_ghost_terminal_evasion_in_env():
 def test_dead_callout_and_line_of_sight_witnessing():
     """Verify that ghosts only learn of peer deaths via direct line-of-sight or radio mesh,
     and surviving witnesses display a 'Ghost X DOWN!' dead callout."""
-    stage = STAGES[2]
+    stage = STAGES[0]
     env = Env(env_id=0, num_ghosts=3, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     env.reset()
 
@@ -210,7 +217,7 @@ def test_dead_callout_and_line_of_sight_witnessing():
 
 def test_ghosts_lack_omniscient_power_state_and_death_access():
     """Verify ghosts cannot omnisciently sense Pacman's power state or peer deaths without sight or radio."""
-    stage = STAGES[2]
+    stage = STAGES[0]
     env = Env(env_id=0, num_ghosts=2, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     env.reset()
 
@@ -262,7 +269,7 @@ def test_ghosts_lack_omniscient_power_state_and_death_access():
 def test_dead_ghost_list_in_rl_vector():
     """Verify build_vector explicitly encodes peer dead status, unknown status, and team casualty ratio."""
     from obs import build_vector, VEC_DIM, MAX_GHOSTS
-    stage = STAGES[2]
+    stage = STAGES[0]
     env = Env(env_id=0, num_ghosts=3, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     env.reset()
 
@@ -307,7 +314,7 @@ def test_dead_ghost_list_in_rl_vector():
 def test_peer_not_seen_at_last_known_pos_marked_unknown():
     """Verify that when a ghost looks at a peer's last known position and sees nobody there,
     it immediately marks the peer UNKNOWN (not keeping stale coordinates), but does NOT falsely mark it dead."""
-    stage = STAGES[2]
+    stage = STAGES[0]
     env = Env(env_id=0, num_ghosts=2, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     env.reset()
 
@@ -320,7 +327,7 @@ def test_peer_not_seen_at_last_known_pos_marked_unknown():
     pos1_stale = None
     for cand in open_cells:
         if cand != pos0 and math.hypot(cand[0] - pos0[0], cand[1] - pos0[1]) < 5.0:
-            if env.world.line_of_sight((pos0[1] + 0.5, pos0[0] + 0.5), (cand[1] + 0.5, cand[0] + 0.5), radius=0.35, step_size=0.5):
+            if env.world.line_of_sight((pos0[1] + 0.5, pos0[0] + 0.5), (cand[1] + 0.5, cand[0] + 0.5), radius=0.4, step_size=0.5):
                 pos1_stale = cand
                 break
     assert pos1_stale is not None
@@ -336,8 +343,8 @@ def test_peer_not_seen_at_last_known_pos_marked_unknown():
     g1.y, g1.x = float(open_cells[0][0]) + 0.5, float(open_cells[0][1]) + 0.5
 
     # Ghost 0 scans lidar (run 2 frames so frame % LIDAR_SWEEP_EVERY == 0 triggers sweep)
-    g0.update((env.player.y, env.player.x), False, env.ghosts)
-    g0.update((env.player.y, env.player.x), False, env.ghosts)
+    g0.update((env.player.y, env.player.x), False, env.ghosts, skip_movement=True)
+    g0.update((env.player.y, env.player.x), False, env.ghosts, skip_movement=True)
 
     # Ghost 0 is looking directly at (stale_y, stale_x) and Ghost 1 is NOT there:
     # Ghost 0 must IMMEDIATELY mark Ghost 1 as UNKNOWN!

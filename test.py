@@ -84,8 +84,9 @@ def _worker_chunk(ckpt_path: str, n_games: int, stage_override=None, seed_offset
     np.random.seed(seed_offset)
     torch.manual_seed(seed_offset)
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    stage_idx = ckpt['curriculum']['stage_idx']
-    eff_stage_idx = stage_override if stage_override is not None else stage_idx
+    ckpt_stage = ckpt.get('curriculum', {}).get('stage_idx', 0) if isinstance(ckpt.get('curriculum'), dict) else 0
+    raw_idx = stage_override if stage_override is not None else ckpt_stage
+    eff_stage_idx = min(len(STAGES) - 1, max(0, raw_idx))
     stage     = STAGES[eff_stage_idx]
     actor = GhostActor().cpu()
     actor.load_state_dict(ckpt['actor'])

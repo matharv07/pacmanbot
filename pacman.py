@@ -356,11 +356,7 @@ class Player:
                 return self.grid[int(r)][int(c)] == WALL
             return True
         self.prev_y, self.prev_x = self.y, self.x
-        if self.stationary:
-            if not self.powered and random.random() < 0.0107:
-                self.powered = True
-                self.power_timer = 40
-        elif AUTO_MODE:
+        if AUTO_MODE:
             self.frame_counter += 1
             self._route_age += 1
             self.pos_history.append((self.x, self.y))
@@ -728,6 +724,9 @@ class Game:
             ghost_starts.append(tuple(open_cells_arr[best_idx]))
             avail[best_idx] = False
         self.ghosts = {i: Ghost(i, self.grid, pos, GHOST_COLORS[i % len(GHOST_COLORS)], self.player_start, self.world) for i, pos in enumerate(ghost_starts)}
+        for g in self.ghosts.values():
+            g.rl_mode = RL_MODE
+            g.cbba_agent.rl_mode = RL_MODE
         self.state = "playing"
         self.message_timer = 0
         self.debug_ghost_id = 0
@@ -793,6 +792,9 @@ class Game:
                             self.player._route_target = None
                         elif RL_TOGGLE_RECT.collidepoint(event.pos):
                             RL_MODE = not RL_MODE
+                            for g in self.ghosts.values():
+                                g.rl_mode = RL_MODE
+                                g.cbba_agent.rl_mode = RL_MODE
                             if RL_MODE:
                                 load_rl_model()
 
@@ -844,8 +846,14 @@ class Game:
                         for r, c in indices:
                             if 0 <= r < R and 0 <= c < C:
                                 self.recent_nom[gid][r, c] = 1.0
-                        tasks = actions_to_tasks(g, scores_map, indices, self.frame_counter, obs_resolution=1.0)
-                        for t in tasks:
+                        tasks = actions_to_tasks(g, scores_map, indices, self.frame_counter, obs_resolution=1.0, target_speed=float(spd_np[i][0]))
+                        cand_tasks = list(tasks)
+                        cur_active = g.cbba_agent.get_active_task()
+                        if cur_active is not None and (self.frame_counter - cur_active.created_frame < 24):
+                            d_cur = math.hypot(cur_active.target_pos[0] - g.y, cur_active.target_pos[1] - g.x)
+                            if d_cur > 0.6 and cur_active not in cand_tasks:
+                                cand_tasks.append(cur_active)
+                        for t in cand_tasks:
                             k = _task_key(t)
                             if k not in pooled_tasks or t.score > pooled_tasks[k].score:
                                 pooled_tasks[k] = t

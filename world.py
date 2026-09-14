@@ -159,16 +159,17 @@ class World:
             cx = (px * 10.0).astype(np.int32)
             cy = (py * 10.0).astype(np.int32)
             valid = (cx >= 0) & (cx < cols) & (cy >= 0) & (cy < rows)
-            if abs(radius - 0.4) < 1e-4:
+            r_float = float(radius)
+            if abs(r_float - 0.4) <= 0.03:
                 grid = self._grid_0_4
-            elif abs(radius - 0.35) < 1e-4:
+            elif abs(r_float - 0.35) <= 0.03:
                 grid = self._grid_0_35
-            elif abs(radius - 0.3) < 1e-4:
+            elif abs(r_float - 0.3) <= 0.03:
                 grid = self._grid_0_3
-            elif radius < 1e-4:
+            elif r_float <= 0.05:
                 grid = self._grid_0_0
             else:
-                grid = None                
+                grid = self._grid_0_4 if r_float >= 0.38 else (self._grid_0_35 if r_float >= 0.32 else self._grid_0_3)
             if grid is not None:
                 ans = np.zeros_like(px, dtype=bool)
                 ans[valid] = grid[cy[valid], cx[valid]]

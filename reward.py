@@ -42,7 +42,7 @@ class RewardShaper:
         if t is not None:
             return t
         t = ghost.last_lost_pacman
-        if t is not None:
+        if t is not None and (getattr(ghost, 'frame', 0) - getattr(ghost, 'pacman_last_seen', 0) <= 25):
             return t
         if hasattr(ghost.belief_map, 'top_cells'):
             top = ghost.belief_map.top_cells(n=1)
@@ -53,12 +53,20 @@ class RewardShaper:
     def _phi_hunt(self, ghost, target) -> float:
         if getattr(ghost, 'pacman_powered', False) or target is None:
             return 0.0
-        # using cached Dijkstra distance if available (from CBBA auction)
-        if hasattr(ghost, 'cbba_agent') and target in ghost.cbba_agent._dist_cache:
-            d = ghost.cbba_agent._dist_cache[target]
-            if math.isinf(d) or math.isnan(d):
-                d = abs(ghost.y - target[0]) + abs(ghost.x - target[1])
-        else:
+        target_ck = (round(float(target[0]), 2), round(float(target[1]), 2))
+        d = None
+        if hasattr(ghost, 'cbba_agent') and ghost.cbba_agent is not None:
+            d = ghost.cbba_agent._dist_cache.get(target_ck, ghost.cbba_agent._dist_cache.get(target))
+        if d is None or math.isinf(d) or math.isnan(d):
+            w = getattr(ghost, 'world', None)
+            if w is not None and hasattr(w, 'apsp') and hasattr(w, 'prm_node_idx'):
+                p1 = (round(float(ghost.y), 1), round(float(ghost.x), 1))
+                p2 = (round(float(target[0]), 1), round(float(target[1]), 1))
+                idx1 = w.prm_node_idx.get(p1)
+                idx2 = w.prm_node_idx.get(p2)
+                if idx1 is not None and idx2 is not None:
+                    d = float(w.apsp[idx1, idx2])
+        if d is None or math.isinf(d) or math.isnan(d):
             d = abs(ghost.y - target[0]) + abs(ghost.x - target[1])
         if math.isinf(d) or math.isnan(d):
             d = 999.0
@@ -79,11 +87,20 @@ class RewardShaper:
     def _phi_flee(self, ghost, target) -> float:
         if not getattr(ghost, 'pacman_powered', False) or target is None:
             return 0.0
-        if hasattr(ghost, 'cbba_agent') and target in ghost.cbba_agent._dist_cache:
-            d = ghost.cbba_agent._dist_cache[target]
-            if math.isinf(d) or math.isnan(d):
-                d = abs(ghost.y - target[0]) + abs(ghost.x - target[1])
-        else:
+        target_ck = (round(float(target[0]), 2), round(float(target[1]), 2))
+        d = None
+        if hasattr(ghost, 'cbba_agent') and ghost.cbba_agent is not None:
+            d = ghost.cbba_agent._dist_cache.get(target_ck, ghost.cbba_agent._dist_cache.get(target))
+        if d is None or math.isinf(d) or math.isnan(d):
+            w = getattr(ghost, 'world', None)
+            if w is not None and hasattr(w, 'apsp') and hasattr(w, 'prm_node_idx'):
+                p1 = (round(float(ghost.y), 1), round(float(ghost.x), 1))
+                p2 = (round(float(target[0]), 1), round(float(target[1]), 1))
+                idx1 = w.prm_node_idx.get(p1)
+                idx2 = w.prm_node_idx.get(p2)
+                if idx1 is not None and idx2 is not None:
+                    d = float(w.apsp[idx1, idx2])
+        if d is None or math.isinf(d) or math.isnan(d):
             d = abs(ghost.y - target[0]) + abs(ghost.x - target[1])
         if math.isinf(d) or math.isnan(d):
             d = 999.0
