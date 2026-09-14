@@ -70,14 +70,16 @@ def test_3_stage_curriculum_configuration():
     assert STAGES[0].cols == 17
     assert STAGES[0].n_ghosts == 3
     assert STAGES[0].n_power == 2
-    assert STAGES[0].min_updates == 100
+    assert STAGES[0].min_updates == 80
+    assert STAGES[0].target_kill_rate == 0.80
 
     # Stage 1: 21x27, 5 ghosts, 8 power pellets
     assert STAGES[1].rows == 21
     assert STAGES[1].cols == 27
     assert STAGES[1].n_ghosts == 5
     assert STAGES[1].n_power == 8
-    assert STAGES[1].min_updates == 150
+    assert STAGES[1].min_updates == 120
+    assert STAGES[1].target_kill_rate == 0.78
 
     # Stage 2: 33x41, 7 ghosts, 28 power pellets (high danger final challenge)
     assert STAGES[2].rows == 33
