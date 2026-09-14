@@ -43,7 +43,7 @@ if torch.cuda.is_available():
 NUM_ENVS            = int(os.environ.get("NUM_ENVS", "14"))
 ROLLOUT_STEPS       = int(os.environ.get("ROLLOUT_STEPS", "256"))
 MINI_BATCH          = int(os.environ.get("MINI_BATCH", "4096"))
-MICRO_BATCH         = int(os.environ.get("MICRO_BATCH", "4096"))
+MICRO_BATCH         = int(os.environ.get("MICRO_BATCH", "2048"))
 ROLLOUT_INFER_CHUNK = int(os.environ.get("ROLLOUT_INFER_CHUNK", "2048"))
 #adaptive OOM-safe chunk sizes — halved automatically on cuda OOM, never grow back
 _eff_infer_chunk = ROLLOUT_INFER_CHUNK
