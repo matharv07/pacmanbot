@@ -255,19 +255,20 @@ def find_topological_flee_target(world, ghost_pos: tuple, pac_pos: tuple, radius
             d_pac = np.hypot(prm_arr[:, 0] - py, prm_arr[:, 1] - px)
         else:
             return None
-    with np.errstate(invalid='ignore'):
-        lead_margin = np.where((d_pac < math.inf) & (d_ghost < math.inf), d_pac - d_ghost, -np.inf)
     degrees = np.array([len(world.prm_graph.get(n, [])) for n in world.prm_nodes], dtype=np.float32)
     deg_bonus = np.where(degrees >= 3, 8.0, np.where(degrees == 2, 0.0, -25.0))
-    scores = d_pac * 2.0 + lead_margin * 1.5 - d_ghost * 0.4 + deg_bonus
-    invalid = (lead_margin <= 0) | (d_ghost == math.inf) | (d_pac == math.inf)
-    scores[invalid] = -np.inf
+    with np.errstate(invalid='ignore'):
+        lead_margin = np.where((d_pac < math.inf) & (d_ghost < math.inf), d_pac - d_ghost, -np.inf)
+        scores = d_pac * 2.0 + lead_margin * 1.5 - d_ghost * 0.4 + deg_bonus
+        invalid = (lead_margin <= 0) | (d_ghost == math.inf) | (d_pac == math.inf)
+        scores[invalid] = -np.inf
     best_idx = int(np.argmax(scores))
     if scores[best_idx] > -np.inf:
         node = world.prm_nodes[best_idx]
         return (float(node[0]), float(node[1]))
-    fallback_scores = d_pac * 2.0 - d_ghost * 0.5 + deg_bonus
-    fallback_scores[(d_ghost == math.inf) | (d_pac == math.inf)] = -np.inf
+    with np.errstate(invalid='ignore'):
+        fallback_scores = d_pac * 2.0 - d_ghost * 0.5 + deg_bonus
+        fallback_scores[(d_ghost == math.inf) | (d_pac == math.inf)] = -np.inf
     if np.any(fallback_scores > -np.inf):
         best_fb = int(np.argmax(fallback_scores))
         node = world.prm_nodes[best_fb]
