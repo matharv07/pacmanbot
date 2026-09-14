@@ -20,34 +20,23 @@ import glob
 from net import GhostActor
 from world import World
 
+LARGEST_STAGE_IDX = len(STAGES) - 1
+
 parser = argparse.ArgumentParser()
-parser.add_argument("--stage", type=int, default=4, help="Curriculum stage index to visualize (default: 4)")
+parser.add_argument("--stage", type=int, default=None, help=f"Curriculum stage index to visualize (default: largest stage {LARGEST_STAGE_IDX})")
 parser.add_argument("--checkpoint", type=int, default=-1, help="Checkpoint to load")
 args, _ = parser.parse_known_args()
 
 check = args.checkpoint
 stage_choice = args.stage
 if stage_choice is None:
-    ckpts = glob.glob("checkpoints/ckpt_*.pt")
-    if ckpts:
-        def _ckpt_score(f):
-            try:
-                num = int(f.split('ckpt_')[-1].split('.pt')[0])
-                return (num > 0 and num % 100 == 0, num)
-            except ValueError:
-                return (False, -1)
-        latest_ckpt = max(ckpts, key=_ckpt_score)
-        if check != -1 and os.path.exists(f"checkpoints/ckpt_{check}.pt"):
-            latest_ckpt = f"checkpoints/ckpt_{check}.pt"
-        try:
-            c_data = torch.load(latest_ckpt, map_location='cpu', weights_only=False)
-            stage_choice = c_data.get("curriculum", {}).get("stage_idx", 4)
-        except Exception:
-            stage_choice = 4
-    else:
-        stage_choice = 4
+    stage_choice = LARGEST_STAGE_IDX
 
-STAGE = STAGES[stage_choice] if stage_choice != -1 and 0 <= stage_choice < len(STAGES) else None
+if stage_choice != -1:
+    stage_choice = min(LARGEST_STAGE_IDX, max(0, stage_choice))
+    STAGE = STAGES[stage_choice]
+else:
+    STAGE = None
 if STAGE:
     ROWS = STAGE.rows
     COLS = STAGE.cols
