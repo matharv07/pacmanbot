@@ -25,15 +25,15 @@ def _pad_spatial(arr, target_h, target_w):
     h, w = arr.shape[-2], arr.shape[-1]
     if h == target_h and w == target_w:
         return arr
-    pad_h = target_h - h
-    pad_w = target_w - w
-    if arr.ndim == 2:
-        return np.pad(arr, ((0, pad_h), (0, pad_w)))
-    elif arr.ndim == 3:
-        return np.pad(arr, ((0, 0), (0, pad_h), (0, pad_w)))
-    elif arr.ndim == 4:
-        return np.pad(arr, ((0, 0), (0, 0), (0, pad_h), (0, pad_w)))
-    return arr
+    out = np.zeros(arr.shape[:-2] + (target_h, target_w), dtype=arr.dtype)
+    out[..., :h, :w] = arr
+    if arr.ndim == 4 and out.shape[1] >= 1:
+        out[:, 0, h:, :] = 1.0
+        out[:, 0, :, w:] = 1.0
+    elif arr.ndim == 3 and out.shape[0] >= 1:
+        out[0, h:, :] = 1.0
+        out[0, :, w:] = 1.0
+    return out
 
 def _run_episode(actor, env, stage):
     obs = env.reset()

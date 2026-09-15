@@ -330,7 +330,7 @@ def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int, o
             tt = TaskType.HUNT
         else:
             tt = TaskType.DYNAMIC
-        tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame, owner=ghost.gid, target_speed=target_speed))
+        tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame, owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed))
     return tasks
 
 def build_global_spatial(env, rows: int, cols: int, obs_resolution: float = 1.0) -> np.ndarray:

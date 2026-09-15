@@ -256,11 +256,12 @@ class Env:
             if score_diff > 0:
                 for a_gid in alive:
                     if a_gid in rewards and not self.ghosts[a_gid].dead:
-                        rewards[a_gid] -= 0.02 * score_diff
+                        rewards[a_gid] -= 0.01 * score_diff
             if not powered_before and getattr(self.player, 'powered', False):
+                pow_penalty = max(1.5, min(8.0, 16.0 / max(1, getattr(self, 'n_power', 8))))
                 for a_gid in alive:
                     if a_gid in rewards and not self.ghosts[a_gid].dead:
-                        rewards[a_gid] -= 10.0    #team penalty for allowing Pacman to grab a power pellet
+                        rewards[a_gid] -= pow_penalty    #team penalty scaled by power pellet density
             powered = self.player.powered
             new_pac_v = np.array([float(self.player.vy), float(self.player.vx)], dtype=np.float32)
             if self._pending_pred is not None:
@@ -358,7 +359,8 @@ class Env:
                             time_decay = math.exp(-self.frame / 120.0)
                             speed_mult = 0.8 + 2.0 * time_decay
                             pac_score = getattr(self.player, 'score', 0)
-                            score_dock = min(pac_score * 0.15, 60.0)
+                            approx_max_score = (self.world_height * self.world_width * 0.4) * 10.0
+                            score_dock = min(60.0, 60.0 * (pac_score / max(1.0, approx_max_score * 0.6)))
                             min_direct = max(20.0, 50.0 * speed_mult - 20.0)
                             direct_kill_award = max(min_direct, 80.0 * speed_mult - score_dock)
                             if gid in rewards:

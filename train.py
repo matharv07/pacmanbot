@@ -48,14 +48,15 @@ ROLLOUT_INFER_CHUNK = int(os.environ.get("ROLLOUT_INFER_CHUNK", "2048"))
 #adaptive OOM-safe chunk sizes — halved automatically on cuda OOM, never grow back
 _eff_infer_chunk = ROLLOUT_INFER_CHUNK
 _eff_micro_batch = MICRO_BATCH
-PPO_EPOCHS      = 4    
+PPO_EPOCHS      = 2    
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
-CLIP_EPS        = 0.2
+CLIP_EPS        = 0.15
 ENT_COEF        = 0.008
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
-LR              = 2e-4
+LR              = 1.0e-4
+LR_CRITIC       = 1.5e-4
 BC_INIT         = 0.0
 BC_FLOOR        = 0.0
 K_NOMINATIONS   = 3
@@ -63,7 +64,7 @@ LOG_DIR         = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file_
 CKPT_DIR        = os.environ.get("CKPT_DIR", os.path.join(os.path.dirname(__file__), "checkpoints"))
 BC_ANNEAL_UPDATES = 80
 BC_ADVANCE_GATE = 0.10
-TARGET_KL       = 0.05
+TARGET_KL       = 0.015
 CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -389,6 +390,14 @@ def train():
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(CKPT_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, "metrics.jsonl")
+    if "--resume" not in sys.argv and os.path.exists(log_path):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archived_path = os.path.join(LOG_DIR, f"metrics_{ts}.jsonl")
+        try:
+            os.rename(log_path, archived_path)
+            print(f"Archived previous log file to {archived_path}")
+        except Exception as e:
+            print(f"Warning: Could not archive {log_path}: {e}")
     curriculum = CurriculumScheduler(start_stage=CURRICULUM_START_STAGE)
     stage = curriculum.stage
     print(f"Curriculum: starting at Stage {curriculum.stage_idx}\n({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts)")
@@ -405,7 +414,7 @@ def train():
     critic_rollout.eval()
     ret_rms = RunningMeanStd(shape=()).to(DEVICE)
     opt_actor  = torch.optim.Adam(actor.parameters(), lr=LR)
-    opt_critic = torch.optim.Adam(critic.parameters(), lr=LR*2)
+    opt_critic = torch.optim.Adam(critic.parameters(), lr=LR_CRITIC)
     predictor  = MovementPredictor(in_dim=PREDICTOR_IN_DIM, hidden_dim=PREDICTOR_HIDDEN_DIM).to(DEVICE)
     opt_predictor = torch.optim.Adam(predictor.parameters(), lr=LR)
     start_update = 1
@@ -629,7 +638,7 @@ def train():
                 metrics["clip_fraction"] += mb_clip_fraction
                 metrics["n_batches"]  += 1
                 epoch_kls.append(mb_approx_kl)
-            if np.mean(epoch_kls) > 1.5 * TARGET_KL:
+            if np.mean(epoch_kls) > 1.2 * TARGET_KL:
                 break
         t_ppo = time.time() - t_ppo_start
         if critic_warmup_remaining > 0:
@@ -1040,9 +1049,9 @@ def train():
             torch.cuda.empty_cache()
             current_returns = [0.0] * NUM_ENVS
             for pg in opt_actor.param_groups:
-                pg['lr'] = max(1.2e-4, pg['lr'] * 0.85)
+                pg['lr'] = max(0.7e-4, pg['lr'] * 0.85)
             for pg in opt_critic.param_groups:
-                pg['lr'] = max(2.4e-4, pg['lr'] * 0.85)
+                pg['lr'] = max(1.0e-4, pg['lr'] * 0.85)
             ret_rms.count.clamp_(max=10000.0)
             critic_warmup_remaining = 20
             with open(log_path, "a") as f:

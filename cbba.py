@@ -7,7 +7,7 @@ from pathfinder import dijkstra_multi, astar
 
 AUCTION_EVERY   = 6      #full auction every 0.6s 
 LT              = 3
-LAMBDA          = 0.99   #time decay factor
+LAMBDA          = 0.96   #time decay factor
 
 def _task_key(task: Task) -> tuple:
     pos = (round(float(task.target_pos[0]), 1), round(float(task.target_pos[1]), 1))
