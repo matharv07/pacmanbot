@@ -43,28 +43,29 @@ if torch.cuda.is_available():
 NUM_ENVS            = int(os.environ.get("NUM_ENVS", "14"))
 ROLLOUT_STEPS       = int(os.environ.get("ROLLOUT_STEPS", "256"))
 MINI_BATCH          = int(os.environ.get("MINI_BATCH", "4096"))
-MICRO_BATCH         = int(os.environ.get("MICRO_BATCH", "4096"))
+MICRO_BATCH         = int(os.environ.get("MICRO_BATCH", "1024"))
 ROLLOUT_INFER_CHUNK = int(os.environ.get("ROLLOUT_INFER_CHUNK", "2048"))
 #adaptive OOM-safe chunk sizes — halved automatically on cuda OOM, never grow back
 _eff_infer_chunk = ROLLOUT_INFER_CHUNK
 _eff_micro_batch = MICRO_BATCH
-PPO_EPOCHS      = 2    
+PPO_EPOCHS      = 6
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
-CLIP_EPS        = 0.15
-ENT_COEF        = 0.008
+CLIP_EPS        = 0.2
+ENT_COEF        = 0.003
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
-LR              = 1.0e-4
-LR_CRITIC       = 1.5e-4
-BC_INIT         = 0.0
-BC_FLOOR        = 0.0
+LR              = 2.0e-4
+LR_CRITIC       = 3.0e-4
+BC_INIT         = 0.5
+BC_FLOOR        = 0.02
 K_NOMINATIONS   = 3
 LOG_DIR         = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file__), "logs"))
 CKPT_DIR        = os.environ.get("CKPT_DIR", os.path.join(os.path.dirname(__file__), "checkpoints"))
-BC_ANNEAL_UPDATES = 80
+BC_ANNEAL_UPDATES = 200
 BC_ADVANCE_GATE = 0.10
-TARGET_KL       = 0.015
+TARGET_KL       = 0.025
+LR_WARMUP_UPDATES = 50   #linear warmup before cosine decay
 CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -648,7 +649,23 @@ def train():
     rollout_transfer = BatchTransfer(DEVICE)
     train_transfer   = BatchTransfer(DEVICE)
     max_updates = int(os.environ.get("MAX_UPDATES", "50001"))
+    _stage_start_update = start_update   #track start of each curriculum stage for LR schedule
     for update in range(start_update, max_updates):
+        #LR schedule: linear warmup then cosine decay per-stage
+        updates_in_stage = update - _stage_start_update
+        if updates_in_stage < LR_WARMUP_UPDATES:
+            lr_mult = updates_in_stage / max(1, LR_WARMUP_UPDATES)
+        else:
+            progress = (updates_in_stage - LR_WARMUP_UPDATES) / max(1, max_updates - _stage_start_update - LR_WARMUP_UPDATES)
+            lr_mult = 0.3 + 0.7 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        cur_base_lr_actor = opt_actor.param_groups[0].get('_base_lr', LR)
+        cur_base_lr_critic = opt_critic.param_groups[0].get('_base_lr', LR_CRITIC)
+        for pg in opt_actor.param_groups:
+            pg['_base_lr'] = pg.get('_base_lr', LR)
+            pg['lr'] = pg['_base_lr'] * lr_mult
+        for pg in opt_critic.param_groups:
+            pg['_base_lr'] = pg.get('_base_lr', LR_CRITIC)
+            pg['lr'] = pg['_base_lr'] * lr_mult
         if bc_decay_step < BC_ANNEAL_UPDATES:
             anneal_frac = 0.5 * (1.0 + math.cos(math.pi * bc_decay_step / BC_ANNEAL_UPDATES))
         else:
@@ -1048,10 +1065,14 @@ def train():
             vec_env.sync_predictor(predictor.state_dict())
             torch.cuda.empty_cache()
             current_returns = [0.0] * NUM_ENVS
+            #reset BC decay so each new stage gets fresh heuristic guidance
+            bc_decay_step = 0
+            #decay base LR by 0.8× per stage advance, with floors
             for pg in opt_actor.param_groups:
-                pg['lr'] = max(0.7e-4, pg['lr'] * 0.85)
+                pg['_base_lr'] = max(0.5e-4, pg.get('_base_lr', LR) * 0.80)
             for pg in opt_critic.param_groups:
-                pg['lr'] = max(1.0e-4, pg['lr'] * 0.85)
+                pg['_base_lr'] = max(0.8e-4, pg.get('_base_lr', LR_CRITIC) * 0.80)
+            _stage_start_update = update  #reset LR warmup for new stage
             ret_rms.count.clamp_(max=10000.0)
             critic_warmup_remaining = 20
             with open(log_path, "a") as f:

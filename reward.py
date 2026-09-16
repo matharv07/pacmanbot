@@ -3,6 +3,13 @@ Potential-based reward shaping for the MAPPO ghost pursuit pipeline.
 
 Every shaping term is formulated as  r(t) = γ Φ(s_{t+1}) - Φ(s_t), so that
 the optimal policy is invariant to the shaping (Ng et al., 1999).
+
+Tuned for AGGRESSIVE coordinated swarm pursuit:
+- Hunt potential uses steep close-range gradient to reward closing distance
+- Surround potential rewards multi-angle encirclement (pincer formation)
+- Mesh connectivity potential keeps the radio mesh intact for coordination
+- Cornering potential rewards trapping Pacman in dead-ends
+- Dispersion potential prevents useless clumping far from target
 """
 
 import math
@@ -11,13 +18,15 @@ import numpy as np
 class RewardShaper:
     """Tracks per-ghost potentials and returns the shaping delta each step."""
 
-    def __init__(self, alpha=5.0, beta=6.0, gamma_ex=0.01, delta_peak=2.0, delta_spread=2.0, delta_ent=1.0, beta_mesh=3.0, alpha_corner=3.0, gamma=0.99):
+    def __init__(self, alpha=6.0, beta=7.0, gamma_ex=0.008, delta_peak=2.5,
+                 delta_spread=2.5, delta_ent=1.0, beta_mesh=3.5,
+                 alpha_corner=4.0, gamma=0.99):
         """
         Parameters
         ----------
-        alpha        : hunt shaping weight (dual-scale exponential potential to Pacman/target)
-        beta         : encirclement shaping weight (circular variance / pincer formation)
-        gamma_ex     : exploration shaping weight
+        alpha        : hunt shaping weight — steep close-range gradient
+        beta         : encirclement shaping weight — coordinated pincer reward
+        gamma_ex     : exploration shaping weight (low: exploration is secondary to pursuit)
         delta_peak   : belief peak certainty weight
         delta_spread : belief spatial standard deviation penalty weight
         delta_ent    : belief normalized entropy weight
@@ -70,7 +79,7 @@ class RewardShaper:
             d = abs(ghost.y - target[0]) + abs(ghost.x - target[1])
         if math.isinf(d) or math.isnan(d):
             d = 999.0
-        #corridor lead interception: allow flanking ghosts cutting off Pacman's lead path to share hunt potential
+        #corridor lead interception: flanking ghosts cutting off Pacman's lead path
         p_dir = getattr(ghost, '_player_dir', (0, 0))
         p_speed = math.hypot(p_dir[0], p_dir[1])
         if p_speed > 0.05:
@@ -78,11 +87,11 @@ class RewardShaper:
             lead_x = target[1] + p_dir[1] * 3.0
             d_lead = abs(ghost.y - lead_y) + abs(ghost.x - lead_x)
             d = min(d, d_lead + 0.5)
-        #near scale (sigma=4.0): aggressive surge within capture/striking distance
-        #far scale (sigma=12.0): smooth continuous guidance across corridors
-        near_surge = 0.6 * math.exp(-d / 4.0)
-        far_guide = 0.4 * math.exp(-d / 12.0)
-        return self.alpha * (near_surge + far_guide)
+        #three-scale hunt potential for aggressive pursuit: - kill zone (sigma=2.5): extremely steep reward within striking distance - near chase (sigma=5.0): strong pull during active pursuit - far guide (sigma=14.0): gentle gradient across the whole map
+        kill_zone  = 0.4 * math.exp(-d / 2.5)
+        near_chase = 0.35 * math.exp(-d / 5.0)
+        far_guide  = 0.25 * math.exp(-d / 14.0)
+        return self.alpha * (kill_zone + near_chase + far_guide)
 
     def _phi_flee(self, ghost, target) -> float:
         if not getattr(ghost, 'pacman_powered', False) or target is None:
@@ -104,7 +113,7 @@ class RewardShaper:
             d = abs(ghost.y - target[0]) + abs(ghost.x - target[1])
         if math.isinf(d) or math.isnan(d):
             d = 999.0
-        #danger potential: strongly negative when close to powered Pacman, vanishing to 0 as ghost escapes
+        #danger potential: strongly negative when close to powered Pacman
         return -self.alpha * 2.0 * math.exp(-d / 6.0)
 
     def _phi_surround(self, ghost, all_ghosts, target) -> float:
@@ -130,9 +139,11 @@ class RewardShaper:
         R = math.hypot(sum(math.cos(a) for a in angles) / N,
                        sum(math.sin(a) for a in angles) / N)
         encirclement = 1.0 - R
-        #distance compression: surges as the perimeter tightens around Pacman
-        avg_prox = sum(math.exp(-d / 6.0) for d in dists) / N
-        return self.beta * encirclement * avg_prox
+        #distance compression: surges as the perimeter tightens around Pacman -- steeper proximity curve to reward closing in as a group
+        avg_prox = sum(math.exp(-d / 5.0) for d in dists) / N
+        #bonus for having 3+ ghosts converging (proper swarm)
+        swarm_bonus = 1.0 + 0.3 * max(0, N - 2)
+        return self.beta * encirclement * avg_prox * swarm_bonus
 
     def _phi_explore(self, ghost) -> float:
         if not hasattr(ghost.world, 'prm_nodes') or not hasattr(ghost, 'prm_last_seen'):
@@ -223,7 +234,7 @@ class RewardShaper:
             return 0.0
         pr, pc = target
         dist_pac = math.hypot(ghost.y - pr, ghost.x - pc)
-        if dist_pac > 5.0 or getattr(ghost, 'world', None) is None or not hasattr(ghost.world, 'is_passable'):
+        if dist_pac > 6.0 or getattr(ghost, 'world', None) is None or not hasattr(ghost.world, 'is_passable'):
             return 0.0
         p_radius = 0.35
         cardinals = [(0.7, 0.0), (-0.7, 0.0), (0.0, 0.7), (0.0, -0.7)]
@@ -231,10 +242,20 @@ class RewardShaper:
         for dr, dc in cardinals:
             if ghost.world.is_passable(pc + dc, pr + dr, radius=p_radius):
                 open_exits += 1
+        #strong cornering reward: Pacman is trapped in a dead-end or corridor
         if open_exits <= 1:
             return self.alpha_corner * math.exp(-dist_pac / 3.0)
-        elif open_exits == 2 and dist_pac < 3.0:
-            return 0.5 * self.alpha_corner * math.exp(-dist_pac / 3.0)
+        elif open_exits == 2 and dist_pac < 4.0:
+            #corridor: count how many ghosts are covering the two exits
+            ghosts_covering = 0
+            for g in all_ghosts.values():
+                if getattr(g, 'dead', False) or g.gid == ghost.gid:
+                    continue
+                gd = math.hypot(g.y - pr, g.x - pc)
+                if gd < 5.0:
+                    ghosts_covering += 1
+            cover_mult = 1.0 + 0.5 * min(ghosts_covering, 2)
+            return 0.6 * self.alpha_corner * math.exp(-dist_pac / 3.0) * cover_mult
         return 0.0
 
     def potential(self, ghost, all_ghosts) -> float:

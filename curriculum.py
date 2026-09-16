@@ -2,13 +2,14 @@
 Curriculum Learning Scheduler for stepwise grid-size scaling.
 
 Defines training stages that gradually increase grid complexity:
-  Stage 0: 7x9    grid, 2 ghosts - learn basic pursuit
-  Stage 1: 13x17  grid, 3 ghosts - learn corridor navigation
-  Stage 2: 21x27  grid, 5 ghosts - learn belief-based hunting
-  Stage 3: 33x41  grid, 7 ghosts - full game (final fine-tuning)
+  Stage 0: 7x9    grid, 2 ghosts - learn basic pursuit on tiny grid
+  Stage 1: 13x17  grid, 3 ghosts - learn corridor navigation + coordination
+  Stage 2: 17x21  grid, 4 ghosts - learn belief-map hunting
+  Stage 3: 21x27  grid, 5 ghosts - learn multi-agent swarming
+  Stage 4: 33x41  grid, 7 ghosts - full game (final fine-tuning)
 
-Advancement is triggered when the rolling mean return plateaus above
-a per-stage threshold for a sustained window of updates.
+Advancement is triggered when the rolling mean return AND kill rate
+sustain above per-stage thresholds for a sustained window of updates.
 """
 
 from __future__ import annotations
@@ -34,11 +35,13 @@ class Stage:
     def cols(self) -> int:
         return int(self.world_width * self.obs_resolution)
 
-STAGES = [Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=3, n_power=2,  advance_return=30.0, min_updates=60,  target_kill_rate=0.70),
-    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=8,  advance_return=-15.0, min_updates=80, target_kill_rate=0.68),
-    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.75)]
+STAGES = [Stage(world_height=7,  world_width=9,  obs_resolution=1.0, n_ghosts=2, n_power=1,  advance_return=50.0, min_updates=120, target_kill_rate=0.80),
+          Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=3, n_power=4,  advance_return=35.0, min_updates=200, target_kill_rate=0.75),
+          Stage(world_height=17, world_width=21, obs_resolution=1.0, n_ghosts=4, n_power=8,  advance_return=20.0, min_updates=250, target_kill_rate=0.70),
+          Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=14, advance_return=0.0, min_updates=300, target_kill_rate=0.65),
+          Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.75)]
 
-ADVANCE_WINDOW = 40    #rolling window of updates achieving return/kill threshold required to clear a stage
+ADVANCE_WINDOW = 60    #rolling window of updates for advancement checks
 
 class CurriculumScheduler:
     def __init__(self, start_stage: int = 0):
@@ -71,23 +74,23 @@ class CurriculumScheduler:
             return False
         avg_ret = sum(self._return_history) / len(self._return_history)
         avg_kill = (sum(self._kill_history) / len(self._kill_history)) if self._kill_history else 0.0
-        #dominant performance gate: exceeds stage target by 10% relative
+        #dominant performance gate: exceeds stage kill target by 10% relative
         dominant_gate = min(0.95, self.stage.target_kill_rate * 1.10)
-        if avg_kill >= dominant_gate and avg_ret >= (self.stage.advance_return - 2.0):
+        if avg_kill >= dominant_gate and avg_ret >= (self.stage.advance_return - 3.0):
             return True
         #solid target: meets both calibrated advance_return and target_kill_rate
         if avg_ret >= self.stage.advance_return and avg_kill >= self.stage.target_kill_rate:
             return True
-        #plateau detection: if training has stalled in this stage after min_updates + ADVANCE_WINDOW
+        #plateau detection: if training has stalled after min_updates + ADVANCE_WINDOW
         if self._updates_in_stage >= self.stage.min_updates + ADVANCE_WINDOW:
             half = ADVANCE_WINDOW // 2
             hist = list(self._return_history)
             avg_first = sum(hist[:half]) / half
             avg_second = sum(hist[half:]) / half
-            competency_kill = self.stage.target_kill_rate * 0.90
-            #if return progress has flattened out (< 0.75 improvement) and policy maintains competent baseline
-            if (avg_second - avg_first) < 0.75 and avg_kill >= competency_kill and avg_ret >= (self.stage.advance_return - 5.0):
-                print(f"Curriculum advancing due to plateau: progress {avg_second - avg_first:.2f} < 0.75 (Current avg ret: {avg_second:.2f}, kill: {avg_kill:.1%})")
+            competency_kill = self.stage.target_kill_rate * 0.88
+            #if return progress has flattened and policy maintains competent baseline
+            if (avg_second - avg_first) < 1.0 and avg_kill >= competency_kill and avg_ret >= (self.stage.advance_return - 8.0):
+                print(f"Curriculum advancing due to plateau: progress {avg_second - avg_first:.2f} < 1.0 (avg ret: {avg_second:.2f}, kill: {avg_kill:.1%})")
                 return True
         return False
 
