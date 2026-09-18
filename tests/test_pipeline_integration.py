@@ -14,7 +14,7 @@ def test_curriculum_logic():
     print("Testing curriculum logic...")
     cs = CurriculumScheduler(start_stage=0)
     assert cs.stage_idx == 0
-    assert len(STAGES) == 3, f"Expected 3 curriculum stages, got {len(STAGES)}"
+    assert len(STAGES) == 6, f"Expected 6 curriculum stages, got {len(STAGES)}"
 
     # Test that partial/None updates do not corrupt the rolling window
     cs.record_return(mean_return=None, kill_rate=None)
@@ -25,41 +25,41 @@ def test_curriculum_logic():
     assert cs._updates_in_stage == 3
 
     # Test that min_updates cannot be bypassed even with 95% kill rate
-    for _ in range(50):
+    for _ in range(40):
         cs.record_return(mean_return=80.0, kill_rate=0.95)
-    assert len(cs._return_history) == 50
-    assert cs._updates_in_stage == 53
-    assert not cs.should_advance(), "Curriculum must NOT advance before min_updates (150) is reached!"
+    assert len(cs._return_history) == 40
+    assert cs._updates_in_stage == 43
+    assert not cs.should_advance(), f"Curriculum must NOT advance before min_updates ({cs.stage.min_updates}) is reached!"
 
-    # Reach min_updates (150 updates) with high performance
-    for _ in range(100):
+    # Reach min_updates with high performance
+    for _ in range(80):
         cs.record_return(mean_return=75.0, kill_rate=0.90)
-    assert cs._updates_in_stage >= 100
+    assert cs._updates_in_stage >= cs.stage.min_updates
     assert cs.should_advance(), "Curriculum should advance once min_updates is reached with high kill rate"
     cs.advance()
     assert cs.stage_idx == 1, f"Expected Stage 1, got {cs.stage_idx}"
-    assert not cs.is_final, "Stage 1 is intermediate (21x27)"
+    assert not cs.is_final, "Stage 1 is intermediate"
 
-    # Advance Stage 1 to Stage 2
-    for _ in range(150):
-        cs.record_return(mean_return=70.0, kill_rate=0.85)
-    assert cs._updates_in_stage >= 150
-    assert cs.should_advance()
-    cs.advance()
-    assert cs.stage_idx == 2, f"Expected Stage 2, got {cs.stage_idx}"
-    assert cs.is_final, "Stage 2 should be the final stage (33x41)"
+    # Fast forward through remaining intermediate stages to final stage
+    while not cs.is_final:
+        for _ in range(cs.stage.min_updates):
+            cs.record_return(mean_return=50.0, kill_rate=0.85)
+        assert cs.should_advance()
+        cs.advance()
+    assert cs.stage_idx == len(STAGES) - 1, f"Expected final stage {len(STAGES) - 1}, got {cs.stage_idx}"
+    assert cs.is_final, "Final stage should be terminal"
     assert not cs.should_advance(), "Terminal stage should never advance"
 
     # Test state_dict recovery and clamping
     cs_load = CurriculumScheduler(start_stage=0)
     corrupted_state = {
-        "stage_idx": 4,  # legacy 5-stage index
+        "stage_idx": 10,  # out-of-bounds stage index
         "updates_in_stage": 40,
         "return_history": [20.0] * 30,
         "kill_history": [0.7] * 40
     }
     cs_load.load_state_dict(corrupted_state)
-    assert cs_load.stage_idx == 2, "Legacy stage index > 2 should be clamped to terminal stage 2"
+    assert cs_load.stage_idx == len(STAGES) - 1, "Out-of-bounds stage index should be clamped to terminal stage"
     assert len(cs_load._return_history) == 30
     assert len(cs_load._kill_history) == 30
     print("✓ Curriculum test passed!")
@@ -80,7 +80,7 @@ def test_actor_critic_shapes_and_logprobs():
     eval_lp, eval_ent, _pool, _vec, flat_logits, speed_params = actor.evaluate_actions(sp, ve, vm, idx, speed)
     assert eval_lp.shape == (2,), f"eval_lp shape mismatch: {eval_lp.shape}"
     assert eval_ent.shape == (2,), f"eval_ent shape mismatch: {eval_ent.shape}"
-    rollout_lp = lp.mean(dim=1) + 0.1 * speed_lp.squeeze(-1)
+    rollout_lp = lp.sum(dim=1) + 0.1 * speed_lp.squeeze(-1)
     diff = torch.abs(rollout_lp - eval_lp).max().item()
     print(f"Log-prob difference between rollout and evaluate_actions: {diff:.6f}")
     assert diff < 1e-4, f"Mismatch between rollout log-prob and evaluate_actions: {diff}"

@@ -63,26 +63,18 @@ def test_ghost_evasion_controller_sets_topological_velocity():
     assert v_mag > 0.05, f"Ghost should be moving to evade powered pacman, got {v_mag}"
 
 def test_3_stage_curriculum_configuration():
-    """Verify STAGES is correctly configured with 3 progressive stages."""
-    assert len(STAGES) == 3
-    # Stage 0: 13x17, 3 ghosts, 2 power pellets
-    assert STAGES[0].rows == 13
-    assert STAGES[0].cols == 17
-    assert STAGES[0].n_ghosts == 3
-    assert STAGES[0].n_power == 2
-    assert STAGES[0].min_updates == 60
-    assert STAGES[0].target_kill_rate == 0.67
+    """Verify STAGES is correctly configured with smooth progressive stages."""
+    assert len(STAGES) == 6
+    # Stage 0: 7x9, 2 ghosts, 1 power pellet
+    assert STAGES[0].rows == 7
+    assert STAGES[0].cols == 9
+    assert STAGES[0].n_ghosts == 2
+    assert STAGES[0].n_power == 1
+    assert STAGES[0].min_updates == 80
+    assert STAGES[0].target_kill_rate == 0.80
 
-    # Stage 1: 21x27, 5 ghosts, 8 power pellets
-    assert STAGES[1].rows == 21
-    assert STAGES[1].cols == 27
-    assert STAGES[1].n_ghosts == 5
-    assert STAGES[1].n_power == 8
-    assert STAGES[1].min_updates == 100
-    assert STAGES[1].target_kill_rate == 0.70
-
-    # Stage 2: 33x41, 7 ghosts, 28 power pellets (high danger final challenge)
-    assert STAGES[2].rows == 33
-    assert STAGES[2].cols == 41
-    assert STAGES[2].n_ghosts == 7
-    assert STAGES[2].n_power == 28
+    # Final stage: 33x41, 7 ghosts, 28 power pellets
+    assert STAGES[-1].rows == 33
+    assert STAGES[-1].cols == 41
+    assert STAGES[-1].n_ghosts == 7
+    assert STAGES[-1].n_power == 28

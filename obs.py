@@ -16,16 +16,16 @@ UNKNOWN = -1
 MAX_H = 33
 MAX_W = 41
 MAX_GHOSTS   = 7
-SPATIAL_CH   = 16        #number of spatial channels (see channel map below)
+SPATIAL_CH   = 11       #number of spatial channels (see channel map below)
 GLOBAL_SPATIAL_CH = 12   #number of channels in the omniscient global state
-VEC_DIM      = 163
+VEC_DIM      = 67
 CRITIC_VEC_DIM = MAX_GHOSTS * VEC_DIM + MAX_GHOSTS
 
 """
 Channel Map:
-    0  is_wall           4  belief_map       8–13  other ghosts (6 ch, with staleness decay)
-    1  is_pellet         5  safety_map       14    staleness
-    2  is_power          6  own_position     15    recent_nominations
+    0  is_wall           4  belief_map       8  peer_ghosts (with staleness decay)
+    1  is_pellet         5  safety_map       9  staleness
+    2  is_power          6  own_position     10 recent_nominations
     3  peer_intent       7  pacman_position
 """
 
@@ -143,10 +143,9 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_reso
     for gid in range(MAX_GHOSTS):
         if gid == ghost.gid:
             continue
-        ch = 8 + (gid if gid < ghost.gid else gid - 1)
         pos = ghost.known_agents.get(gid)
         if pos is not None and pos != "UNKNOWN":
-            _place_blob(out[ch], float(pos[0]), float(pos[1]), rows, cols, obs_resolution)
+            _place_blob(out[8], float(pos[0]), float(pos[1]), rows, cols, obs_resolution)
         elif hasattr(ghost, '_last_known_agent_pos') and gid in ghost._last_known_agent_pos:
             last_pos = ghost._last_known_agent_pos[gid]
             if isinstance(last_pos, (tuple, list)) and len(last_pos) >= 2:
@@ -154,7 +153,7 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_reso
                 delta_frames = max(0, ghost.frame - last_frame)
                 decay = math.exp(-delta_frames / 30.0)
                 if decay > 0.05:
-                    _place_blob(out[ch], float(last_pos[0]), float(last_pos[1]), rows, cols, obs_resolution, scale=decay)  
+                    _place_blob(out[8], float(last_pos[0]), float(last_pos[1]), rows, cols, obs_resolution, scale=decay)  
     stale_ch = np.ones((rows, cols), dtype=np.float32)
     if ghost.prm_last_seen:
         cur_frame = ghost.frame
@@ -169,8 +168,8 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_reso
                     elif stale_val > 1.0:
                         stale_val = 1.0
                     stale_ch[ri, ci] = stale_val
-    out[14] = stale_ch
-    out[15] = recent_noms[:rows, :cols]
+    out[9] = stale_ch
+    out[10] = recent_noms[:rows, :cols]
     return out
 
 def build_vector(ghost) -> np.ndarray:
@@ -196,7 +195,7 @@ def build_vector(ghost) -> np.ndarray:
     f.append(min(ghost.frame, 2000) / 2000.0)
     f.append(1.0 if getattr(ghost, 'in_fallback_mode', False) else 0.0)
     speed = math.hypot(ghost.vx, ghost.vy)
-    max_speed = getattr(ghost, 'max_speed', 0.5)
+    max_speed = getattr(ghost, 'max_speed', 0.50)
     f.append(speed / max_speed if max_speed > 0 else 0.0)
     f.extend([ghost.vy / 5.0, ghost.vx / 5.0])
     target = _pacman_target(ghost)
@@ -239,39 +238,6 @@ def build_vector(ghost) -> np.ndarray:
         own.append(None)
     for t in own:
         f.extend(_enc(t))
-    #peer tasks & telemetry (6 peers * 16 dims = 96 dims)
-    max_dim = max(w_height, w_width)
-    for gid in range(MAX_GHOSTS):
-        if gid == ghost.gid:
-            continue
-        peer_task = ghost.cbba_agent.get_known_task_for(gid)
-        f.extend(_enc(peer_task))  # 11 dims
-        #peer position and velocity telemetry (5 dims)
-        pos = ghost.known_agents.get(gid)
-        peer_obj = getattr(ghost, 'known_peer_objs', {}).get(gid)
-        if pos is not None and pos != "UNKNOWN":
-            rel_y = (pos[0] - ghost.y) / w_height
-            rel_x = (pos[1] - ghost.x) / w_width
-            vy = (peer_obj.vy / 5.0) if (peer_obj is not None and not getattr(peer_obj, 'dead', False)) else 0.0
-            vx = (peer_obj.vx / 5.0) if (peer_obj is not None and not getattr(peer_obj, 'dead', False)) else 0.0
-            link_dist = min(math.hypot(pos[0] - ghost.y, pos[1] - ghost.x) / max_dim, 1.0)
-        elif hasattr(ghost, '_last_known_agent_pos') and gid in ghost._last_known_agent_pos:
-            last_pos = ghost._last_known_agent_pos[gid]
-            if isinstance(last_pos, (tuple, list)) and len(last_pos) >= 2:
-                rel_y = (last_pos[0] - ghost.y) / w_height
-                rel_x = (last_pos[1] - ghost.x) / w_width
-                vy = 0.0
-                vx = 0.0
-                link_dist = min(math.hypot(last_pos[0] - ghost.y, last_pos[1] - ghost.x) / max_dim, 1.0)
-            else:
-                rel_y, rel_x = 0.0, 0.0
-                vy, vx = 0.0, 0.0
-                link_dist = 1.0
-        else:
-            rel_y, rel_x = 0.0, 0.0
-            vy, vx = 0.0, 0.0
-            link_dist = 1.0
-        f.extend([rel_y, rel_x, vy, vx, link_dist])  # 5 dims
 
     return np.asarray(f, dtype=np.float32)
 

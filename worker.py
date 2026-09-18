@@ -256,12 +256,11 @@ class Env:
             if score_diff > 0:
                 for a_gid in alive:
                     if a_gid in rewards and not self.ghosts[a_gid].dead:
-                        rewards[a_gid] -= 0.01 * score_diff
+                        rewards[a_gid] -= 0.002 * score_diff  #-0.02 per normal pellet (10 score)
             if not powered_before and getattr(self.player, 'powered', False):
-                pow_penalty = max(1.5, min(8.0, 16.0 / max(1, getattr(self, 'n_power', 8))))
                 for a_gid in alive:
                     if a_gid in rewards and not self.ghosts[a_gid].dead:
-                        rewards[a_gid] -= pow_penalty    #team penalty scaled by power pellet density
+                        rewards[a_gid] -= 1.0    #flat power pellet activation penalty
             powered = self.player.powered
             new_pac_v = np.array([float(self.player.vy), float(self.player.vx)], dtype=np.float32)
             if self._pending_pred is not None:
@@ -274,7 +273,7 @@ class Env:
                 has_los = (ghost.known_pacman is not None)
                 if has_los and not getattr(ghost, '_had_los_prev', False) and not powered:
                     if gid in rewards:
-                        rewards[gid] += 3.0    #strong LOS discovery reward — incentivize seeking Pacman
+                        rewards[gid] += 0.5    #LOS discovery reward
                 ghost._had_los_prev = has_los
                 ghost.update((self.player.y, self.player.x), powered, self.ghosts, speed_mult=getattr(ghost, 'current_speed_mult', 1.0))
             if not self.player.dead:
@@ -352,33 +351,17 @@ class Env:
                                     if witnesses:
                                         og.witness_death(gid, self.ghosts)
                             if gid in rewards:
-                                rewards[gid] -= 40.0
+                                rewards[gid] -= 8.0
                         else:
                             self.player.die()
                             done = True
-                            #scale time_decay relative to max_frames so kills stay rewarding throughout
-                            decay_scale = max(120.0, self.max_frames * 0.15)
-                            time_decay = math.exp(-self.frame / decay_scale)
-                            speed_mult = 0.85 + 1.8 * time_decay
-                            pac_score = getattr(self.player, 'score', 0)
-                            approx_max_score = (self.world_height * self.world_width * 0.4) * 10.0
-                            score_dock = min(50.0, 50.0 * (pac_score / max(1.0, approx_max_score * 0.6)))
-                            #direct killer: always get at least 30 reward, up to 100+ for early kills
-                            min_direct = max(30.0, 55.0 * speed_mult - 15.0)
-                            direct_kill_award = max(min_direct, 100.0 * speed_mult - score_dock)
                             if gid in rewards:
-                                rewards[gid] += direct_kill_award
-                            #team reward: every alive teammate shares in the kill
-                            TEAM_KILL_BASE = 65.0 * speed_mult
-                            TEAM_KILL_PROX = 50.0 * speed_mult
+                                rewards[gid] += 10.0
                             for other_gid, other_ghost in self.ghosts.items():
                                 if other_gid != gid and not other_ghost.dead and other_gid in rewards:
                                     dist = math.hypot(other_ghost.y - self.player.y, other_ghost.x - self.player.x)
-                                    proximity_scale = math.exp(-dist / 7.0)
-                                    min_team = max(8.0, 20.0 * speed_mult - 5.0)
-                                    team_award = max(min_team, TEAM_KILL_BASE + TEAM_KILL_PROX * proximity_scale - score_dock * 0.4)
-                                    rewards[other_gid] += team_award
-                            #multi-agent swarming / pincer group catch bonus
+                                    proximity_bonus = min(2.0, 2.0 * math.exp(-dist / 7.0))
+                                    rewards[other_gid] += 3.0 + proximity_bonus
                             swarm_ghosts = []
                             angles = []
                             for cand_gid, cand_ghost in self.ghosts.items():
@@ -395,12 +378,7 @@ class Env:
                                 R = math.hypot(sum(math.cos(a) for a in angles) / N,
                                                sum(math.sin(a) for a in angles) / N)
                                 angular_enclosure = 1.0 - R
-                                #stronger swarm bonus: reward coordinated multi-angle captures heavily
-                                swarm_frac = len(swarm_ghosts) / max(len(self.ghosts), 1)
-                                swarm_mult = angular_enclosure * swarm_frac
-                                #bonus scales with number of ghosts involved (3+ ghosts = massive bonus)
-                                n_bonus = 1.0 + 0.4 * max(0, len(swarm_ghosts) - 2)
-                                swarm_bonus = 80.0 * swarm_mult * speed_mult * n_bonus
+                                swarm_bonus = 2.0 * angular_enclosure
                                 for sg_id in swarm_ghosts:
                                     if sg_id in rewards:
                                         rewards[sg_id] += swarm_bonus
@@ -412,63 +390,25 @@ class Env:
             if (len(self.world.pellets) + len(self.world.power_pellets)) == 0:
                 done = True
                 for o in rewards:
-                    rewards[o] -= 25.0    #failed to catch before all pellets eaten
+                    rewards[o] -= 5.0
                 break
             if self.frame >= self.max_frames:
                 done = True
                 for o in rewards:
-                    rewards[o] -= 15.0    #timeout penalty — urgency to finish
+                    rewards[o] -= 3.0
                 break
-            #extended mesh connectivity awards / penalties
-            alive_now = [g for g in self.ghosts.values() if not g.dead]
-            n_alive_now = len(alive_now)
-            if n_alive_now >= 2:
-                for gid in alive:
-                    if gid not in rewards or self.ghosts[gid].dead:
-                        continue
-                    g_self = self.ghosts[gid]
-                    visited = {gid}
-                    q = [g_self]
-                    while q:
-                        curr = q.pop(0)
-                        for og in alive_now:
-                            if og.gid not in visited:
-                                if math.hypot(curr.y - og.y, curr.x - og.x) <= 12.0:
-                                    visited.add(og.gid)
-                                    q.append(og)
-                    if len(visited) == 1:
-                        rewards[gid] -= 0.02   #isolated ghost penalty
-                    elif len(visited) == n_alive_now:
-                        rewards[gid] += 0.005  #full mesh team connectivity reward
-            #corridor anti-clustering / traffic jam penalty (masked when near Pacman)
-            alive_ghosts = [g for g in self.ghosts.values() if not g.dead]
-            if len(alive_ghosts) >= 2:
-                for i in range(len(alive_ghosts)):
-                    g1 = alive_ghosts[i]
-                    d_pac1 = math.hypot(g1.y - self.player.y, g1.x - self.player.x)
-                    for j in range(i + 1, len(alive_ghosts)):
-                        g2 = alive_ghosts[j]
-                        d_pac2 = math.hypot(g2.y - self.player.y, g2.x - self.player.x)
-                        if min(d_pac1, d_pac2) > 3.5:
-                            d_peer = math.hypot(g1.y - g2.y, g1.x - g2.x)
-                            if d_peer < 0.85:
-                                jam_penalty = 0.015 * (1.0 - d_peer / 0.85)
-                                if g1.gid in rewards:
-                                    rewards[g1.gid] -= jam_penalty
-                                if g2.gid in rewards:
-                                    rewards[g2.gid] -= jam_penalty
 
-            step_cost = 0.060       #urgency cost — per-frame penalty drives aggressive pursuit
+            step_cost = 0.05 / DECISION_INTERVAL
             for gid in rewards:
                 if self.ghosts[gid].dead:
                     continue
-                rewards[gid] -= step_cost    #per-frame step cost
+                rewards[gid] -= step_cost
                 conv = getattr(self.ghosts[gid], 'power_pellets_converted_this_frame', 0)
                 if conv > 0:
-                    rewards[gid] += 20.0 * conv
+                    rewards[gid] += 2.0 * conv
                     for ogid in alive:
                         if ogid != gid and not self.ghosts[ogid].dead and ogid in rewards:
-                            rewards[ogid] += 5.0 * conv
+                            rewards[ogid] += 0.5 * conv
                     self.ghosts[gid].power_pellets_converted_this_frame = 0
         for gid, g in self.ghosts.items():
             if gid not in rewards:

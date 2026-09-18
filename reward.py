@@ -260,14 +260,13 @@ class RewardShaper:
 
     def potential(self, ghost, all_ghosts) -> float:
         target = self._pac_target(ghost)
-        return (self._phi_hunt(ghost, target) + 
-                self._phi_surround(ghost, all_ghosts, target) + 
-                self._phi_explore(ghost) + 
-                self._phi_belief(ghost) +
-                self._phi_dispersion(ghost, all_ghosts) +
-                self._phi_mesh(ghost, all_ghosts) +
-                self._phi_corner(ghost, all_ghosts, target) +
-                self._phi_flee(ghost, target))
+        p = (self._phi_hunt(ghost, target) + 
+             self._phi_surround(ghost, all_ghosts, target) + 
+             self._phi_explore(ghost) + 
+             self._phi_belief(ghost) + 
+             self._phi_corner(ghost, all_ghosts, target) + 
+             self._phi_flee(ghost, target))
+        return max(-5.0, min(5.0, p))
 
     def shaping(self, ghost, all_ghosts) -> float:
         phi = self.potential(ghost, all_ghosts)
@@ -275,9 +274,9 @@ class RewardShaper:
         if gid not in self._prev:
             self._prev[gid] = phi
             return 0.0
-        r = self.gamma * phi - self._prev[gid]
+        r = (self.gamma * phi - self._prev[gid]) * 0.3
         self._prev[gid] = phi
-        return r
+        return max(-0.5, min(0.5, r))
 
     def reset(self):
         self._prev.clear()

@@ -108,7 +108,7 @@ def test_vector_dimensions_and_agent_id_one_hot():
         g = env.ghosts[gid]
         vec = build_vector(g)
         assert len(vec) == VEC_DIM, f"Vector length {len(vec)} does not match VEC_DIM {VEC_DIM}"
-        assert VEC_DIM == 163, f"VEC_DIM expected 163, got {VEC_DIM}"
+        assert VEC_DIM == 67, f"VEC_DIM expected 67, got {VEC_DIM}"
 
         # Agent ID one-hot: indices 27..33
         id_slice = vec[27:34]
@@ -119,7 +119,7 @@ def test_vector_dimensions_and_agent_id_one_hot():
 
     # Verify critic vec dim
     assert CRITIC_VEC_DIM == MAX_GHOSTS * VEC_DIM + MAX_GHOSTS
-    assert CRITIC_VEC_DIM == 1148
+    assert CRITIC_VEC_DIM == 476
 
 
 def test_global_spatial_channel_count_and_pacman_power():

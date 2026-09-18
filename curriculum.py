@@ -35,11 +35,12 @@ class Stage:
     def cols(self) -> int:
         return int(self.world_width * self.obs_resolution)
 
-STAGES = [Stage(world_height=7,  world_width=9,  obs_resolution=1.0, n_ghosts=2, n_power=1,  advance_return=50.0, min_updates=120, target_kill_rate=0.80),
-          Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=3, n_power=4,  advance_return=35.0, min_updates=200, target_kill_rate=0.75),
-          Stage(world_height=17, world_width=21, obs_resolution=1.0, n_ghosts=4, n_power=8,  advance_return=20.0, min_updates=250, target_kill_rate=0.70),
-          Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=14, advance_return=0.0, min_updates=300, target_kill_rate=0.65),
-          Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.75)]
+STAGES = [Stage(world_height=7,  world_width=9,  obs_resolution=1.0, n_ghosts=2, n_power=1,  advance_return=0.8, min_updates=80,  target_kill_rate=0.80),
+          Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=3, n_power=4,  advance_return=0.8, min_updates=150, target_kill_rate=0.75),
+          Stage(world_height=17, world_width=21, obs_resolution=1.0, n_ghosts=4, n_power=8,  advance_return=0.6, min_updates=200, target_kill_rate=0.70),
+          Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=14, advance_return=0.4, min_updates=250, target_kill_rate=0.65),
+          Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=20, advance_return=0.2, min_updates=300, target_kill_rate=0.65),
+          Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.65)]
 
 ADVANCE_WINDOW = 60    #rolling window of updates for advancement checks
 
@@ -76,7 +77,7 @@ class CurriculumScheduler:
         avg_kill = (sum(self._kill_history) / len(self._kill_history)) if self._kill_history else 0.0
         #dominant performance gate: exceeds stage kill target by 10% relative
         dominant_gate = min(0.95, self.stage.target_kill_rate * 1.10)
-        if avg_kill >= dominant_gate and avg_ret >= (self.stage.advance_return - 3.0):
+        if avg_kill >= dominant_gate and avg_ret >= 0.0:
             return True
         #solid target: meets both calibrated advance_return and target_kill_rate
         if avg_ret >= self.stage.advance_return and avg_kill >= self.stage.target_kill_rate:
@@ -88,9 +89,9 @@ class CurriculumScheduler:
             avg_first = sum(hist[:half]) / half
             avg_second = sum(hist[half:]) / half
             competency_kill = self.stage.target_kill_rate * 0.88
-            #if return progress has flattened and policy maintains competent baseline
-            if (avg_second - avg_first) < 1.0 and avg_kill >= competency_kill and avg_ret >= (self.stage.advance_return - 8.0):
-                print(f"Curriculum advancing due to plateau: progress {avg_second - avg_first:.2f} < 1.0 (avg ret: {avg_second:.2f}, kill: {avg_kill:.1%})")
+            #if return progress has flattened (< 0.20) and policy maintains competent baseline
+            if (avg_second - avg_first) < 0.20 and avg_kill >= competency_kill and avg_ret >= 0.0:
+                print(f"Curriculum advancing due to plateau: progress {avg_second - avg_first:.2f} < 0.20 (avg ret: {avg_second:.2f}, kill: {avg_kill:.1%})")
                 return True
         return False
 

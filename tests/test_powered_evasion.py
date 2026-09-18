@@ -147,7 +147,7 @@ def test_ghost_terminal_evasion_in_env():
 def test_dead_callout_and_line_of_sight_witnessing():
     """Verify that ghosts only learn of peer deaths via direct line-of-sight or radio mesh,
     and surviving witnesses display a 'Ghost X DOWN!' dead callout."""
-    stage = STAGES[0]
+    stage = next(s for s in STAGES if s.rows >= 17)
     env = Env(env_id=0, num_ghosts=3, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     env.reset()
 
@@ -217,7 +217,7 @@ def test_dead_callout_and_line_of_sight_witnessing():
 
 def test_ghosts_lack_omniscient_power_state_and_death_access():
     """Verify ghosts cannot omnisciently sense Pacman's power state or peer deaths without sight or radio."""
-    stage = STAGES[0]
+    stage = next(s for s in STAGES if s.rows >= 21)
     env = Env(env_id=0, num_ghosts=2, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     env.reset()
 
@@ -348,9 +348,10 @@ def test_peer_not_seen_at_last_known_pos_marked_unknown():
     assert g1_pos is not None
     g1.y, g1.x = float(g1_pos[0]) + 0.5, float(g1_pos[1]) + 0.5
 
-    # Ghost 0 scans lidar (run 2 frames so frame % LIDAR_SWEEP_EVERY == 0 triggers sweep)
-    g0.update((env.player.y, env.player.x), False, env.ghosts, skip_movement=True)
-    g0.update((env.player.y, env.player.x), False, env.ghosts, skip_movement=True)
+    # Ghost 0 scans lidar (run LIDAR_SWEEP_EVERY frames so sweep triggers)
+    from ghost import LIDAR_SWEEP_EVERY
+    for _ in range(LIDAR_SWEEP_EVERY):
+        g0.update((env.player.y, env.player.x), False, env.ghosts, skip_movement=True)
 
     # Ghost 0 is looking directly at (stale_y, stale_x) and Ghost 1 is NOT there:
     # Ghost 0 must IMMEDIATELY mark Ghost 1 as UNKNOWN!

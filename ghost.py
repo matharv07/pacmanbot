@@ -47,8 +47,8 @@ HEARTBEAT_EVERY   = 5
 HEARTBEAT_TIMEOUT = 25
 RESYNC_EVERY      = 100
 OSCILLATION_WINDOW = 8   #position history length to prevent oscillations
-LIDAR_SWEEP_EVERY  = 2   #lidar sweep + LOS checks every N frames
-BELIEF_DIFFUSE_EVERY = 3 #belief map diffusion every N frames
+LIDAR_SWEEP_EVERY  = 3   #lidar sweep + LOS checks every N frames
+BELIEF_DIFFUSE_EVERY = 4 #belief map diffusion every N frames
 
 _ANGLES = np.linspace(0, 2*math.pi, RAY_COUNT, endpoint=False)
 _DX = np.cos(_ANGLES) * 0.5
@@ -93,7 +93,6 @@ class Ghost:
         self.seq = 0
         self.known_agents = {}                  #(row, col) | UNKNOWN for dead/out of reach agents
         self._last_known_agent_pos = {}         #last known physical (y, x) coordinates for ghosts
-        self.known_peer_objs = {}               #reference dict to all peer ghost objects
         self.dead_agents = set()                #set of gids confirmed dead
         self.last_heartbeat = {}                #frame of last received heartbeat from every ghost
         self.last_sync_frame = {}               #frame of last full sync sent to every ghost
@@ -123,7 +122,6 @@ class Ghost:
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False, speed_mult=1.0):
         self.frame += 1
-        self.known_peer_objs = all_ghosts
         if self.callout_timer > 0:
             self.callout_timer -= 1
             if self.callout_timer == 0:

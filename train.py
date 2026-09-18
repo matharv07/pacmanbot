@@ -40,31 +40,30 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-NUM_ENVS            = int(os.environ.get("NUM_ENVS", "14"))
-ROLLOUT_STEPS       = int(os.environ.get("ROLLOUT_STEPS", "256"))
-MINI_BATCH          = int(os.environ.get("MINI_BATCH", "4096"))
-MICRO_BATCH         = int(os.environ.get("MICRO_BATCH", "1024"))
-ROLLOUT_INFER_CHUNK = int(os.environ.get("ROLLOUT_INFER_CHUNK", "2048"))
+NUM_ENVS            = int(os.environ.get("NUM_ENVS", "16"))
+ROLLOUT_STEPS       = int(os.environ.get("ROLLOUT_STEPS", "128"))
+MINI_BATCH          = int(os.environ.get("MINI_BATCH", "2048"))
+MICRO_BATCH         = int(os.environ.get("MICRO_BATCH", "512"))
+ROLLOUT_INFER_CHUNK = int(os.environ.get("ROLLOUT_INFER_CHUNK", "1024"))
 #adaptive OOM-safe chunk sizes — halved automatically on cuda OOM, never grow back
 _eff_infer_chunk = ROLLOUT_INFER_CHUNK
 _eff_micro_batch = MICRO_BATCH
-PPO_EPOCHS      = 6
-GAMMA           = 0.99
-GAE_LAMBDA      = 0.95
-CLIP_EPS        = 0.2
-ENT_COEF        = 0.003
+PPO_EPOCHS      = 4
+GAMMA           = 0.985
+GAE_LAMBDA      = 0.96
+CLIP_EPS        = 0.15
+ENT_COEF        = 0.001
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
-LR              = 2.0e-4
-LR_CRITIC       = 3.0e-4
-BC_INIT         = 0.5
-BC_FLOOR        = 0.02
+LR              = 3.0e-4
+LR_CRITIC       = 5.0e-4
+STAGE_BC_INIT   = [0.35, 0.20, 0.10, 0.05, 0.02, 0.00]
+BC_FLOOR        = 0.0
 K_NOMINATIONS   = 3
 LOG_DIR         = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file__), "logs"))
 CKPT_DIR        = os.environ.get("CKPT_DIR", os.path.join(os.path.dirname(__file__), "checkpoints"))
-BC_ANNEAL_UPDATES = 200
-BC_ADVANCE_GATE = 0.10
-TARGET_KL       = 0.025
+BC_ANNEAL_UPDATES = 80
+TARGET_KL       = 0.06
 LR_WARMUP_UPDATES = 50   #linear warmup before cosine decay
 CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
@@ -666,11 +665,10 @@ def train():
         for pg in opt_critic.param_groups:
             pg['_base_lr'] = pg.get('_base_lr', LR_CRITIC)
             pg['lr'] = pg['_base_lr'] * lr_mult
-        if bc_decay_step < BC_ANNEAL_UPDATES:
-            anneal_frac = 0.5 * (1.0 + math.cos(math.pi * bc_decay_step / BC_ANNEAL_UPDATES))
-        else:
-            anneal_frac = 0.0
-        bc_prob = max(BC_FLOOR, BC_INIT * anneal_frac)
+        stage_bc_init = STAGE_BC_INIT[min(curriculum.stage_idx, len(STAGE_BC_INIT) - 1)]
+        bc_frac = max(0.0, 1.0 - bc_decay_step / BC_ANNEAL_UPDATES)
+        lam_bc = max(BC_FLOOR, stage_bc_init * bc_frac)
+        bc_prob = lam_bc
         t_start_rollout = time.time()
         #per-env, per-step storage (lists of length ROLLOUT_STEPS)
         buf_spatial   = [[] for _ in range(NUM_ENVS)]
@@ -819,7 +817,7 @@ def train():
                     step_actions[e] = env_act
                     buf_actions[e].append(e_idx)
                     buf_speeds[e].append(e_spd)
-                    buf_logprobs[e].append(e_lp.mean(axis=1) + 0.1 * e_spd_lp.squeeze(-1))
+                    buf_logprobs[e].append(e_lp.sum(axis=1) + 0.1 * e_spd_lp.squeeze(-1))
                     v_dict = {gids[i]: float(e_val[i]) for i in range(n_g)}
                     buf_values[e].append(v_dict)
                     offset += n_g
@@ -1006,7 +1004,6 @@ def train():
         indices = np.arange(N_total)
         #normalize advantages GLOBALLY across the entire batch, not per-minibatch
         ds_adv = (ds_adv - ds_adv.mean()) / (ds_adv.std() + 1e-8)
-        lam_bc = max(BC_FLOOR, BC_INIT * anneal_frac)
         realized_merge_rate = (ep_heuristic_merges / ep_total_auctions) if ep_total_auctions > 0 else 0.0
         t_rollout = time.time() - t_start_rollout
         mean_ret = round(float(np.mean(ep_returns)), 3) if ep_returns else None
@@ -1017,13 +1014,11 @@ def train():
                 ema_return = mean_ret
             else:
                 ema_return = 0.95 * ema_return + 0.05 * mean_ret
-            slack = 0.05 * abs(ema_return)
-            if mean_ret >= (ema_return - slack):
-                bc_decay_step += 1
-        #update return running statistics before PPO optimization so value targets are normalized
-        ret_rms.update(ds_ret)
+        bc_decay_step += 1
         #synchronous on-policy PPO optimization
         metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms)
+        #update return running statistics after PPO optimization
+        ret_rms.update(ds_ret)
         actor_rollout.load_state_dict(actor.state_dict())
         critic_rollout.load_state_dict(critic.state_dict())
         nb = max(1, metrics["n_batches"])
@@ -1052,7 +1047,7 @@ def train():
             "t_ppo":      round(t_ppo, 1)}
         with open(log_path, "a") as f:
             f.write(json.dumps(row) + "\n")
-        has_eval = (mean_ret is not None and kill_rate is not None and lam_bc <= BC_ADVANCE_GATE)
+        has_eval = (mean_ret is not None and kill_rate is not None)
         curriculum.record_return(mean_ret if has_eval else None, kill_rate=kill_rate if has_eval else None)
         if curriculum.should_advance():
             curriculum.advance()
