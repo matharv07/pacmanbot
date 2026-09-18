@@ -82,7 +82,7 @@ def test_actor_critic_shapes_and_logprobs():
     eval_lp, eval_ent, _pool, _vec, flat_logits, speed_params = actor.evaluate_actions(sp, ve, vm, idx, speed, direction)
     assert eval_lp.shape == (2,), f"eval_lp shape mismatch: {eval_lp.shape}"
     assert eval_ent.shape == (2,), f"eval_ent shape mismatch: {eval_ent.shape}"
-    rollout_lp = lp.sum(dim=1) + 0.1 * speed_lp.squeeze(-1) + 0.1 * dir_lp.squeeze(-1)
+    rollout_lp = lp.sum(dim=1) + 0.1 * speed_lp.squeeze(-1) + 0.02 * dir_lp.squeeze(-1)
     diff = torch.abs(rollout_lp - eval_lp).max().item()
     print(f"Log-prob difference between rollout and evaluate_actions: {diff:.6f}")
     assert diff < 1e-4, f"Mismatch between rollout log-prob and evaluate_actions: {diff}"

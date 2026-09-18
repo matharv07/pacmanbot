@@ -116,11 +116,11 @@ class GhostActor(nn.Module):
         speed = torch.clamp(speed, 1e-4, 1.0 - 1e-4)
         speed_lp = dist_speed.log_prob(speed)
 
-        dir_params = torch.clamp(F.softplus(self.dir_head(torch.cat([pool, vec], dim=1))) + 1.001, max=15.0)
+        dir_params = torch.clamp(F.softplus(self.dir_head(torch.cat([pool, vec], dim=1))) + 1.5, min=1.5, max=8.0)
         dir_alpha, dir_beta = dir_params[:, 0], dir_params[:, 1]
         dist_dir = torch.distributions.Beta(dir_alpha, dir_beta)
         direction = dist_dir.sample()
-        direction = torch.clamp(direction, 1e-4, 1.0 - 1e-4)
+        direction = torch.clamp(direction, 1e-3, 1.0 - 1e-3)
         dir_lp = dist_dir.log_prob(direction)
 
         return (torch.stack(sel_idx, 1), torch.stack(sel_lp, 1), scores, pool, vec,
@@ -177,18 +177,18 @@ class GhostActor(nn.Module):
         speeds = torch.clamp(speeds.squeeze(-1), 1e-4, 1.0 - 1e-4)
         speed_lp = dist_speed.log_prob(speeds)
         speed_ent = dist_speed.entropy()
-        dir_params = torch.clamp(F.softplus(self.dir_head(torch.cat([pool, vec], dim=1))) + 1.001, max=15.0)
+        dir_params = torch.clamp(F.softplus(self.dir_head(torch.cat([pool, vec], dim=1))) + 1.5, min=1.5, max=8.0)
         if directions is not None:
             dir_alpha, dir_beta = dir_params[:, 0], dir_params[:, 1]
             dist_dir = torch.distributions.Beta(dir_alpha, dir_beta)
-            directions = torch.clamp(directions.squeeze(-1), 1e-4, 1.0 - 1e-4)
+            directions = torch.clamp(directions.squeeze(-1), 1e-3, 1.0 - 1e-3)
             dir_lp = dist_dir.log_prob(directions)
             dir_ent = dist_dir.entropy()
         else:
             dir_lp = torch.zeros_like(speed_lp)
             dir_ent = torch.zeros_like(speed_ent)
-        logprobs = torch.stack(lp_list, 1).sum(1) + 0.1 * speed_lp + 0.1 * dir_lp
-        entropy  = torch.stack(ent_list, 1).sum(1) + 0.5 * speed_ent + 0.5 * dir_ent
+        logprobs = torch.stack(lp_list, 1).sum(1) + 0.1 * speed_lp + 0.02 * dir_lp
+        entropy  = torch.stack(ent_list, 1).sum(1) + 0.5 * speed_ent + 0.1 * dir_ent
         return logprobs, entropy, pool, vec, flat_clean, speed_params
 
 class GhostCritic(nn.Module):

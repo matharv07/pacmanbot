@@ -232,14 +232,16 @@ class Ghost:
                             moved = True
                             if hasattr(self, '_committed_path'):
                                 self._committed_path = []
-        #RL Continuous Tactical Direction / Steering (active in rl_mode for tactical tasks or when near Pacman)
+        #RL Continuous Tactical Direction / Steering (active in rl_mode when in tactical proximity to Pacman or target)
         if not moved and getattr(self, 'rl_mode', False) and getattr(self, 'current_rl_dir', None) is not None:
             is_tactical = False
-            if active_task is not None and getattr(active_task, 'task_type', None) in (TaskType.HUNT, TaskType.FLANK, TaskType.DYNAMIC):
-                is_tactical = True
-            elif self.known_pacman is not None and not self.pacman_powered:
+            if self.known_pacman is not None and not self.pacman_powered:
                 d_p = math.hypot(self.known_pacman[0] - self.y, self.known_pacman[1] - self.x)
-                if d_p < 6.0:
+                if d_p < 4.5:
+                    is_tactical = True
+            elif active_task is not None:
+                d_tgt = math.hypot(active_task.target_pos[0] - self.y, active_task.target_pos[1] - self.x)
+                if d_tgt < 1.5:
                     is_tactical = True
             if is_tactical:
                 rl_angle = float(self.current_rl_dir) * 2.0 * math.pi - math.pi

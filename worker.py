@@ -371,7 +371,7 @@ class Env:
                                 if other_gid != gid and not other_ghost.dead and other_gid in rewards:
                                     dist = math.hypot(other_ghost.y - self.player.y, other_ghost.x - self.player.x)
                                     proximity_bonus = min(2.0, 2.0 * math.exp(-dist / 7.0))
-                                    rewards[other_gid] += 3.0 + proximity_bonus
+                                    rewards[other_gid] += 6.0 + proximity_bonus
                             swarm_ghosts = []
                             angles = []
                             for cand_gid, cand_ghost in self.ghosts.items():
@@ -388,7 +388,7 @@ class Env:
                                 R = math.hypot(sum(math.cos(a) for a in angles) / N,
                                                sum(math.sin(a) for a in angles) / N)
                                 angular_enclosure = 1.0 - R
-                                swarm_bonus = 2.0 * angular_enclosure
+                                swarm_bonus = 3.0 * angular_enclosure
                                 for sg_id in swarm_ghosts:
                                     if sg_id in rewards:
                                         rewards[sg_id] += swarm_bonus
@@ -408,7 +408,7 @@ class Env:
                     rewards[o] -= 3.0
                 break
 
-            step_cost = 0.05 / DECISION_INTERVAL
+            step_cost = 0.015 / DECISION_INTERVAL
             for gid in rewards:
                 if self.ghosts[gid].dead:
                     continue

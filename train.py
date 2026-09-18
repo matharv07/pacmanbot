@@ -52,17 +52,17 @@ PPO_EPOCHS      = 4
 GAMMA           = 0.985
 GAE_LAMBDA      = 0.96
 CLIP_EPS        = 0.15
-ENT_COEF        = 0.01
+ENT_COEF        = 0.001
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
-LR              = 3.0e-4
-LR_CRITIC       = 5.0e-4
+LR              = 2.0e-4
+LR_CRITIC       = 3.0e-4
 STAGE_BC_INIT   = [0.35, 0.20, 0.10, 0.05, 0.00]
-BC_FLOOR        = 0.0
+BC_FLOOR        = 0.02
 K_NOMINATIONS   = 3
 LOG_DIR         = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file__), "logs"))
 CKPT_DIR        = os.environ.get("CKPT_DIR", os.path.join(os.path.dirname(__file__), "checkpoints"))
-BC_ANNEAL_UPDATES = 80
+BC_ANNEAL_UPDATES = 120
 TARGET_KL       = 0.06
 LR_WARMUP_UPDATES = 50   #linear warmup before cosine decay
 CURRICULUM_START_STAGE = 0
@@ -508,6 +508,7 @@ def train():
             uid_to_indices[b_gsp_ids_np[i]].append(i)
         unique_uids = list(uid_to_indices.keys())
         global critic_warmup_remaining
+        early_stop = False
         for epoch_i in range(PPO_EPOCHS):
             epoch_kls = []
             np.random.shuffle(unique_uids)
@@ -660,7 +661,10 @@ def train():
                 metrics["clip_fraction"] += mb_clip_fraction
                 metrics["n_batches"]  += 1
                 epoch_kls.append(mb_approx_kl)
-            if np.mean(epoch_kls) > 1.2 * TARGET_KL:
+                if mb_approx_kl > 1.5 * TARGET_KL:
+                    early_stop = True
+                    break
+            if early_stop or (epoch_kls and np.mean(epoch_kls) > 1.2 * TARGET_KL):
                 break
         t_ppo = time.time() - t_ppo_start
         if critic_warmup_remaining > 0:
@@ -849,7 +853,7 @@ def train():
                     buf_actions[e].append(e_idx)
                     buf_speeds[e].append(e_spd)
                     buf_directions[e].append(e_dir)
-                    buf_logprobs[e].append(e_lp.sum(axis=1) + 0.1 * e_spd_lp.squeeze(-1) + 0.1 * e_dir_lp.squeeze(-1))
+                    buf_logprobs[e].append(e_lp.sum(axis=1) + 0.1 * e_spd_lp.squeeze(-1) + 0.02 * e_dir_lp.squeeze(-1))
                     v_dict = {gids[i]: float(e_val[i]) for i in range(n_g)}
                     buf_values[e].append(v_dict)
                     offset += n_g
