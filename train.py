@@ -648,7 +648,10 @@ def train():
                 if torch.isfinite(grad_norm_c) and (critic_warmup_remaining > 0 or torch.isfinite(grad_norm_a)):
                     opt_critic.step()
                     if critic_warmup_remaining <= 0:
-                        opt_actor.step()
+                        if mb_approx_kl <= 4.0 * TARGET_KL:
+                            opt_actor.step()
+                        else:
+                            opt_actor.zero_grad()
                 else:
                     opt_critic.zero_grad()
                     if critic_warmup_remaining <= 0:
@@ -661,10 +664,8 @@ def train():
                 metrics["clip_fraction"] += mb_clip_fraction
                 metrics["n_batches"]  += 1
                 epoch_kls.append(mb_approx_kl)
-                if mb_approx_kl > 1.5 * TARGET_KL:
-                    early_stop = True
-                    break
-            if early_stop or (epoch_kls and np.mean(epoch_kls) > 1.2 * TARGET_KL):
+            epoch_mean_kl = float(np.mean(epoch_kls)) if epoch_kls else 0.0
+            if epoch_mean_kl > 1.5 * TARGET_KL:
                 break
         t_ppo = time.time() - t_ppo_start
         if critic_warmup_remaining > 0:
@@ -674,15 +675,16 @@ def train():
     rollout_transfer = BatchTransfer(DEVICE)
     train_transfer   = BatchTransfer(DEVICE)
     max_updates = int(os.environ.get("MAX_UPDATES", "50001"))
-    _stage_start_update = start_update   #track start of each curriculum stage for LR schedule
+    _stage_start_update = max(0, start_update - getattr(curriculum, '_updates_in_stage', 0))   #track start of each curriculum stage for LR schedule
     for update in range(start_update, max_updates):
         #LR schedule: linear warmup then cosine decay per-stage
         updates_in_stage = update - _stage_start_update
+        stage_horizon = max(300, getattr(curriculum.stage, 'min_updates', 100) * 3)
         if updates_in_stage < LR_WARMUP_UPDATES:
             lr_mult = updates_in_stage / max(1, LR_WARMUP_UPDATES)
         else:
-            progress = (updates_in_stage - LR_WARMUP_UPDATES) / max(1, max_updates - _stage_start_update - LR_WARMUP_UPDATES)
-            lr_mult = 0.3 + 0.7 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+            progress = min(1.0, (updates_in_stage - LR_WARMUP_UPDATES) / max(1, stage_horizon - LR_WARMUP_UPDATES))
+            lr_mult = 0.35 + 0.65 * 0.5 * (1.0 + math.cos(math.pi * progress))
         cur_base_lr_actor = opt_actor.param_groups[0].get('_base_lr', LR)
         cur_base_lr_critic = opt_critic.param_groups[0].get('_base_lr', LR_CRITIC)
         for pg in opt_actor.param_groups:

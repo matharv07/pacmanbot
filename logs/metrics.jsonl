@@ -1,0 +1,1 @@
+{"update": 1, "episodes": 0, "steps": 32, "wall_s": 2.3, "actor_loss": -0.0, "value_loss": 2.69333, "bc_loss": 4.58853, "entropy": 14.04208, "approx_kl": 0.0, "clip_frac": 0.0, "bc_coef": 0.35, "bc_prob": 0.35, "merge_rate": 0.0, "mean_return": null, "pacman_score": null, "kill_rate": null, "curriculum_stage": 0, "grid_size": "13x17", "lr": 0.0, "t_rollout": 1.6, "t_ppo": 0.7}
