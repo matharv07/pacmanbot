@@ -119,6 +119,8 @@ class Ghost:
         self.callout_timer: int = 0
         self._prev_seen_pacman: Optional[tuple] = None
         self._player_dir = (0.0, 0.0)
+        self.current_rl_dir: Optional[float] = None
+        self.rl_mode: bool = False
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False, speed_mult=1.0):
         self.frame += 1
@@ -230,8 +232,24 @@ class Ghost:
                             moved = True
                             if hasattr(self, '_committed_path'):
                                 self._committed_path = []
-        #Dynamic Terminal Pursuit & Lead Interception (active when Pacman is in LOS or near)
-        if not moved and not self.pacman_powered and self.known_pacman:
+        #RL Continuous Tactical Direction / Steering (active in rl_mode for tactical tasks or when near Pacman)
+        if not moved and getattr(self, 'rl_mode', False) and getattr(self, 'current_rl_dir', None) is not None:
+            is_tactical = False
+            if active_task is not None and getattr(active_task, 'task_type', None) in (TaskType.HUNT, TaskType.FLANK, TaskType.DYNAMIC):
+                is_tactical = True
+            elif self.known_pacman is not None and not self.pacman_powered:
+                d_p = math.hypot(self.known_pacman[0] - self.y, self.known_pacman[1] - self.x)
+                if d_p < 6.0:
+                    is_tactical = True
+            if is_tactical:
+                rl_angle = float(self.current_rl_dir) * 2.0 * math.pi - math.pi
+                desired_vx = math.cos(rl_angle)
+                desired_vy = math.sin(rl_angle)
+                moved = True
+                if hasattr(self, '_committed_path'):
+                    self._committed_path = []
+        #Dynamic Terminal Pursuit & Lead Interception (heuristic baseline only, active when Pacman is in LOS or near)
+        if not getattr(self, 'rl_mode', False) and not moved and not self.pacman_powered and self.known_pacman:
             pr, pc = self.known_pacman
             pac_y, pac_x = float(pr), float(pc)
             dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
@@ -392,18 +410,23 @@ class Ghost:
                             desired_vy = dy / d
                             moved = True
         self.in_fallback_mode = not moved
-        #fallback (maintain forward momentum along corridor instead of spinning)
+        #fallback (maintain forward momentum along corridor instead of spinning, or use RL direction)
         if not moved:
             if hasattr(self, '_committed_path'):
                 self._committed_path = []
-            cur_speed = math.hypot(self.vx, self.vy)
-            if cur_speed > 0.01:
-                desired_vx = self.vx / cur_speed
-                desired_vy = self.vy / cur_speed
+            if getattr(self, 'rl_mode', False) and getattr(self, 'current_rl_dir', None) is not None:
+                rl_angle = float(self.current_rl_dir) * 2.0 * math.pi - math.pi
+                desired_vx = math.cos(rl_angle)
+                desired_vy = math.sin(rl_angle)
             else:
-                angle = random.uniform(0, 2*math.pi)
-                desired_vx = math.cos(angle)
-                desired_vy = math.sin(angle)
+                cur_speed = math.hypot(self.vx, self.vy)
+                if cur_speed > 0.01:
+                    desired_vx = self.vx / cur_speed
+                    desired_vy = self.vy / cur_speed
+                else:
+                    angle = random.uniform(0, 2*math.pi)
+                    desired_vx = math.cos(angle)
+                    desired_vy = math.sin(angle)
         #context steering and momentum — cached every 3 frames to reduce jitter/CPU load
         _STEER_CACHE_TTL = 3
         best_vx, best_vy = desired_vx, desired_vy
@@ -719,7 +742,8 @@ class Ghost:
                 self.pacman_powered = powered
                 if not powered: self.pacman_power_timer = 0
                 self.pacman_last_seen = self.frame
-                pacman_diff = ("pacman", pr, pc, powered, self.frame)
+                p_dir = getattr(self, '_player_dir', (0.0, 0.0))
+                pacman_diff = ("pacman", pr, pc, powered, self.frame, p_dir[0], p_dir[1])
             else:
                 self.pacman_last_seen = self.frame
         else:
@@ -870,7 +894,8 @@ class Ghost:
             frames_ago = self.frame - hb_frame
             sync_diffs.append(("hb_sync", gid, frames_ago))
         if self.known_pacman is not None:
-            sync_diffs.append(("pacman", self.known_pacman[0], self.known_pacman[1], self.pacman_powered, self.pacman_last_seen))
+            p_dir = getattr(self, '_player_dir', (0.0, 0.0))
+            sync_diffs.append(("pacman", self.known_pacman[0], self.known_pacman[1], self.pacman_powered, self.pacman_last_seen, p_dir[0], p_dir[1]))
         elif self.last_lost_pacman is not None and self.pacman_last_seen > -1:
             sync_diffs.append(("pacman_lost", self.last_lost_pacman[0], self.last_lost_pacman[1], self.pacman_last_seen))
         if sync_diffs:
@@ -965,9 +990,13 @@ class Ghost:
                         self.last_heartbeat[gid] = reconstructed
                         relay_diffs.append(diff)
                 elif dtype == "pacman":
-                    _, r, c, powered, obs_frame = diff
+                    r, c, powered, obs_frame = diff[1], diff[2], diff[3], diff[4]
+                    p_vy = diff[5] if len(diff) > 5 else 0.0
+                    p_vx = diff[6] if len(diff) > 6 else 0.0
                     if obs_frame > self.pacman_last_seen:
                         self.known_pacman     = (r, c)
+                        if (p_vy != 0.0 or p_vx != 0.0):
+                            self._player_dir = (p_vy, p_vx)
                         if powered and not self.pacman_powered:
                             self.pacman_power_timer = 40
                         self.pacman_powered   = powered

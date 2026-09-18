@@ -237,8 +237,13 @@ class CBBA_Agent:
                 if key in self.bundle:
                     continue
                 gain, n = self._marginal_gain(key, ghost)
-                if gain <= self.y.get(key, 0.0):
+                cur_y = self.y.get(key, 0.0)
+                cur_z = self.z.get(key)
+                if gain < cur_y - 1e-6:
                     continue
+                if abs(gain - cur_y) <= 1e-6:
+                    if cur_z is not None and cur_z <= self.gid:
+                        continue
                 if gain > best_gain:
                     best_gain = gain
                     best_key = key
@@ -257,7 +262,7 @@ class CBBA_Agent:
         if self._unreachable_cache.get(task.target_pos, -1) > ghost.frame:
             return 0.0, 0
         #distance horizon gate: distant ghosts should not abandon quadrant for remote peer hunt/cutoff tasks unless explicitly designated (assigned_to == ghost.gid) or self-owned
-        if task.task_type == TaskType.HUNT and task.assigned_to != ghost.gid:
+        if task.task_type in (TaskType.HUNT, TaskType.FLANK) and task.assigned_to != ghost.gid:
             if task.owner != ghost.gid and task.owner != -1:
                 tgt = task.target_pos
                 cache_key = (round(float(tgt[0]), 2), round(float(tgt[1]), 2))
@@ -365,14 +370,21 @@ class CBBA_Agent:
 
     def _table1(self, k: int, z_kj, z_ij, y_kj: float, y_ij: float, s_k: dict, s_i: dict) -> str:
         i = self.gid
+        def _beats(new_val: float, new_winner, old_val: float, old_winner) -> bool:
+            if abs(new_val - old_val) < 1e-6:
+                nw = new_winner if new_winner is not None else 999
+                ow = old_winner if old_winner is not None else 999
+                return nw < ow
+            return new_val > old_val
+
         if z_kj == k:           #sender claims self as winner
-            if z_ij == i: return "update" if y_kj > y_ij else "leave"
+            if z_ij == i: return "update" if _beats(y_kj, k, y_ij, i) else "leave"
             elif z_ij == k: 
                 sk_k = s_k.get(k, s_k.get(str(k), -1))
                 si_k = s_i.get(k, s_i.get(str(k), -1))
                 return "update" if sk_k > si_k else "leave"
             elif z_ij is None: return "update"
-            else: return "update" if y_kj > y_ij else "leave"  #z_ij == m
+            else: return "update" if _beats(y_kj, k, y_ij, z_ij) else "leave"  #z_ij == m
         elif z_kj == i:         #sender claims receiver as winner
             if z_ij == i: return "leave"
             elif z_ij == k: return "reset"
@@ -399,7 +411,7 @@ class CBBA_Agent:
                 si_m = s_i.get(m, s_i.get(str(m), -1))
                 return "update" if sk_m > si_m else "leave"
             elif z_ij is None: return "update"
-            else: return "update" if y_kj > y_ij else "leave"   #different m'
+            else: return "update" if _beats(y_kj, m, y_ij, z_ij) else "leave"   #different m'
 
     def _cascade_release(self):
         n_bar = None

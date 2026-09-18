@@ -208,7 +208,14 @@ class Env:
                     self._cached_ht[gid] = np.zeros((R, C), dtype=np.float32)
                     self._cached_hspeed[gid] = 1.0
             if gid in action_dict:      #merge RL tasks with CBBA
-                indices, scores_map, speed = action_dict[gid]
+                act_data = action_dict[gid]
+                if len(act_data) == 4:
+                    indices, scores_map, speed, direction = act_data
+                    g.current_rl_dir = direction
+                else:
+                    indices, scores_map, speed = act_data
+                    g.current_rl_dir = None
+                g.rl_mode = True
                 g.current_speed_mult = speed
                 self.recent_nom[gid] *= NOM_DECAY
                 for r, c in indices:
@@ -222,7 +229,10 @@ class Env:
                 if gid not in action_dict:
                     continue
                 g = self.ghosts[gid]
-                indices, scores_map, speed = action_dict[gid]
+                act_data = action_dict[gid]
+                indices = act_data[0]
+                scores_map = act_data[1]
+                speed = act_data[2]
                 tasks = actions_to_tasks(g, scores_map, indices, self.frame, self.obs_resolution, target_speed=speed)
                 cand_tasks = tasks
                 cur_active = g.cbba_agent.get_active_task()
@@ -415,12 +425,12 @@ class Env:
                 continue
             if g.dead:
                 if gid in self.shaper._prev:
-                    #for Ng et al. shaping, terminal potential upon death must be 0
-                    rewards[gid] += (0.0 - self.shaper._prev.pop(gid, 0.0))
+                    #for Ng et al. shaping, terminal potential upon death must be 0 (scaled consistently by 0.3)
+                    rewards[gid] += (0.0 - self.shaper._prev.pop(gid, 0.0)) * 0.3
             else:
                 if done:
-                    #terminal potential must be 0 for absorbing end-of-episode state
-                    rewards[gid] += (0.0 - self.shaper._prev.pop(gid, 0.0))
+                    #terminal potential must be 0 for absorbing end-of-episode state (scaled consistently by 0.3)
+                    rewards[gid] += (0.0 - self.shaper._prev.pop(gid, 0.0)) * 0.3
                 else:
                     rewards[gid] += self.shaper.shaping(g, self.ghosts)
         obs = self.observe() if not done else None

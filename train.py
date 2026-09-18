@@ -52,12 +52,12 @@ PPO_EPOCHS      = 4
 GAMMA           = 0.985
 GAE_LAMBDA      = 0.96
 CLIP_EPS        = 0.15
-ENT_COEF        = 0.001
+ENT_COEF        = 0.01
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 3.0e-4
 LR_CRITIC       = 5.0e-4
-STAGE_BC_INIT   = [0.35, 0.20, 0.10, 0.05, 0.02, 0.00]
+STAGE_BC_INIT   = [0.35, 0.20, 0.10, 0.05, 0.00]
 BC_FLOOR        = 0.0
 K_NOMINATIONS   = 3
 LOG_DIR         = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file__), "logs"))
@@ -428,7 +428,29 @@ def train():
             ckpt_path = ckpts[-1]
             print(f"Resuming from {ckpt_path} ...")
             ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-            actor.load_state_dict(ckpt["actor"])
+            actor_loaded_cleanly = False
+            try:
+                actor.load_state_dict(ckpt["actor"])
+                actor_loaded_cleanly = True
+                try:
+                    opt_actor.load_state_dict(ckpt["opt_actor"])
+                except Exception as e:
+                    print(f"Warning: Could not restore actor optimizer: {e}")
+            except Exception as e:
+                print(f"Notice: Checkpoint actor architecture differs ({e}). Performing compatible partial transfer...")
+                actor_sd = ckpt["actor"]
+                new_actor_sd = actor.state_dict()
+                for k, v in actor_sd.items():
+                    if k in new_actor_sd:
+                        if v.shape == new_actor_sd[k].shape:
+                            new_actor_sd[k] = v
+                        elif "vec_mlp.0.weight" in k and v.ndim == 2 and new_actor_sd[k].ndim == 2:
+                            min_out = min(v.shape[0], new_actor_sd[k].shape[0])
+                            min_in = min(v.shape[1], new_actor_sd[k].shape[1])
+                            new_actor_sd[k][:min_out, :min_in] = v[:min_out, :min_in]
+                            print(f"  Mapped {k}: {tuple(v.shape)} -> {tuple(new_actor_sd[k].shape)}")
+                actor.load_state_dict(new_actor_sd)
+                print("  ✓ Compatible actor weights loaded successfully. Fresh actor optimizer initialized.")
             try:
                 critic_sd = ckpt["critic"]
                 new_sd = critic.state_dict()
@@ -442,7 +464,6 @@ def train():
                         print(f"Warning: Could not restore critic optimizer: {e}")
             except Exception as e:
                 print(f"Warning: Could not fully restore critic weights: {e}")
-            opt_actor.load_state_dict(ckpt["opt_actor"])
             if "predictor" in ckpt:
                 try:
                     predictor.load_state_dict(ckpt["predictor"])
@@ -477,7 +498,7 @@ def train():
     print("VecEnv initialized. Starting training...")
     t0 = time.time()
 
-    def run_ppo(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_act, b_spd, b_olp, b_adv, b_ret, lam_bc, ret_rms):
+    def run_ppo(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_act, b_spd, b_dir, b_olp, b_adv, b_ret, lam_bc, ret_rms):
         t_ppo_start = time.time()
         metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "approx_kl": 0, "clip_fraction": 0, "n_batches": 0}    
         N_total = b_sp.shape[0]
@@ -546,6 +567,7 @@ def train():
                             mb_hs  = b_hs[chunk_idx]
                             mb_act = b_act[chunk_idx]
                             mb_spd = b_spd[chunk_idx]
+                            mb_dir = b_dir[chunk_idx]
                             mb_olp = b_olp[chunk_idx]
                             mb_adv = b_adv[chunk_idx]
                             mb_ret = b_ret[chunk_idx]
@@ -557,7 +579,7 @@ def train():
                                 push_discord_warning(f"⚠️ Action OOB at update {update}: max_act={mb_act.max().item()}, H*W={_hw}, sp={tuple(mb_sp.shape)}")
                                 mb_act = mb_act.clamp(max=_hw - 1)
                             with torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
-                                new_lp, ent, pool, vec, flat_logits, speed_params = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act, mb_spd)
+                                new_lp, ent, pool, vec, flat_logits, speed_params = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act, mb_spd, mb_dir)
                                 unique_ids, inv_idx = torch.unique(mb_gsp_ids, return_inverse=True)
                                 mb_gsp_unique = b_gsp_unique[unique_ids]
                                 mb_c_pool = critic.encode_spatial(mb_gsp_unique)
@@ -681,6 +703,7 @@ def train():
         buf_hspeed    = [[] for _ in range(NUM_ENVS)]
         buf_actions   = [[] for _ in range(NUM_ENVS)]
         buf_speeds    = [[] for _ in range(NUM_ENVS)]
+        buf_directions= [[] for _ in range(NUM_ENVS)]
         buf_logprobs  = [[] for _ in range(NUM_ENVS)]
         buf_values    = [[] for _ in range(NUM_ENVS)]
         buf_rewards   = [[] for _ in range(NUM_ENVS)]
@@ -719,6 +742,7 @@ def train():
                     buf_hspeed[e].append(np.empty((0, 1), dtype=np.float32))
                     buf_actions[e].append(np.empty((0, K_NOMINATIONS), dtype=np.int64))
                     buf_speeds[e].append(np.empty((0, 1), dtype=np.float32))
+                    buf_directions[e].append(np.empty((0, 1), dtype=np.float32))
                     buf_logprobs[e].append(np.empty((0,), dtype=np.float32))
                     continue
                 #Pad trimmed observations to current stage size for CNN
@@ -766,17 +790,19 @@ def train():
                 n_total = t_sp.shape[0]
                 while True:
                     try:
-                        idx_chunks, lp_chunks, sc_chunks, spd_chunks, spd_lp_chunks = [], [], [], [], []
+                        idx_chunks, lp_chunks, sc_chunks, spd_chunks, spd_lp_chunks, dir_chunks, dir_lp_chunks = [], [], [], [], [], [], []
                         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
                             for ci in range(0, n_total, _eff_infer_chunk):
                                 ce = min(ci + _eff_infer_chunk, n_total)
-                                c_idx, c_lp, c_scores, _, _, c_speed, c_speed_lp = actor_rollout(
+                                c_idx, c_lp, c_scores, _, _, c_speed, c_speed_lp, c_dir, c_dir_lp = actor_rollout(
                                     t_sp[ci:ce], t_ve[ci:ce], t_vm[ci:ce], K=K_NOMINATIONS)
                                 idx_chunks.append(c_idx)
                                 lp_chunks.append(c_lp)
                                 sc_chunks.append(c_scores)
                                 spd_chunks.append(c_speed)
                                 spd_lp_chunks.append(c_speed_lp)
+                                dir_chunks.append(c_dir)
+                                dir_lp_chunks.append(c_dir_lp)
                             val_all = _critic_value(critic_rollout, t_gsp_unique, t_cve, active_n_ghosts)
                             val_all = ret_rms(val_all, unnorm=True)
                         break  #success
@@ -794,6 +820,8 @@ def train():
                 sc_t  = torch.cat(sc_chunks, dim=0).float().cpu().numpy()
                 spd_t = torch.cat(spd_chunks, dim=0).float().cpu().numpy()
                 spd_lp_t = torch.cat(spd_lp_chunks, dim=0).float().cpu().numpy()
+                dir_t = torch.cat(dir_chunks, dim=0).float().cpu().numpy()
+                dir_lp_t = torch.cat(dir_lp_chunks, dim=0).float().cpu().numpy()
                 val_all_np = val_all.float().cpu().numpy()
                 offset = 0
                 for e in range(NUM_ENVS):
@@ -807,17 +835,21 @@ def train():
                     e_lp  = lp_t[offset:offset + n_g]
                     e_spd = spd_t[offset:offset + n_g]
                     e_spd_lp = spd_lp_t[offset:offset + n_g]
+                    e_dir = dir_t[offset:offset + n_g]
+                    e_dir_lp = dir_lp_t[offset:offset + n_g]
                     e_val = val_all_np[offset:offset + n_g]
                     env_act = {}
                     for i, gid in enumerate(gids):
                         pairs = [(int(x // stage.cols), int(x % stage.cols))
                                  for x in e_idx[i]]
                         spd_val = float(e_spd[i].item() if hasattr(e_spd[i], 'item') else e_spd[i])
-                        env_act[gid] = (pairs, e_sc[i], spd_val)
+                        dir_val = float(e_dir[i].item() if hasattr(e_dir[i], 'item') else e_dir[i])
+                        env_act[gid] = (pairs, e_sc[i], spd_val, dir_val)
                     step_actions[e] = env_act
                     buf_actions[e].append(e_idx)
                     buf_speeds[e].append(e_spd)
-                    buf_logprobs[e].append(e_lp.sum(axis=1) + 0.1 * e_spd_lp.squeeze(-1))
+                    buf_directions[e].append(e_dir)
+                    buf_logprobs[e].append(e_lp.sum(axis=1) + 0.1 * e_spd_lp.squeeze(-1) + 0.1 * e_dir_lp.squeeze(-1))
                     v_dict = {gids[i]: float(e_val[i]) for i in range(n_g)}
                     buf_values[e].append(v_dict)
                     offset += n_g
@@ -946,7 +978,7 @@ def train():
         #flatten per-env rollouts into a single batch 
         all_sp, all_ve, all_vm, all_ht, all_hs = [], [], [], [], []
         all_cve, all_gsp_ids = [], []
-        all_act, all_spd, all_lp, all_adv, all_ret = [], [], [], [], []
+        all_act, all_spd, all_dir, all_lp, all_adv, all_ret = [], [], [], [], [], []
         for e in range(NUM_ENVS):
             T = len(buf_rewards[e])
             if T == 0:
@@ -970,6 +1002,7 @@ def train():
                     all_hs.append(buf_hspeed[e][t][i])
                     all_act.append(buf_actions[e][t][i])
                     all_spd.append(buf_speeds[e][t][i])
+                    all_dir.append(buf_directions[e][t][i])
                     all_lp.append(buf_logprobs[e][t][i])
                     all_adv.append(adv_dict_list[t].get(gid, 0.0))
                     all_ret.append(ret_dict_list[t].get(gid, 0.0))
@@ -986,11 +1019,12 @@ def train():
         arr_hs  = np.array(all_hs, dtype=np.float32)
         arr_act = np.array(all_act, dtype=np.int64)
         arr_spd = np.array(all_spd, dtype=np.float32)
+        arr_dir = np.array(all_dir, dtype=np.float32)
         arr_olp = np.array(all_lp, dtype=np.float32)
         arr_adv = np.array(all_adv, dtype=np.float32)
         arr_ret = np.array(all_ret, dtype=np.float32)
-        ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_olp, ds_adv, ds_ret = train_transfer.transfer(
-            arr_sp, arr_gsp_unique, arr_gsp_ids, arr_ve, arr_cve, arr_vm, arr_ht, arr_hs, arr_act, arr_spd, arr_olp, arr_adv, arr_ret)
+        ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_dir, ds_olp, ds_adv, ds_ret = train_transfer.transfer(
+            arr_sp, arr_gsp_unique, arr_gsp_ids, arr_ve, arr_cve, arr_vm, arr_ht, arr_hs, arr_act, arr_spd, arr_dir, arr_olp, arr_adv, arr_ret)
         N_total = ds_sp.shape[0]
         #verify action indices are within spatial bounds
         _sp_hw = ds_sp.shape[-2] * ds_sp.shape[-1]
@@ -1016,7 +1050,7 @@ def train():
                 ema_return = 0.95 * ema_return + 0.05 * mean_ret
         bc_decay_step += 1
         #synchronous on-policy PPO optimization
-        metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms)
+        metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_dir, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms)
         #update return running statistics after PPO optimization
         ret_rms.update(ds_ret)
         actor_rollout.load_state_dict(actor.state_dict())

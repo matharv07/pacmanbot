@@ -55,6 +55,8 @@ class GhostActor(nn.Module):
         self.head = nn.Conv2d(256, 1, 1)
         #continuous speed head (alpha, beta for Beta distribution)
         self.speed_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 2))
+        #continuous tactical direction head (alpha, beta for Beta distribution over normalized angle [0, 1])
+        self.dir_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 2))
 
     def encode(self, spatial, vector):
         x = self.stem(spatial)
@@ -113,22 +115,33 @@ class GhostActor(nn.Module):
         #clamp to avoid 0/1 exactly which might cause log_prob issues
         speed = torch.clamp(speed, 1e-4, 1.0 - 1e-4)
         speed_lp = dist_speed.log_prob(speed)
-        return (torch.stack(sel_idx, 1), torch.stack(sel_lp, 1), scores, pool, vec, speed.unsqueeze(1), speed_lp.unsqueeze(1))
 
-    def evaluate_actions(self, spatial, vector, mask, actions, speeds):
+        dir_params = torch.clamp(F.softplus(self.dir_head(torch.cat([pool, vec], dim=1))) + 1.001, max=15.0)
+        dir_alpha, dir_beta = dir_params[:, 0], dir_params[:, 1]
+        dist_dir = torch.distributions.Beta(dir_alpha, dir_beta)
+        direction = dist_dir.sample()
+        direction = torch.clamp(direction, 1e-4, 1.0 - 1e-4)
+        dir_lp = dist_dir.log_prob(direction)
+
+        return (torch.stack(sel_idx, 1), torch.stack(sel_lp, 1), scores, pool, vec,
+                speed.unsqueeze(1), speed_lp.unsqueeze(1),
+                direction.unsqueeze(1), dir_lp.unsqueeze(1))
+
+    def evaluate_actions(self, spatial, vector, mask, actions, speeds, directions=None):
         """
         Re-computes log-probs and entropy for *stored* action indices.
         Used inside the PPO update loop (single forward pass).
 
         Parameters
         ----------
-        actions : (B, K) long — previously sampled flattened indices
-        speeds  : (B, 1) float — previously sampled speeds
+        actions    : (B, K) long — previously sampled flattened indices
+        speeds     : (B, 1) float — previously sampled speeds
+        directions : (B, 1) float, optional — previously sampled continuous directions
 
         Returns
         -------
-        logprobs    : (B,)          — sum of log-probs for the K actions + speed
-        entropy     : (B,)          — mean entropy across K steps + speed entropy
+        logprobs    : (B,)          — sum of log-probs for the K actions + speed + direction
+        entropy     : (B,)          — mean entropy across K steps + speed + direction entropy
         pool        : (B, 128)      — spatial pool token
         vec         : (B, 128)      — vector embedding token
         flat_logits : (B, H*W)      — reusable for BC loss (NOT detached)
@@ -164,8 +177,18 @@ class GhostActor(nn.Module):
         speeds = torch.clamp(speeds.squeeze(-1), 1e-4, 1.0 - 1e-4)
         speed_lp = dist_speed.log_prob(speeds)
         speed_ent = dist_speed.entropy()
-        logprobs = torch.stack(lp_list, 1).sum(1) + 0.1 * speed_lp
-        entropy  = torch.stack(ent_list, 1).sum(1) + 0.5 * speed_ent
+        dir_params = torch.clamp(F.softplus(self.dir_head(torch.cat([pool, vec], dim=1))) + 1.001, max=15.0)
+        if directions is not None:
+            dir_alpha, dir_beta = dir_params[:, 0], dir_params[:, 1]
+            dist_dir = torch.distributions.Beta(dir_alpha, dir_beta)
+            directions = torch.clamp(directions.squeeze(-1), 1e-4, 1.0 - 1e-4)
+            dir_lp = dist_dir.log_prob(directions)
+            dir_ent = dist_dir.entropy()
+        else:
+            dir_lp = torch.zeros_like(speed_lp)
+            dir_ent = torch.zeros_like(speed_ent)
+        logprobs = torch.stack(lp_list, 1).sum(1) + 0.1 * speed_lp + 0.1 * dir_lp
+        entropy  = torch.stack(ent_list, 1).sum(1) + 0.5 * speed_ent + 0.5 * dir_ent
         return logprobs, entropy, pool, vec, flat_clean, speed_params
 
 class GhostCritic(nn.Module):

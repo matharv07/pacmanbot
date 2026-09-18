@@ -123,7 +123,20 @@ def load_rl_model():
         print(f"Loading checkpoint: {latest}")
         RL_ACTOR = GhostActor().to(RL_DEVICE)
         checkpoint = torch.load(latest, map_location=RL_DEVICE, weights_only=False)
-        RL_ACTOR.load_state_dict(checkpoint["actor"])
+        try:
+            RL_ACTOR.load_state_dict(checkpoint["actor"])
+        except Exception:
+            actor_sd = checkpoint["actor"]
+            new_actor_sd = RL_ACTOR.state_dict()
+            for k, v in actor_sd.items():
+                if k in new_actor_sd:
+                    if v.shape == new_actor_sd[k].shape:
+                        new_actor_sd[k] = v
+                    elif "vec_mlp.0.weight" in k and v.ndim == 2 and new_actor_sd[k].ndim == 2:
+                        min_out = min(v.shape[0], new_actor_sd[k].shape[0])
+                        min_in = min(v.shape[1], new_actor_sd[k].shape[1])
+                        new_actor_sd[k][:min_out, :min_in] = v[:min_out, :min_in]
+            RL_ACTOR.load_state_dict(new_actor_sd)
         RL_ACTOR.eval()
         RL_PREDICTOR_WEIGHTS = checkpoint.get("predictor", None)
         print("RL Model loaded successfully.")
@@ -819,10 +832,11 @@ class Game:
                     t_ve = torch.tensor(np.stack(ve), device=RL_DEVICE, dtype=torch.float32)
                     t_vm = torch.tensor(np.stack(vm), device=RL_DEVICE, dtype=torch.bool)
                     with torch.inference_mode():
-                        idx, _, scores, _, _, speed, _ = RL_ACTOR(t_sp, t_ve, t_vm, K=3)
+                        idx, _, scores, _, _, speed, _, direction, _ = RL_ACTOR(t_sp, t_ve, t_vm, K=3)
                     idx_np = idx.cpu().numpy()
                     sc_np  = scores.cpu().numpy()
                     spd_np = speed.cpu().numpy()
+                    dir_np = direction.cpu().numpy()
                     from cbba import _task_key
                     from pathfinder import dijkstra_multi
                     pooled_tasks = {}
@@ -831,6 +845,8 @@ class Game:
                         indices = [(int(x // C), int(x % C)) for x in idx_np[i]]
                         scores_map = sc_np[i]
                         g.current_speed_mult = float(spd_np[i][0])
+                        g.current_rl_dir = float(dir_np[i][0])
+                        g.rl_mode = True
                         self.recent_nom[gid] *= 0.8
                         for r, c in indices:
                             if 0 <= r < R and 0 <= c < C:

@@ -49,14 +49,15 @@ def _run_episode(actor, env, stage):
         t_ve = torch.from_numpy(ve.astype(np.float32))
         t_vm = torch.from_numpy(vm_p)
         with torch.inference_mode():
-            idx, lp, scores, _pool, _vec, speed, _speed_lp = actor(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
+            idx, lp, scores, _pool, _vec, speed, _speed_lp, direction, _dir_lp = actor(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
         idx_np    = idx.cpu().numpy()
         scores_np = scores.float().cpu().numpy()
         speed_np  = speed.float().cpu().numpy()
+        dir_np    = direction.float().cpu().numpy()
         action_dict = {}
         for i, gid in enumerate(gids):
             pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in idx_np[i]]
-            action_dict[gid] = (pairs, scores_np[i], float(speed_np[i].item()))
+            action_dict[gid] = (pairs, scores_np[i], float(speed_np[i].item()), float(dir_np[i].item()))
         obs, _rewards, done, info = env.step(action_dict, bc_prob=0.0)
         if done:
             surviving = sum(1 for g in env.ghosts.values() if not g.dead)
@@ -87,9 +88,22 @@ def _worker_chunk(ckpt_path: str, n_games: int, stage_override=None, seed_offset
     ckpt_stage = ckpt.get('curriculum', {}).get('stage_idx', 0) if isinstance(ckpt.get('curriculum'), dict) else 0
     raw_idx = stage_override if stage_override is not None else ckpt_stage
     eff_stage_idx = min(len(STAGES) - 1, max(0, raw_idx))
-    stage     = STAGES[eff_stage_idx]
+    stage = STAGES[eff_stage_idx]
     actor = GhostActor().cpu()
-    actor.load_state_dict(ckpt['actor'])
+    try:
+        actor.load_state_dict(ckpt['actor'])
+    except Exception:
+        actor_sd = ckpt['actor']
+        new_actor_sd = actor.state_dict()
+        for k, v in actor_sd.items():
+            if k in new_actor_sd:
+                if v.shape == new_actor_sd[k].shape:
+                    new_actor_sd[k] = v
+                elif "vec_mlp.0.weight" in k and v.ndim == 2 and new_actor_sd[k].ndim == 2:
+                    min_out = min(v.shape[0], new_actor_sd[k].shape[0])
+                    min_in = min(v.shape[1], new_actor_sd[k].shape[1])
+                    new_actor_sd[k][:min_out, :min_in] = v[:min_out, :min_in]
+        actor.load_state_dict(new_actor_sd)
     actor.eval()
     env = Env(env_id=seed_offset, num_ghosts=stage.n_ghosts, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     results = []

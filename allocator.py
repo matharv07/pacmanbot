@@ -39,6 +39,7 @@ class TaskType(IntEnum):
     EVADE_TRACK = 2
     EXPLORE     = 3
     DYNAMIC     = 4     #rl generated waypoints that dont fit the above
+    FLANK       = 5     #multi-directional cutoff/corridor intercept
 
 @dataclass
 class Task:
@@ -136,22 +137,8 @@ def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
                 if cutoff_info and cutoff_info[0] != math.inf:
                     c_dist = cutoff_info[0]
                     cutoff_score = (1.2 + 2.0 * _dist_score(c_dist, HUNT_SCALE) + 2.5 * math.exp(-c_dist / 6.0)) * conf
-                    #if another alive teammate is physically closer to this cutoff point, designate them
-                    assigned_to = -1
-                    min_peer_d = math.inf
-                    best_peer_gid = -1
-                    for gid, pos in getattr(ghost, 'known_agents', {}).items():
-                        if pos != "UNKNOWN" and gid != ghost.gid:
-                            if hasattr(ghost, 'is_agent_dead') and ghost.is_agent_dead(gid):
-                                continue
-                            d_peer = math.hypot(pos[0] - cr, pos[1] - cc)
-                            if d_peer < min_peer_d:
-                                min_peer_d = d_peer
-                                best_peer_gid = gid
-                    if best_peer_gid != -1 and min_peer_d < c_dist:
-                        assigned_to = best_peer_gid
-                    #pincer bonus: incentivize flanking ghosts to cut off Pacman ahead of path
-                    tasks.append(Task(task_type=TaskType.HUNT, target_pos=(cr_r, cc_r), score=1.15 * cutoff_score, assigned_to=assigned_to, created_frame=frame, owner=ghost.gid, target_speed=1.0))
+                    #multi-directional flank task: assigned_to = -1 so CBBA bids purely on agent distance & positioning
+                    tasks.append(Task(task_type=TaskType.FLANK, target_pos=(cr_r, cc_r), score=1.15 * cutoff_score, assigned_to=-1, created_frame=frame, owner=ghost.gid, target_speed=1.0))
     return tasks
 
 def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:

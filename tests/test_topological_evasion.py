@@ -64,14 +64,14 @@ def test_ghost_evasion_controller_sets_topological_velocity():
 
 def test_3_stage_curriculum_configuration():
     """Verify STAGES is correctly configured with smooth progressive stages."""
-    assert len(STAGES) == 6
-    # Stage 0: 7x9, 2 ghosts, 1 power pellet
-    assert STAGES[0].rows == 7
-    assert STAGES[0].cols == 9
-    assert STAGES[0].n_ghosts == 2
-    assert STAGES[0].n_power == 1
-    assert STAGES[0].min_updates == 80
-    assert STAGES[0].target_kill_rate == 0.80
+    assert len(STAGES) == 5
+    # Stage 0: 13x17, 3 ghosts, 4 power pellets
+    assert STAGES[0].rows == 13
+    assert STAGES[0].cols == 17
+    assert STAGES[0].n_ghosts == 3
+    assert STAGES[0].n_power == 4
+    assert STAGES[0].min_updates == 100
+    assert STAGES[0].target_kill_rate == 0.70
 
     # Final stage: 33x41, 7 ghosts, 28 power pellets
     assert STAGES[-1].rows == 33

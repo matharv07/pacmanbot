@@ -18,7 +18,7 @@ MAX_W = 41
 MAX_GHOSTS   = 7
 SPATIAL_CH   = 11       #number of spatial channels (see channel map below)
 GLOBAL_SPATIAL_CH = 12   #number of channels in the omniscient global state
-VEC_DIM      = 67
+VEC_DIM      = 70
 CRITIC_VEC_DIM = MAX_GHOSTS * VEC_DIM + MAX_GHOSTS
 
 """
@@ -91,7 +91,9 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_reso
             if t is not None and t.target_pos is not None:
                 ty, tx = float(t.target_pos[0]), float(t.target_pos[1])
                 task_speed = float(getattr(t, 'target_speed', 1.0))
-                _place_blob(out[3], ty, tx, rows, cols, obs_resolution, scale=task_speed)
+                is_flank = getattr(t, 'task_type', None) == TaskType.FLANK
+                blob_scale = (1.4 if is_flank else 1.0) * task_speed
+                _place_blob(out[3], ty, tx, rows, cols, obs_resolution, scale=blob_scale)
                 peer_pos = ghost.known_agents.get(gid)
                 py, px = None, None
                 if peer_pos is not None and peer_pos != "UNKNOWN":
@@ -112,7 +114,7 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_reso
                             r = int(iy * obs_resolution)
                             c = int(ix * obs_resolution)
                             if 0 <= r < rows and 0 <= c < cols:
-                                line_val = 0.35 * task_speed
+                                line_val = (0.70 if is_flank else 0.35) * task_speed
                                 if line_val > out[3, r, c]:
                                     out[3, r, c] = line_val
     bm = ghost.belief_map
@@ -217,17 +219,17 @@ def build_vector(ghost) -> np.ndarray:
 
     def _enc(t):
         if t is None:
-            return [0.0] * 11
-        v = [0.0] * 11
+            return [0.0] * 12
+        v = [0.0] * 12
         tt = int(t.task_type)
-        if 0 <= tt < 5:
+        if 0 <= tt < 6:
             v[tt] = 1.0
-        v[5] = t.target_pos[0] / w_height
-        v[6] = t.target_pos[1] / w_width
-        v[7] = min(max(t.score, -5.0), 5.0) / 5.0
-        v[8] = min(ghost.frame - t.created_frame, 200) / 200.0
-        v[9] = float(getattr(t, 'target_speed', 1.0))
-        v[10] = 1.0
+        v[6] = t.target_pos[0] / w_height
+        v[7] = t.target_pos[1] / w_width
+        v[8] = min(max(t.score, -5.0), 5.0) / 5.0
+        v[9] = min(ghost.frame - t.created_frame, 200) / 200.0
+        v[10] = float(getattr(t, 'target_speed', 1.0))
+        v[11] = 1.0
         return v
     own = []
     for key in ghost.cbba_agent.path[:3]:
@@ -296,7 +298,7 @@ def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int, o
             tt = TaskType.HUNT
         else:
             tt = TaskType.DYNAMIC
-        tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame, owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed))
+        tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame, owner=ghost.gid, assigned_to=-1, target_speed=target_speed))
     return tasks
 
 def build_global_spatial(env, rows: int, cols: int, obs_resolution: float = 1.0) -> np.ndarray:

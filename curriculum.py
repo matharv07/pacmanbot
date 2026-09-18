@@ -2,11 +2,11 @@
 Curriculum Learning Scheduler for stepwise grid-size scaling.
 
 Defines training stages that gradually increase grid complexity:
-  Stage 0: 7x9    grid, 2 ghosts - learn basic pursuit on tiny grid
-  Stage 1: 13x17  grid, 3 ghosts - learn corridor navigation + coordination
-  Stage 2: 17x21  grid, 4 ghosts - learn belief-map hunting
-  Stage 3: 21x27  grid, 5 ghosts - learn multi-agent swarming
-  Stage 4: 33x41  grid, 7 ghosts - full game (final fine-tuning)
+  Stage 0: 13x17 grid, 3 ghosts - learn corridor navigation, pincer flanking + coordination
+  Stage 1: 17x21 grid, 4 ghosts - learn belief-map hunting
+  Stage 2: 21x27 grid, 5 ghosts - learn multi-agent swarming
+  Stage 3: 27x33 grid, 6 ghosts - full swarm pressure
+  Stage 4: 33x41 grid, 7 ghosts - full game (final fine-tuning)
 
 Advancement is triggered when the rolling mean return AND kill rate
 sustain above per-stage thresholds for a sustained window of updates.
@@ -35,11 +35,10 @@ class Stage:
     def cols(self) -> int:
         return int(self.world_width * self.obs_resolution)
 
-STAGES = [Stage(world_height=7,  world_width=9,  obs_resolution=1.0, n_ghosts=2, n_power=1,  advance_return=0.8, min_updates=80,  target_kill_rate=0.80),
-          Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=3, n_power=4,  advance_return=0.8, min_updates=150, target_kill_rate=0.75),
-          Stage(world_height=17, world_width=21, obs_resolution=1.0, n_ghosts=4, n_power=8,  advance_return=0.6, min_updates=200, target_kill_rate=0.70),
-          Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=14, advance_return=0.4, min_updates=250, target_kill_rate=0.65),
-          Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=20, advance_return=0.2, min_updates=300, target_kill_rate=0.65),
+STAGES = [Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=3, n_power=4,  advance_return=0.50, min_updates=100, target_kill_rate=0.70),
+          Stage(world_height=17, world_width=21, obs_resolution=1.0, n_ghosts=4, n_power=8,  advance_return=0.50, min_updates=150, target_kill_rate=0.68),
+          Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=14, advance_return=0.40, min_updates=200, target_kill_rate=0.65),
+          Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=20, advance_return=0.30, min_updates=250, target_kill_rate=0.65),
           Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.65)]
 
 ADVANCE_WINDOW = 60    #rolling window of updates for advancement checks
