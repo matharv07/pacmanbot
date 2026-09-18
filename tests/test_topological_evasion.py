@@ -63,15 +63,16 @@ def test_ghost_evasion_controller_sets_topological_velocity():
     assert v_mag > 0.05, f"Ghost should be moving to evade powered pacman, got {v_mag}"
 
 def test_3_stage_curriculum_configuration():
-    """Verify STAGES is correctly configured with smooth progressive stages."""
-    assert len(STAGES) == 5
-    # Stage 0: 13x17, 3 ghosts, 4 power pellets
+    """Verify STAGES is a monotone ramp ending on the README's full game."""
+    # Stage 0: 13x17, 3 ghosts — the smallest board the swarm can actually coordinate on
     assert STAGES[0].rows == 13
     assert STAGES[0].cols == 17
     assert STAGES[0].n_ghosts == 3
-    assert STAGES[0].n_power == 4
-    assert STAGES[0].min_updates == 100
-    assert STAGES[0].target_kill_rate == 0.70
+    # board size, swarm size and power pellet count all ramp monotonically
+    for a, b in zip(STAGES, STAGES[1:]):
+        assert b.rows >= a.rows and b.cols >= a.cols
+        assert b.n_ghosts > a.n_ghosts
+        assert b.n_power > a.n_power
 
     # Final stage: 33x41, 7 ghosts, 28 power pellets
     assert STAGES[-1].rows == 33

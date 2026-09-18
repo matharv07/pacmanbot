@@ -8,6 +8,13 @@ Defines training stages that gradually increase grid complexity:
   Stage 3: 27x33 grid, 6 ghosts - full swarm pressure
   Stage 4: 33x41 grid, 7 ghosts - full game (final fine-tuning)
 
+Measured note: difficulty is NOT monotone in map size. Smaller boards are HARDER for the
+swarm — a team wipe needs fewer deaths, episodes are short enough that there is no time to
+coordinate, and the fixed 40-frame power window covers a much larger share of the episode.
+A 9x13 / 2-ghost stage measured 35% kills and 60% team wipes, well below 13x17 / 3 ghosts,
+so the ladder starts at 13x17. Power pellet count ramps with the board so the powered share
+of each episode stays roughly flat until the final stage, which is the README's full game.
+
 Advancement is triggered when the rolling mean return AND kill rate
 sustain above per-stage thresholds for a sustained window of updates.
 """
@@ -35,13 +42,13 @@ class Stage:
     def cols(self) -> int:
         return int(self.world_width * self.obs_resolution)
 
-STAGES = [Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=3, n_power=4,  advance_return=0.50, min_updates=100, target_kill_rate=0.70),
-          Stage(world_height=17, world_width=21, obs_resolution=1.0, n_ghosts=4, n_power=8,  advance_return=0.50, min_updates=150, target_kill_rate=0.68),
-          Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=14, advance_return=0.40, min_updates=200, target_kill_rate=0.65),
-          Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=20, advance_return=0.30, min_updates=250, target_kill_rate=0.65),
-          Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.65)]
+STAGES = [Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=3, n_power=3,  advance_return=2.0, min_updates=60,  target_kill_rate=0.75),
+          Stage(world_height=17, world_width=21, obs_resolution=1.0, n_ghosts=4, n_power=6,  advance_return=2.0, min_updates=80,  target_kill_rate=0.75),
+          Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=12, advance_return=1.5, min_updates=100, target_kill_rate=0.78),
+          Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=20, advance_return=1.5, min_updates=120, target_kill_rate=0.82),
+          Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.90)]
 
-ADVANCE_WINDOW = 60    #rolling window of updates for advancement checks
+ADVANCE_WINDOW = 40    #rolling window of updates for advancement checks
 
 class CurriculumScheduler:
     def __init__(self, start_stage: int = 0):
@@ -89,8 +96,8 @@ class CurriculumScheduler:
             avg_second = sum(hist[half:]) / half
             competency_kill = self.stage.target_kill_rate * 0.88
             #if return progress has flattened (< 0.20) and policy maintains competent baseline
-            if (avg_second - avg_first) < 0.20 and avg_kill >= competency_kill and avg_ret >= 0.0:
-                print(f"Curriculum advancing due to plateau: progress {avg_second - avg_first:.2f} < 0.20 (avg ret: {avg_second:.2f}, kill: {avg_kill:.1%})")
+            if (avg_second - avg_first) < 0.50 and avg_kill >= competency_kill and avg_ret >= 0.0:
+                print(f"Curriculum advancing due to plateau: progress {avg_second - avg_first:.2f} < 0.50 (avg ret: {avg_second:.2f}, kill: {avg_kill:.1%})")
                 return True
         return False
 

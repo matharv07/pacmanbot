@@ -74,17 +74,18 @@ def run_diagnostics(ckpt_path: str = None, stage_idx: int = 1, seed: int = 42, m
         t_vm = torch.from_numpy(vm_p)
         
         with torch.inference_mode():
-            idx, lp, scores, _pool, _vec, speed, _speed_lp, direction, _dir_lp = actor(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
+            idx, lp, scores, _pool, _vec, speed, _speed_lp, direction, _dir_lp, gate, _gate_lp = actor(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
             
         idx_np    = idx.cpu().numpy()
         scores_np = scores.float().cpu().numpy()
         speed_np  = speed.float().cpu().numpy()
         dir_np    = direction.float().cpu().numpy()
+        gate_np   = gate.float().cpu().numpy()
         
         action_dict = {}
         for i, gid in enumerate(gids):
             pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in idx_np[i]]
-            action_dict[gid] = (pairs, scores_np[i], float(speed_np[i].item()), float(dir_np[i].item()))
+            action_dict[gid] = (pairs, scores_np[i], float(speed_np[i].item()), float(dir_np[i].item()), float(gate_np[i].item()))
             
         # Step environment
         obs, rewards, done, info = env.step(action_dict, bc_prob=0.0)

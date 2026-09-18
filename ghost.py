@@ -3,7 +3,7 @@ import random
 import math
 from collections import deque
 import numpy as np
-from pathfinder import dijkstra_multi, next_step
+from pathfinder import next_step, path_belief, ghost_dists, find_topological_flee_target_belief
 from cbba import CBBA_Agent
 from beliefmap import BeliefMap
 from allocator import TaskType
@@ -47,6 +47,9 @@ HEARTBEAT_EVERY   = 5
 HEARTBEAT_TIMEOUT = 25
 RESYNC_EVERY      = 100
 OSCILLATION_WINDOW = 8   #position history length to prevent oscillations
+RL_MAX_DEVIATION   = 1.05  #max residual rotation (rad) the policy may apply to the heuristic heading
+RL_TACTICAL_RADIUS = 6.0   #range to Pacman inside which a steering hijack is allowed
+EVADE_TRIGGER_DIST = 16.0  #start running before Pacman is close enough to lock on
 LIDAR_SWEEP_EVERY  = 3   #lidar sweep + LOS checks every N frames
 BELIEF_DIFFUSE_EVERY = 4 #belief map diffusion every N frames
 
@@ -85,7 +88,7 @@ class Ghost:
         self.known_pellets = set()
         self.known_power_pellets = set()
         self.lidar_memory = set()
-        self.prm_last_seen = {n: -1 for n in getattr(world, 'prm_nodes', [])}
+        self.prm_last_seen = {}                 #belief-grid node -> frame last observed (-1 = never)
         self.prm_known_count = 0
         self.frame = 0
         self.message_queue = []
@@ -110,6 +113,7 @@ class Ghost:
             p_start = (float(np.float32(player_start[0])), float(np.float32(player_start[1])))
         self.belief_map = BeliefMap(gid, rows=int(self.world.height), cols=int(self.world.width), pacman_start=p_start)
         self.belief_map.init_full_topology()
+        self.prm_last_seen = {n: -1 for n in self.belief_map._open_cells}
         self._proximity_channel_cache = None
         self._proximity_channel_frame = -1
         self._proximity_channel_target = None
@@ -120,6 +124,7 @@ class Ghost:
         self._prev_seen_pacman: Optional[tuple] = None
         self._player_dir = (0.0, 0.0)
         self.current_rl_dir: Optional[float] = None
+        self.rl_hijack: bool = False        #policy asked to take over micro-navigation this step
         self.rl_mode: bool = False
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False, speed_mult=1.0):
@@ -189,11 +194,16 @@ class Ghost:
             if pac_target is not None:
                 pr, pc = float(pac_target[0]), float(pac_target[1])
                 dist_pac = math.hypot(pr - self.y, pc - self.x)
-                if dist_pac < 10.0:
-                    from pathfinder import find_topological_flee_target, astar
-                    flee_target = find_topological_flee_target(self.world, (self.y, self.x), (pr, pc), radius=self.radius)
+                if dist_pac < EVADE_TRIGGER_DIST:
+                    fc = getattr(self, '_flee_cache', None)
+                    if (fc is not None and self.frame - fc[0] < 4
+                            and math.hypot(fc[1][0] - pr, fc[1][1] - pc) < 1.5):
+                        flee_target = fc[2]
+                    else:
+                        flee_target = find_topological_flee_target_belief(self.belief_map, (self.y, self.x), (pr, pc))
+                        self._flee_cache = (self.frame, (pr, pc), flee_target)
                     if flee_target is not None:
-                        path = astar(self.world, (self.y, self.x), flee_target, radius=self.radius)
+                        path = self.plan_path(flee_target)
                         if len(path) >= 2:
                             next_pt = path[1]
                             dx = next_pt[1] - self.x
@@ -232,26 +242,7 @@ class Ghost:
                             moved = True
                             if hasattr(self, '_committed_path'):
                                 self._committed_path = []
-        #RL Continuous Tactical Direction / Steering (active in rl_mode when in tactical proximity to Pacman or target)
-        if not moved and getattr(self, 'rl_mode', False) and getattr(self, 'current_rl_dir', None) is not None:
-            is_tactical = False
-            if self.known_pacman is not None and not self.pacman_powered:
-                d_p = math.hypot(self.known_pacman[0] - self.y, self.known_pacman[1] - self.x)
-                if d_p < 4.5:
-                    is_tactical = True
-            elif active_task is not None:
-                d_tgt = math.hypot(active_task.target_pos[0] - self.y, active_task.target_pos[1] - self.x)
-                if d_tgt < 1.5:
-                    is_tactical = True
-            if is_tactical:
-                rl_angle = float(self.current_rl_dir) * 2.0 * math.pi - math.pi
-                desired_vx = math.cos(rl_angle)
-                desired_vy = math.sin(rl_angle)
-                moved = True
-                if hasattr(self, '_committed_path'):
-                    self._committed_path = []
-        #Dynamic Terminal Pursuit & Lead Interception (heuristic baseline only, active when Pacman is in LOS or near)
-        if not getattr(self, 'rl_mode', False) and not moved and not self.pacman_powered and self.known_pacman:
+        if not moved and not self.pacman_powered and self.known_pacman:
             pr, pc = self.known_pacman
             pac_y, pac_x = float(pr), float(pc)
             dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
@@ -282,21 +273,15 @@ class Ghost:
                     if moved and hasattr(self, '_committed_path'):
                         self._committed_path = []
         GRAB_DIST = 2.0
-        if not getattr(self, 'rl_mode', False) and not moved and (not self.known_pacman or self.pacman_powered or dist_pac > 4.5):
+        if not moved and (not self.known_pacman or self.pacman_powered or dist_pac > 4.5):
             best_power = None
             best_pd = float('inf')
-            power_arr = getattr(self.world, 'power_pellets_arr', None)
-            if power_arr is not None and len(power_arr) > 0:
-                dist = np.hypot(power_arr[:, 0] - self.x, power_arr[:, 1] - self.y)
-                valid_mask = dist < 3.5
-                if np.any(valid_mask):
-                    valid_idx = np.where(valid_mask)[0]
-                    for idx in valid_idx:
-                        px, py = power_arr[idx]
-                        pd = math.hypot(py - self.y, px - self.x)
-                        if pd < GRAB_DIST and pd < best_pd:
-                            best_power = (py, px)
-                            best_pd = pd
+            #denial uses only power pellets this ghost has seen or been told about
+            for px, py in self.known_power_pellets:
+                pd = math.hypot(py - self.y, px - self.x)
+                if pd < GRAB_DIST and pd < best_pd:
+                    best_power = (py, px)
+                    best_pd = pd
             if best_power is not None:
                 dx, dy = best_power[1] - self.x, best_power[0] - self.y
                 d = math.hypot(dx, dy)
@@ -318,12 +303,7 @@ class Ghost:
                 elif prev_target and math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 3.0:
                     replan = True
             if replan:
-                if self.world is not None:
-                    from pathfinder import astar
-                    full_path = astar(self.world, (float(self.y), float(self.x)), target)
-                else:
-                    from pathfinder import astar_belief
-                    full_path = astar_belief(self.belief_map, (float(self.y), float(self.x)), target)
+                full_path = self.plan_path(target)
                 if len(full_path) >= 2:
                     self._committed_path = full_path[1:]
                     self._committed_target = target
@@ -385,12 +365,7 @@ class Ghost:
                 elif self.frame - getattr(self, '_last_replan_frame', -999) >= 30:
                     replan = True
                 if replan:
-                    if self.world is not None:
-                        from pathfinder import astar
-                        full_path = astar(self.world, (float(self.y), float(self.x)), target)
-                    else:
-                        from pathfinder import astar_belief
-                        full_path = astar_belief(self.belief_map, (float(self.y), float(self.x)), target)
+                    full_path = self.plan_path(target)
                     if len(full_path) >= 2:
                         self._committed_path = full_path[1:]
                         self._committed_target = target
@@ -416,20 +391,21 @@ class Ghost:
         if not moved:
             if hasattr(self, '_committed_path'):
                 self._committed_path = []
-            if getattr(self, 'rl_mode', False) and getattr(self, 'current_rl_dir', None) is not None:
-                rl_angle = float(self.current_rl_dir) * 2.0 * math.pi - math.pi
-                desired_vx = math.cos(rl_angle)
-                desired_vy = math.sin(rl_angle)
+            cur_speed = math.hypot(self.vx, self.vy)
+            if cur_speed > 0.01:
+                desired_vx = self.vx / cur_speed
+                desired_vy = self.vy / cur_speed
             else:
-                cur_speed = math.hypot(self.vx, self.vy)
-                if cur_speed > 0.01:
-                    desired_vx = self.vx / cur_speed
-                    desired_vy = self.vy / cur_speed
-                else:
-                    angle = random.uniform(0, 2*math.pi)
-                    desired_vx = math.cos(angle)
-                    desired_vy = math.sin(angle)
-        #context steering and momentum — cached every 3 frames to reduce jitter/CPU load
+                angle = random.uniform(0, 2*math.pi)
+                desired_vx = math.cos(angle)
+                desired_vy = math.sin(angle)
+        if (getattr(self, 'rl_mode', False) and getattr(self, 'rl_hijack', False)
+                and getattr(self, 'current_rl_dir', None) is not None
+                and (desired_vx != 0.0 or desired_vy != 0.0) and self._in_tactical_envelope(active_task)):
+            off = (float(self.current_rl_dir) - 0.5) * 2.0 * RL_MAX_DEVIATION
+            ca, sa = math.cos(off), math.sin(off)
+            desired_vx, desired_vy = desired_vx * ca - desired_vy * sa, desired_vx * sa + desired_vy * ca
+        #context steering and momentum, cached every 3 frames to reduce jitter/CPU load
         _STEER_CACHE_TTL = 3
         best_vx, best_vy = desired_vx, desired_vy
         if desired_vx != 0.0 or desired_vy != 0.0:
@@ -543,6 +519,23 @@ class Ghost:
         self._check_oscillation()
         return newly_discovered, stale_refreshed
 
+    def plan_path(self, target) -> list:
+        return path_belief(self.belief_map, (float(self.y), float(self.x)), (float(target[0]), float(target[1])))
+
+    def plan_dists(self, targets) -> dict:
+        return ghost_dists(self, (float(self.y), float(self.x)), list(targets))
+
+    def _in_tactical_envelope(self, active_task) -> bool:
+        if getattr(self, 'in_fallback_mode', False):
+            return True
+        pac = self.known_pacman or self.last_lost_pacman
+        if pac is not None and math.hypot(pac[0] - self.y, pac[1] - self.x) < RL_TACTICAL_RADIUS:
+            return True
+        if active_task is not None:
+            if math.hypot(active_task.target_pos[0] - self.y, active_task.target_pos[1] - self.x) < 2.0:
+                return True
+        return False
+
     def _check_oscillation(self):
         if len(self.pos_history) < OSCILLATION_WINDOW:
             return
@@ -599,17 +592,6 @@ class Ghost:
         visible_prm = []
         visible_belief_idxs = set()
         impassable_belief_nodes = []
-        prm_arr = getattr(self.world, 'prm_nodes_arr', None)
-        if prm_arr is not None and len(prm_arr) > 0:
-            dx = prm_arr[:, 1] - self.x
-            dy = prm_arr[:, 0] - self.y
-            dist = np.hypot(dx, dy)
-            valid_mask = dist <= MAX_RAY_DIST
-            if np.any(valid_mask):
-                valid_nodes = prm_arr[valid_mask]
-                valid_targets = np.column_stack((valid_nodes[:, 1], valid_nodes[:, 0]))
-                is_los = self.world.batch_line_of_sight((self.x, self.y), valid_targets, radius=0.4, step_size=0.5)
-                visible_prm = [tuple(n) for n, vis in zip(valid_nodes, is_los) if vis]
         bm_arr = getattr(self.belief_map, '_open_arr', None)
         if bm_arr is not None and len(bm_arr) > 0:
             dx = bm_arr[:, 1] - self.x
@@ -629,6 +611,9 @@ class Ghost:
                     for idx, node, vis in zip(valid_idxs, valid_nodes, is_los):
                         if vis and tuple(node) not in disabled_nodes:
                             visible_belief_idxs.add(idx)
+        if visible_belief_idxs:
+            cells = self.belief_map._open_cells
+            visible_prm = [cells[i] for i in visible_belief_idxs if i < len(cells)]
         pellet_diffs = []
         pellets_arr = getattr(self.world, 'pellets_arr', None)
         pellets_tup = getattr(self.world, 'pellets_tuples', None)

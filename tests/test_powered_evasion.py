@@ -35,6 +35,10 @@ class DummyGhost:
         self.vx = 0.0
         self.vy = 0.0
         self.radius = 0.35
+        #flee planning runs on the ghost's own discovered topology, so the stub needs one
+        from beliefmap import BeliefMap
+        self.belief_map = BeliefMap(gid, rows=int(self.world.height), cols=int(self.world.width))
+        self.belief_map.init_full_topology()
 
     def is_agent_dead(self, other_gid: int) -> bool:
         return other_gid in self.dead_agents

@@ -17,6 +17,7 @@ from obs import (build_spatial, build_global_spatial, build_vector, build_valid_
 from reward import RewardShaper
 from allocator import generate_tasks as heuristic_generate_tasks
 from beliefmap import extract_movement_features
+from net import speed_to_mult, mult_to_throttle
 
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 os.environ['SDL_VIDEODRIVER'] = "dummy"
@@ -185,7 +186,7 @@ class Env:
                 self._cached_hdists[gid] = h_task_dists
                 target = np.zeros((R, C), dtype=np.float32)
                 if h_tasks:
-                    self._cached_hspeed[gid] = h_tasks[0].target_speed
+                    self._cached_hspeed[gid] = mult_to_throttle(h_tasks[0].target_speed)
                     for t in h_tasks[:3]:
                         r_t, c_t = int(t.target_pos[0] * self.obs_resolution), int(t.target_pos[1] * self.obs_resolution)
                         if 0 <= r_t < R and 0 <= c_t < C:
@@ -200,7 +201,7 @@ class Env:
                                         if self.world.is_passable(wx, wy, radius=0.35):
                                             target[nr, nc] += t.score * 0.5
                 else:
-                    self._cached_hspeed[gid] = 1.0
+                    self._cached_hspeed[gid] = mult_to_throttle(1.0)
                 self._cached_ht[gid] = target
             else:
                 h_tasks = self._cached_htasks.get(gid, []) if bc_prob > 0.0 else []
@@ -209,21 +210,18 @@ class Env:
                     self._cached_hspeed[gid] = 1.0
             if gid in action_dict:      #merge RL tasks with CBBA
                 act_data = action_dict[gid]
-                if len(act_data) == 4:
-                    indices, scores_map, speed, direction = act_data
-                    g.current_rl_dir = direction
-                else:
-                    indices, scores_map, speed = act_data
-                    g.current_rl_dir = None
+                indices, scores_map, speed = act_data[0], act_data[1], act_data[2]
+                g.current_rl_dir = act_data[3] if len(act_data) > 3 else None
+                g.rl_hijack      = bool(act_data[4]) if len(act_data) > 4 else False
                 g.rl_mode = True
-                g.current_speed_mult = speed
+                #the [0,1] throttle is a fraction of the ghost speed cap, never a free-fall to zero
+                g.current_speed_mult = speed_to_mult(speed)
                 self.recent_nom[gid] *= NOM_DECAY
                 for r, c in indices:
                     if 0 <= r < R and 0 <= c < C:
                         self.recent_nom[gid][r, c] = 1.0
         if self.frame % DECISION_INTERVAL == 0:
             from cbba import _task_key
-            from pathfinder import dijkstra_multi
             pooled_tasks = {}
             for gid in alive:
                 if gid not in action_dict:
@@ -232,7 +230,7 @@ class Env:
                 act_data = action_dict[gid]
                 indices = act_data[0]
                 scores_map = act_data[1]
-                speed = act_data[2]
+                speed = speed_to_mult(act_data[2])
                 tasks = actions_to_tasks(g, scores_map, indices, self.frame, self.obs_resolution, target_speed=speed)
                 cand_tasks = tasks
                 cur_active = g.cbba_agent.get_active_task()
@@ -252,7 +250,7 @@ class Env:
                         g = self.ghosts[gid]
                         g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
                         info_total_auctions += 1
-                        h_dists = dijkstra_multi(g.world, (g.y, g.x), all_targets)
+                        h_dists = g.plan_dists(all_targets)
                         g.cbba_agent._phase1(g, all_pooled_tasks, h_dists)
         rewards = {gid: 0.0 for gid in alive}
         done = False
@@ -266,11 +264,11 @@ class Env:
             if score_diff > 0:
                 for a_gid in alive:
                     if a_gid in rewards and not self.ghosts[a_gid].dead:
-                        rewards[a_gid] -= 0.002 * score_diff  #-0.02 per normal pellet (10 score)
+                        rewards[a_gid] -= 0.004 * score_diff  #-0.04 per normal pellet (10 score)
             if not powered_before and getattr(self.player, 'powered', False):
                 for a_gid in alive:
                     if a_gid in rewards and not self.ghosts[a_gid].dead:
-                        rewards[a_gid] -= 1.0    #flat power pellet activation penalty
+                        rewards[a_gid] -= 2.0    #flat power pellet activation penalty
             powered = self.player.powered
             new_pac_v = np.array([float(self.player.vy), float(self.player.vx)], dtype=np.float32)
             if self._pending_pred is not None:
@@ -361,17 +359,20 @@ class Env:
                                     if witnesses:
                                         og.witness_death(gid, self.ghosts)
                             if gid in rewards:
-                                rewards[gid] -= 8.0
+                                rewards[gid] -= 15.0
+                            for o_gid, og in self.ghosts.items():
+                                if o_gid != gid and not og.dead and o_gid in rewards:
+                                    rewards[o_gid] -= 3.0   #losing a node costs the whole mesh
                         else:
                             self.player.die()
                             done = True
                             if gid in rewards:
-                                rewards[gid] += 10.0
+                                rewards[gid] += 20.0
                             for other_gid, other_ghost in self.ghosts.items():
                                 if other_gid != gid and not other_ghost.dead and other_gid in rewards:
                                     dist = math.hypot(other_ghost.y - self.player.y, other_ghost.x - self.player.x)
-                                    proximity_bonus = min(2.0, 2.0 * math.exp(-dist / 7.0))
-                                    rewards[other_gid] += 6.0 + proximity_bonus
+                                    proximity_bonus = min(3.0, 3.0 * math.exp(-dist / 7.0))
+                                    rewards[other_gid] += 14.0 + proximity_bonus
                             swarm_ghosts = []
                             angles = []
                             for cand_gid, cand_ghost in self.ghosts.items():
@@ -388,37 +389,39 @@ class Env:
                                 R = math.hypot(sum(math.cos(a) for a in angles) / N,
                                                sum(math.sin(a) for a in angles) / N)
                                 angular_enclosure = 1.0 - R
-                                swarm_bonus = 3.0 * angular_enclosure
+                                swarm_bonus = 6.0 * angular_enclosure
                                 for sg_id in swarm_ghosts:
                                     if sg_id in rewards:
                                         rewards[sg_id] += swarm_bonus
                             break
                 if not any(not g.dead for g in self.ghosts.values()):
                     done = True
+                    for o in rewards:
+                        rewards[o] -= 15.0   #whole swarm eliminated
             if done:
                 break
             if (len(self.world.pellets) + len(self.world.power_pellets)) == 0:
                 done = True
                 for o in rewards:
-                    rewards[o] -= 5.0
+                    rewards[o] -= 15.0   #Pacman cleared the board
                 break
             if self.frame >= self.max_frames:
                 done = True
                 for o in rewards:
-                    rewards[o] -= 3.0
+                    rewards[o] -= 10.0   #ran out of time
                 break
 
-            step_cost = 0.015 / DECISION_INTERVAL
+            step_cost = 0.010 / DECISION_INTERVAL
             for gid in rewards:
                 if self.ghosts[gid].dead:
                     continue
                 rewards[gid] -= step_cost
                 conv = getattr(self.ghosts[gid], 'power_pellets_converted_this_frame', 0)
                 if conv > 0:
-                    rewards[gid] += 2.0 * conv
+                    rewards[gid] += 2.5 * conv
                     for ogid in alive:
                         if ogid != gid and not self.ghosts[ogid].dead and ogid in rewards:
-                            rewards[ogid] += 0.5 * conv
+                            rewards[ogid] += 0.6 * conv
                     self.ghosts[gid].power_pellets_converted_this_frame = 0
         for gid, g in self.ghosts.items():
             if gid not in rewards:

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import List, Optional
 import numpy as np
-from pathfinder import dijkstra_multi
+from pathfinder import ghost_dists
 
 WALL    = 1
 EMPTY   = 0
@@ -26,7 +26,8 @@ UNKNOWN = -1
 
 HUNT_SCALE    = 14.0
 CONVERT_SCALE = 8.0
-SAFE_RADIUS   = 8       #min safe power pacman distance
+CONVERT_DENIAL_W = 7.0  #weight on racing Pacman to a power pellet it is closing on
+SAFE_RADIUS   = 14      #min safe distance from a powered Pacman
 SAFE_SCALE    = 8.0
 RECENCY_SCALE = 20.0    #sets up quantity to prioritize revisiting older mapped locations
 EXPLORE_SCALE = 6.0
@@ -144,6 +145,12 @@ def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
 def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
     tasks: list[Task] = []
     if not hasattr(ghost, 'known_power_pellets'): return tasks
+    #pacman estimate comes only from LOS, relayed comms or this ghost's own belief map
+    pac = ghost.known_pacman or ghost.last_lost_pacman
+    if pac is None and getattr(ghost, 'belief_map', None) is not None:
+        top = ghost.belief_map.top_cells(n=1)
+        pac = top[0] if top else None
+    powered = getattr(ghost, 'pacman_powered', False)
     for pos in ghost.known_power_pellets:
         yx_pos = (pos[1], pos[0])
         info = _lookup_dist(dists, yx_pos)
@@ -154,17 +161,25 @@ def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
             continue
         #distance-dependent conversion score that prioritizes power pellet denial when nearby
         score = 2.0 + 3.0 * _dist_score(dist, CONVERT_SCALE)
+        #denial urgency: every pellet Pacman reaches costs the swarm a full powered phase,
+        if pac is not None:
+            d_pac = abs(pac[0] - yx_pos[0]) + abs(pac[1] - yx_pos[1])
+            threat = math.exp(-d_pac / 7.0)
+            race = 1.0 if dist <= d_pac * 0.9 else 0.35
+            score += CONVERT_DENIAL_W * threat * race
+        if powered:
+            score *= 0.4   #never walk into a powered Pacman for a pellet
         tasks.append(Task(task_type=TaskType.CONVERT, target_pos=yx_pos, score=score, created_frame=frame, owner=ghost.gid, target_speed=1.0))
     return tasks
 
 def _find_flee_pos(ghost, pacman_pos: tuple) -> Optional[tuple]:
     pr, pc = pacman_pos
-    if getattr(ghost, 'world', None) is None: return None
-    from pathfinder import find_topological_flee_target
-    top_target = find_topological_flee_target(ghost.world, (ghost.y, ghost.x), (pr, pc), radius=ghost.radius)
+    if getattr(ghost, 'belief_map', None) is None: return None
+    from pathfinder import find_topological_flee_target_belief
+    top_target = find_topological_flee_target_belief(ghost.belief_map, (ghost.y, ghost.x), (pr, pc))
     if top_target is not None:
         return top_target
-    prm_nodes = getattr(ghost.world, 'prm_nodes', None)
+    prm_nodes = getattr(ghost.belief_map, '_open_cells', None)
     #direction vector from Pacman to Ghost (away from Pacman)
     d_pac_ghost = (ghost.y - pr, ghost.x - pc)
     cur_dist = math.hypot(d_pac_ghost[0], d_pac_ghost[1])
@@ -297,13 +312,13 @@ def generate_tasks(ghost, frame: int) -> tuple[List[Task], dict]:
     explore_tasks = _score_explore(ghost, frame)
     for et in explore_tasks:
         targets.add((float(et.target_pos[0]), float(et.target_pos[1])))
-    dists = dijkstra_multi(ghost.world, start, list(targets))
+    dists = ghost_dists(ghost, start, list(targets))
     tasks: list[Task] = []
     if getattr(ghost, 'pacman_powered', False):
         evade_track = _score_evade_track(ghost, dists, frame)
         if evade_track is not None:
             if evade_track.target_pos not in dists:
-                extra_dist = dijkstra_multi(ghost.world, start, [evade_track.target_pos])
+                extra_dist = ghost_dists(ghost, start, [evade_track.target_pos])
                 dists.update(extra_dist)
             tasks.append(evade_track)
         tasks.extend(explore_tasks)

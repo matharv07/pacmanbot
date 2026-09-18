@@ -832,26 +832,28 @@ class Game:
                     t_ve = torch.tensor(np.stack(ve), device=RL_DEVICE, dtype=torch.float32)
                     t_vm = torch.tensor(np.stack(vm), device=RL_DEVICE, dtype=torch.bool)
                     with torch.inference_mode():
-                        idx, _, scores, _, _, speed, _, direction, _ = RL_ACTOR(t_sp, t_ve, t_vm, K=3)
+                        idx, _, scores, _, _, speed, _, direction, _, gate, _ = RL_ACTOR(t_sp, t_ve, t_vm, K=3)
                     idx_np = idx.cpu().numpy()
                     sc_np  = scores.cpu().numpy()
                     spd_np = speed.cpu().numpy()
                     dir_np = direction.cpu().numpy()
+                    gate_np = gate.cpu().numpy()
                     from cbba import _task_key
-                    from pathfinder import dijkstra_multi
                     pooled_tasks = {}
                     for i, gid in enumerate(alive):
                         g = self.ghosts[gid]
                         indices = [(int(x // C), int(x % C)) for x in idx_np[i]]
                         scores_map = sc_np[i]
-                        g.current_speed_mult = float(spd_np[i][0])
+                        from net import speed_to_mult
+                        g.current_speed_mult = speed_to_mult(float(spd_np[i][0]))
                         g.current_rl_dir = float(dir_np[i][0])
+                        g.rl_hijack = bool(gate_np[i][0])
                         g.rl_mode = True
                         self.recent_nom[gid] *= 0.8
                         for r, c in indices:
                             if 0 <= r < R and 0 <= c < C:
                                 self.recent_nom[gid][r, c] = 1.0
-                        tasks = actions_to_tasks(g, scores_map, indices, self.frame_counter, obs_resolution=1.0, target_speed=float(spd_np[i][0]))
+                        tasks = actions_to_tasks(g, scores_map, indices, self.frame_counter, obs_resolution=1.0, target_speed=g.current_speed_mult)
                         cand_tasks = list(tasks)
                         cur_active = g.cbba_agent.get_active_task()
                         if cur_active is not None and (self.frame_counter - cur_active.created_frame < 24):
@@ -868,7 +870,7 @@ class Game:
                         for gid in alive:
                             g = self.ghosts[gid]
                             g.cbba_agent._last_auction = self.frame_counter + 6
-                            dists = dijkstra_multi(g.world, (g.y, g.x), all_targets)
+                            dists = g.plan_dists(all_targets)
                             g.cbba_agent._phase1(g, all_pooled_tasks, dists)
         self.player.update(self.ghosts)
         powered = self.player.powered

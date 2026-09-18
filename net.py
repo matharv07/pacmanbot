@@ -10,6 +10,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from obs import SPATIAL_CH, MAX_H, MAX_W, VEC_DIM, CRITIC_VEC_DIM, GLOBAL_SPATIAL_CH
 
+SPEED_FLOOR   = 0.55
+SPEED_PRIOR_A = 2.6
+SPEED_PRIOR_B = -2.0
+GATE_PRIOR_LOGIT = -1.2
+RL_MAX_DEVIATION = 1.05
+
+def speed_to_mult(throttle):            #throttle in [0,1] -> speed multiplier in [SPEED_FLOOR, 1.0]
+    return SPEED_FLOOR + (1.0 - SPEED_FLOOR) * float(throttle)
+
+def mult_to_throttle(mult):             #inverse of speed_to_mult, for behaviour-cloning targets
+    return (float(mult) - SPEED_FLOOR) / (1.0 - SPEED_FLOOR)
+
 class ResBlock(nn.Module):
     def __init__(self, c_in, c_out, cond_dim=None):
         super().__init__()
@@ -53,10 +65,21 @@ class GhostActor(nn.Module):
         self.res3 = ResBlock(128, 128, cond_dim=128)
         #1×1 conv to logit map (combines 128 local spatial channels + 128 global context channels)
         self.head = nn.Conv2d(256, 1, 1)
-        #continuous speed head (alpha, beta for Beta distribution)
+        #continuous speed head (alpha, beta for Beta distribution over the [0,1] throttle)
+        #the throttle is remapped to SPEED_FLOOR..1.0 of the ghost speed cap in worker.py
         self.speed_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 2))
-        #continuous tactical direction head (alpha, beta for Beta distribution over normalized angle [0, 1])
+        #continuous tactical steering head (alpha, beta) — a RESIDUAL rotation of the
+        #heuristic heading, not an absolute angle, so an untrained head is a no-op
         self.dir_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 2))
+        #binary hijack gate: does the policy take over micro-navigation this step?
+        self.gate_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 1))
+        #priors: start near the speed cap, steer straight, and defer to the heuristic controller
+        nn.init.zeros_(self.speed_head[-1].weight)
+        self.speed_head[-1].bias.data = torch.tensor([SPEED_PRIOR_A, SPEED_PRIOR_B])
+        nn.init.zeros_(self.dir_head[-1].weight)
+        nn.init.zeros_(self.dir_head[-1].bias)
+        nn.init.zeros_(self.gate_head[-1].weight)
+        nn.init.constant_(self.gate_head[-1].bias, GATE_PRIOR_LOGIT)
 
     def encode(self, spatial, vector):
         x = self.stem(spatial)
@@ -108,26 +131,31 @@ class GhostActor(nn.Module):
             sel_idx.append(idx)
             sel_lp.append(dist.log_prob(idx))
             flat.scatter_(1, idx.unsqueeze(1), float('-inf'))
-        speed_params = torch.clamp(F.softplus(self.speed_head(torch.cat([pool, vec], dim=1))) + 1.5, min=1.5, max=8.0)
-        alpha, beta = speed_params[:, 0], speed_params[:, 1]
-        dist_speed = torch.distributions.Beta(alpha, beta)
-        speed = dist_speed.sample()
-        #clamp to avoid 0/1 exactly which might cause log_prob issues
-        speed = torch.clamp(speed, 1e-3, 1.0 - 1e-3)
+        tok = torch.cat([pool, vec], dim=1)
+        dist_speed = self._speed_dist(tok)
+        speed = torch.clamp(dist_speed.sample(), 1e-3, 1.0 - 1e-3)
         speed_lp = dist_speed.log_prob(speed)
-
-        dir_params = torch.clamp(F.softplus(self.dir_head(torch.cat([pool, vec], dim=1))) + 1.5, min=1.5, max=8.0)
-        dir_alpha, dir_beta = dir_params[:, 0], dir_params[:, 1]
-        dist_dir = torch.distributions.Beta(dir_alpha, dir_beta)
-        direction = dist_dir.sample()
-        direction = torch.clamp(direction, 1e-3, 1.0 - 1e-3)
+        dist_dir = self._dir_dist(tok)
+        direction = torch.clamp(dist_dir.sample(), 1e-3, 1.0 - 1e-3)
         dir_lp = dist_dir.log_prob(direction)
+        dist_gate = self._gate_dist(tok)
+        gate = dist_gate.sample()
+        gate_lp = dist_gate.log_prob(gate)
+        return (torch.stack(sel_idx, 1), torch.stack(sel_lp, 1), scores, pool, vec, speed.unsqueeze(1), speed_lp.unsqueeze(1), 
+                direction.unsqueeze(1), dir_lp.unsqueeze(1), gate.unsqueeze(1), gate_lp.unsqueeze(1))
 
-        return (torch.stack(sel_idx, 1), torch.stack(sel_lp, 1), scores, pool, vec,
-                speed.unsqueeze(1), speed_lp.unsqueeze(1),
-                direction.unsqueeze(1), dir_lp.unsqueeze(1))
+    def _speed_dist(self, tok):
+        params = torch.clamp(F.softplus(self.speed_head(tok)) + 1.5, min=1.5, max=12.0)
+        return torch.distributions.Beta(params[:, 0], params[:, 1])
 
-    def evaluate_actions(self, spatial, vector, mask, actions, speeds, directions=None):
+    def _dir_dist(self, tok):
+        params = torch.clamp(F.softplus(self.dir_head(tok)) + 2.0, min=2.0, max=12.0)
+        return torch.distributions.Beta(params[:, 0], params[:, 1])
+
+    def _gate_dist(self, tok):
+        return torch.distributions.Bernoulli(logits=self.gate_head(tok).squeeze(-1).clamp(-8.0, 8.0))
+
+    def evaluate_actions(self, spatial, vector, mask, actions, speeds, directions=None, gates=None):
         """
         Re-computes log-probs and entropy for *stored* action indices.
         Used inside the PPO update loop (single forward pass).
@@ -135,8 +163,9 @@ class GhostActor(nn.Module):
         Parameters
         ----------
         actions    : (B, K) long — previously sampled flattened indices
-        speeds     : (B, 1) float — previously sampled speeds
-        directions : (B, 1) float, optional — previously sampled continuous directions
+        speeds     : (B, 1) float — previously sampled speed throttles
+        directions : (B, 1) float, optional — previously sampled steering residuals
+        gates      : (B, 1) float, optional — previously sampled hijack gate (0/1)
 
         Returns
         -------
@@ -171,24 +200,30 @@ class GhostActor(nn.Module):
             mask_k = torch.zeros_like(flat, dtype=torch.bool)
             mask_k.scatter_(1, actions[:, k].unsqueeze(1), True)
             flat = torch.where(mask_k, float('-inf'), flat)
-        speed_params = torch.clamp(F.softplus(self.speed_head(torch.cat([pool, vec], dim=1))) + 1.5, min=1.5, max=8.0)
-        alpha, beta = speed_params[:, 0], speed_params[:, 1]
-        dist_speed = torch.distributions.Beta(alpha, beta)
+        tok = torch.cat([pool, vec], dim=1)
+        dist_speed = self._speed_dist(tok)
         speeds = torch.clamp(speeds.squeeze(-1), 1e-3, 1.0 - 1e-3)
         speed_lp = dist_speed.log_prob(speeds)
         speed_ent = dist_speed.entropy()
-        dir_params = torch.clamp(F.softplus(self.dir_head(torch.cat([pool, vec], dim=1))) + 1.5, min=1.5, max=8.0)
         if directions is not None:
-            dir_alpha, dir_beta = dir_params[:, 0], dir_params[:, 1]
-            dist_dir = torch.distributions.Beta(dir_alpha, dir_beta)
+            dist_dir = self._dir_dist(tok)
             directions = torch.clamp(directions.squeeze(-1), 1e-3, 1.0 - 1e-3)
             dir_lp = dist_dir.log_prob(directions)
             dir_ent = dist_dir.entropy()
         else:
             dir_lp = torch.zeros_like(speed_lp)
             dir_ent = torch.zeros_like(speed_ent)
-        logprobs = torch.stack(lp_list, 1).sum(1) + 0.1 * speed_lp + 0.02 * dir_lp
-        entropy  = torch.stack(ent_list, 1).sum(1) + 0.5 * speed_ent + 0.1 * dir_ent
+        if gates is not None:
+            dist_gate = self._gate_dist(tok)
+            gate_lp = dist_gate.log_prob(gates.squeeze(-1))
+            gate_ent = dist_gate.entropy()
+        else:
+            gate_lp = torch.zeros_like(speed_lp)
+            gate_ent = torch.zeros_like(speed_ent)
+        #every component is emitted each step, so the ratio uses the true joint log-prob
+        logprobs = torch.stack(lp_list, 1).sum(1) + speed_lp + dir_lp + gate_lp
+        entropy  = torch.stack(ent_list, 1).sum(1) + speed_ent + dir_ent + gate_ent
+        speed_params = torch.stack([dist_speed.concentration1, dist_speed.concentration0], dim=1)
         return logprobs, entropy, pool, vec, flat_clean, speed_params
 
 class GhostCritic(nn.Module):

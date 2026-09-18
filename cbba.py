@@ -3,7 +3,7 @@ import math
 from typing import Optional
 import ast
 from allocator import TaskType, Task, generate_tasks
-from pathfinder import dijkstra_multi, astar
+from pathfinder import astar, leg_cost_belief, ghost_dists
 
 AUCTION_EVERY   = 6      #full auction every 0.6s 
 LT              = 3
@@ -30,10 +30,12 @@ class CBBA_Agent:
         self._dist_cache: dict = {}        #(pos) -> distance, cached per-auction
         self._astar_cache: dict = {}       #persists across auctions
         self._unreachable_cache: dict = {} #(pos) -> timeout_frame
+        self._pair_dist_cache: dict = {}   #(r1,c1,r2,c2) -> belief-space leg cost
 
     def reset_caches(self):
         self._dist_cache.clear()
         self._astar_cache.clear()
+        self._pair_dist_cache.clear()
 
     def mark_unreachable(self, target_pos: tuple, frame: int):
         self._unreachable_cache[target_pos] = frame + 150  #5 seconds penalty
@@ -209,8 +211,8 @@ class CBBA_Agent:
         self._dist_cache = {(round(float(pos[0]), 2), round(float(pos[1]), 2)): d for pos, (d, _) in dists.items()}
         missing = [t.target_pos for t in candidate_tasks if (round(float(t.target_pos[0]), 2), round(float(t.target_pos[1]), 2)) not in self._dist_cache]
         if missing:
-            if getattr(ghost, 'world', None) is not None and hasattr(ghost.world, 'apsp'):
-                new_dists = dijkstra_multi(ghost.world, (ghost.y, ghost.x), missing)
+            if True:
+                new_dists = ghost_dists(ghost, (ghost.y, ghost.x), missing)
                 for pos, (d, _) in new_dists.items():
                     self._dist_cache[(round(float(pos[0]), 2), round(float(pos[1]), 2))] = d
             for t in candidate_tasks:
@@ -345,24 +347,13 @@ class CBBA_Agent:
                 elif abs(r1 - r2) + abs(c1 - c2) == 1:
                     d = 1.0
                 else:
-                    w = getattr(ghost, 'world', None)
-                    if w is not None and hasattr(w, 'apsp') and hasattr(w, 'prm_node_idx'):
-                        p1 = (round(float(r1), 1), round(float(c1), 1))
-                        p2 = (round(float(r2), 1), round(float(c2), 1))
-                        idx1 = w.prm_node_idx.get(p1)
-                        idx2 = w.prm_node_idx.get(p2)
-                        if idx1 is not None and idx2 is not None:
-                            d = float(w.apsp[idx1, idx2])
-                        else:
-                            cache_key = (r1, c1, r2, c2)
-                            if not hasattr(w, '_pair_dist_cache'):
-                                w._pair_dist_cache = {}
-                            d = w._pair_dist_cache.get(cache_key)
-                            if d is None:
-                                d = float(abs(r1 - r2) + abs(c1 - c2))
-                                w._pair_dist_cache[cache_key] = d
-                    else:
-                        d = float(abs(r1 - r2) + abs(c1 - c2))
+                    #leg cost between two tasks on the ghost's own belief topology
+                    bm = getattr(ghost, 'belief_map', None)
+                    cache_key = (r1, c1, r2, c2)
+                    d = self._pair_dist_cache.get(cache_key)
+                    if d is None:
+                        d = leg_cost_belief(bm, (float(r1), float(c1)), (float(r2), float(c2))) if bm is not None else float(abs(r1 - r2) + abs(c1 - c2))
+                        self._pair_dist_cache[cache_key] = d
             cumulative += d
             total += task.score * (self.lamda ** cumulative)
             prev_pos = tgt

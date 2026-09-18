@@ -1,6 +1,8 @@
 import heapq
 import math
 import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra as _sp_dijkstra
 
 def _euclidean(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
@@ -274,3 +276,191 @@ def find_topological_flee_target(world, ghost_pos: tuple, pac_pos: tuple, radius
         node = world.prm_nodes[best_fb]
         return (float(node[0]), float(node[1]))
     return None
+
+def _belief_base(belief_map):
+    """Builds (once per topology) the full adjacency over the belief grid plus the
+    per-edge endpoint arrays needed to mask it cheaply as walls are discovered."""
+    if not hasattr(belief_map, '_open_cells') or not hasattr(belief_map, '_nbr_idx'):
+        return None
+    if hasattr(belief_map, '_ensure_initialised'):
+        belief_map._ensure_initialised()
+    n = len(belief_map._open_cells)
+    if n == 0:
+        return None
+    base = getattr(belief_map, '_plan_base', None)
+    if base is not None and base['n'] == n and base['nbr_id'] == id(belief_map._nbr_idx):
+        return base
+    nbr_idx = belief_map._nbr_idx
+    rows = np.repeat(np.arange(n, dtype=np.int32), nbr_idx.shape[1])
+    cols = nbr_idx.ravel()
+    data = belief_map._nbr_dist.ravel().astype(np.float64)
+    keep = (cols >= 0) & (data > 0)
+    graph = csr_matrix((data[keep], (rows[keep], cols[keep])), shape=(n, n))
+    graph.sum_duplicates()
+    erows = np.repeat(np.arange(n, dtype=np.int32), np.diff(graph.indptr))
+    base = {'n': n, 'nbr_id': id(nbr_idx), 'graph': graph, 'erows': erows, 'ecols': graph.indices.copy(),
+            'masked': None, 'mask_stamp': -1, 'rows': {}, 'node_idx': {}}
+    belief_map._plan_base = base
+    return base
+
+def _belief_csr(belief_map):
+    """Adjacency over the ghost's DISCOVERED topology.
+
+    The belief graph starts optimistic — every cell assumed open — and nodes are masked out
+    as lidar confirms walls, so planning never uses a wall the ghost has not seen. The base
+    graph is built once; discovery only re-applies a vectorised edge mask (O(E), ~0.1 ms).
+    """
+    base = _belief_base(belief_map)
+    if base is None:
+        return None
+    walk = getattr(belief_map, '_walkable_mask', None)
+    stamp = len(getattr(belief_map, '_disabled_wall_nodes', ()))
+    if base['masked'] is not None and base['mask_stamp'] == stamp:
+        return base['masked']
+    g = base['graph'].copy()
+    if walk is not None and len(walk) == base['n']:
+        ok = walk[base['erows']] & walk[base['ecols']]
+        g.data[~ok] = 0.0
+        g.eliminate_zeros()   #scipy treats explicit zeros as weight-0 edges, so drop them
+    base['masked'] = g
+    base['mask_stamp'] = stamp
+    return g
+
+def _node_idx(belief_map, pos):
+    """Nearest belief node for a coordinate, memoised — positions repeat heavily."""
+    base = _belief_base(belief_map)
+    key = (round(float(pos[0]), 2), round(float(pos[1]), 2))
+    cache = base['node_idx'] if base is not None else None
+    if cache is not None:
+        idx = cache.get(key)
+        if idx is not None:
+            return idx
+    idx = belief_map._closest_node(pos)
+    if cache is not None and len(cache) < 20000:
+        cache[key] = idx
+    return idx
+
+def _dist_row(belief_map, src_idx, with_pred=False, allow_stale=False):
+    """Geodesic distances from one belief node to every node, cached per source.
+
+    Navigation and bidding ask for a row computed under the current wall mask. CBBA bundle
+    ordering passes allow_stale=True and accepts a row from a few discoveries ago — an
+    ordering heuristic does not need to know about a wall found two frames back, and this
+    is what keeps the per-pair leg cost at a dict lookup during early exploration.
+    """
+    g = _belief_csr(belief_map)
+    if g is None:
+        return None, None
+    base = belief_map._plan_base
+    rows, stamp = base['rows'], base['mask_stamp']
+    hit = rows.get(src_idx)
+    if hit is not None and (allow_stale or hit[2] == stamp) and (not with_pred or hit[1] is not None):
+        return hit[0], hit[1]
+    if with_pred:
+        d, pred = _sp_dijkstra(g, directed=False, indices=src_idx, return_predecessors=True)
+    else:
+        d, pred = _sp_dijkstra(g, directed=False, indices=src_idx), None
+    if len(rows) >= 384:
+        rows.clear()
+    rows[src_idx] = (d.astype(np.float32), pred, stamp)
+    return rows[src_idx][0], pred
+
+def _manhattan_dists(start, target_set):
+    return {t: (abs(start[0] - t[0]) + abs(start[1] - t[1]), [start, t]) for t in target_set}
+
+def dijkstra_multi_belief(belief_map, start, targets):
+    """Multi-target shortest path over the ghost's own discovered map.
+
+    Drop-in replacement for dijkstra_multi() — returns {target: (dist, path)} — but uses
+    only information the ghost has sensed or been told, never the ground-truth world graph.
+    """
+    if not targets:
+        return {}
+    target_set = list(set(targets))
+    if _belief_csr(belief_map) is None:
+        return _manhattan_dists(start, target_set)
+    start_idx = _node_idx(belief_map, start)
+    if start_idx < 0:
+        return _manhattan_dists(start, target_set)
+    dist, _ = _dist_row(belief_map, start_idx)
+    cells = belief_map._open_cells
+    results = {}
+    for t in target_set:
+        ti = _node_idx(belief_map, t)
+        if ti < 0 or not math.isfinite(dist[ti]):
+            results[t] = (math.inf, [])
+            continue
+        #add the residual hop from the graph node to the exact target coordinate
+        results[t] = (float(dist[ti]) + _euclidean(cells[ti], (float(t[0]), float(t[1]))), [start, t])
+    if start in results:
+        results[start] = (0.0, [start])
+    return results
+
+def leg_cost_belief(belief_map, a, b):
+    """Geodesic cost between two arbitrary points on the discovered map (CBBA bundle legs)."""
+    if _belief_csr(belief_map) is None:
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+    ia, ib = _node_idx(belief_map, a), _node_idx(belief_map, b)
+    if ia < 0 or ib < 0:
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+    dist, _ = _dist_row(belief_map, ia, allow_stale=True)
+    d = dist[ib]
+    return float(d) if math.isfinite(d) else abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+def path_belief(belief_map, start, goal):
+    """Shortest waypoint path over the discovered map via Dijkstra predecessors.
+    Returns [start, ..., goal] or [] if unreachable. Falls back to astar_belief."""
+    if _belief_csr(belief_map) is None:
+        return astar_belief(belief_map, start, goal)
+    si, gi = _node_idx(belief_map, start), _node_idx(belief_map, goal)
+    if si < 0 or gi < 0:
+        return []
+    if si == gi:
+        return [start, goal]
+    dist, pred = _dist_row(belief_map, si, with_pred=True)
+    if not math.isfinite(dist[gi]):
+        return []
+    cells = belief_map._open_cells
+    nodes = []
+    cur = gi
+    while cur != si and cur >= 0:
+        nodes.append(cells[cur])
+        cur = int(pred[cur])
+    nodes.reverse()
+    return [start] + [(float(n[0]), float(n[1])) for n in nodes] + [goal]
+
+def find_topological_flee_target_belief(belief_map, ghost_pos: tuple, pac_pos: tuple):
+    """Belief-space analogue of find_topological_flee_target.
+
+    Picks the reachable node that maximises geodesic distance from Pacman while staying
+    cheap for the ghost to reach, using only the discovered topology.
+    """
+    if _belief_csr(belief_map) is None:
+        return None
+    g_idx, p_idx = _node_idx(belief_map, ghost_pos), _node_idx(belief_map, pac_pos)
+    if g_idx < 0 or p_idx < 0:
+        return None
+    d_ghost, _ = _dist_row(belief_map, g_idx)
+    d_pac, _ = _dist_row(belief_map, p_idx)
+    reachable = np.isfinite(d_ghost) & np.isfinite(d_pac)
+    if not np.any(reachable):
+        return None
+    #prefer nodes Pacman is far from and the ghost can still reach before being caught
+    score = np.full(d_pac.shape, -np.inf)
+    score[reachable] = d_pac[reachable] - 0.6 * d_ghost[reachable]
+    best = int(np.argmax(score))
+    if not np.isfinite(score[best]):
+        return None
+    node = belief_map._open_cells[best]
+    return (float(node[0]), float(node[1]))
+
+def ghost_dists(ghost, start, targets):
+    """Distances from `start` to `targets` over a ghost's own discovered topology.
+
+    Kept module-level (rather than only as a Ghost method) so the allocator and CBBA stay
+    decoupled from the Ghost class, and so agent stubs without a belief map still work.
+    """
+    bm = getattr(ghost, 'belief_map', None)
+    if bm is None:
+        return _manhattan_dists(start, list(set(targets)))
+    return dijkstra_multi_belief(bm, start, list(targets))

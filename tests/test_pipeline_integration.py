@@ -72,17 +72,19 @@ def test_actor_critic_shapes_and_logprobs():
     sp = torch.randn(2, SPATIAL_CH, H, W)
     ve = torch.randn(2, VEC_DIM)
     vm = torch.ones(2, H, W, dtype=torch.bool)
-    idx, lp, scores, pool, vec, speed, speed_lp, direction, dir_lp = actor(sp, ve, vm, K=3)
+    idx, lp, scores, pool, vec, speed, speed_lp, direction, dir_lp, gate, gate_lp = actor(sp, ve, vm, K=3)
     assert idx.shape == (2, 3), f"idx shape mismatch: {idx.shape}"
     assert lp.shape == (2, 3), f"lp shape mismatch: {lp.shape}"
     assert speed.shape == (2, 1), f"speed shape mismatch: {speed.shape}"
     assert speed_lp.shape == (2, 1), f"speed_lp shape mismatch: {speed_lp.shape}"
     assert direction.shape == (2, 1), f"direction shape mismatch: {direction.shape}"
     assert dir_lp.shape == (2, 1), f"dir_lp shape mismatch: {dir_lp.shape}"
-    eval_lp, eval_ent, _pool, _vec, flat_logits, speed_params = actor.evaluate_actions(sp, ve, vm, idx, speed, direction)
+    assert gate.shape == (2, 1), f"gate shape mismatch: {gate.shape}"
+    assert gate_lp.shape == (2, 1), f"gate_lp shape mismatch: {gate_lp.shape}"
+    eval_lp, eval_ent, _pool, _vec, flat_logits, speed_params = actor.evaluate_actions(sp, ve, vm, idx, speed, direction, gate)
     assert eval_lp.shape == (2,), f"eval_lp shape mismatch: {eval_lp.shape}"
     assert eval_ent.shape == (2,), f"eval_ent shape mismatch: {eval_ent.shape}"
-    rollout_lp = lp.sum(dim=1) + 0.1 * speed_lp.squeeze(-1) + 0.02 * dir_lp.squeeze(-1)
+    rollout_lp = lp.sum(dim=1) + speed_lp.squeeze(-1) + dir_lp.squeeze(-1) + gate_lp.squeeze(-1)
     diff = torch.abs(rollout_lp - eval_lp).max().item()
     print(f"Log-prob difference between rollout and evaluate_actions: {diff:.6f}")
     assert diff < 1e-4, f"Mismatch between rollout log-prob and evaluate_actions: {diff}"

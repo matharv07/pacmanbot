@@ -146,9 +146,9 @@ class RewardShaper:
         return self.beta * encirclement * avg_prox * swarm_bonus
 
     def _phi_explore(self, ghost) -> float:
-        if not hasattr(ghost.world, 'prm_nodes') or not hasattr(ghost, 'prm_last_seen'):
+        if not hasattr(ghost, 'prm_last_seen') or not ghost.prm_last_seen:
             return 0.0
-        total_nodes = max(len(ghost.world.prm_nodes), 1)
+        total_nodes = max(len(ghost.prm_last_seen), 1)
         known = getattr(ghost, 'prm_known_count', None)
         if known is None:
             known = sum(1 for v in ghost.prm_last_seen.values() if v != -1)
