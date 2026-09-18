@@ -74,7 +74,7 @@ class Ghost:
         self.x, self.y = float(pos[1]), float(pos[0])
         self.prev_x, self.prev_y = self.x, self.y
         self.vx, self.vy = 0.0, 0.0
-        self.max_speed = 0.75
+        self.max_speed = 0.50
         self.target_cell = pos
         self.color = color
         self.dead = False
