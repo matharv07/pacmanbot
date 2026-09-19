@@ -43,13 +43,9 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-#sized for an 8-core / 16-thread desktop: rollouts are synchronous, so per-step latency is the
-#slowest worker — 14 leaves a hardware thread for the trainer process and one spare
 NUM_ENVS            = int(os.environ.get("NUM_ENVS", "14"))
 ROLLOUT_STEPS       = int(os.environ.get("ROLLOUT_STEPS", "128"))
 MINI_BATCH          = int(os.environ.get("MINI_BATCH", "2048"))
-#measured ~14 GB of activations per 1024 samples at 33x41 in bf16 -> 512 peaks near 7 GB and
-#leaves room for the on-GPU rollout buffer on a 16 GB card; 1024 would OOM at the final stage
 MICRO_BATCH         = int(os.environ.get("MICRO_BATCH", "512"))
 ROLLOUT_INFER_CHUNK = int(os.environ.get("ROLLOUT_INFER_CHUNK", "1024"))
 #adaptive OOM-safe chunk sizes — halved automatically on cuda OOM, never grow back
@@ -59,12 +55,8 @@ PPO_EPOCHS      = 2
 GAMMA           = 0.985
 GAE_LAMBDA      = 0.96
 CLIP_EPS        = 0.20
-#entropy is controlled, not fixed. Run 12 (1850 updates): with a fixed 0.001 the cell-pick entropy
-#fell from ~12 to 0.3 by update 1150 and the policy sat frozen on the cloned heuristic (0.667 kill)
-#for the remaining 700 updates. The coefficient now ratchets up whenever the K cell picks' summed
-#entropy drops below ENT_TARGET and decays back toward the floor when there is slack
 ENT_COEF_INIT   = float(os.environ.get("ENT_COEF_INIT", "0.01"))
-ENT_TARGET      = float(os.environ.get("ENT_TARGET", "3.0"))    #nats, summed over the K=3 cell picks (~e^1 candidates each)
+ENT_TARGET      = float(os.environ.get("ENT_TARGET", "3.0"))
 ENT_COEF_BOUNDS = (0.001, 0.2)
 ENT_COEF_STEP   = 1.10
 VF_COEF         = 0.5
@@ -72,22 +64,16 @@ MAX_GRAD_NORM   = 0.5
 LR              = 1.2e-4
 LR_CRITIC       = 3.0e-4
 STAGE_BC_INIT   = [0.35, 0.25, 0.15, 0.08, 0.04]
-BC_FLOOR        = 0.0               #anneal all the way off: a permanent pull toward the 0.667-kill heuristic caps the policy
+BC_FLOOR        = 0.0
 K_NOMINATIONS   = 3
 LOG_DIR         = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file__), "logs"))
 CKPT_DIR        = os.environ.get("CKPT_DIR", os.path.join(os.path.dirname(__file__), "checkpoints"))
-#BC schedule is counted in ACTOR updates (ticks only when the actor actually stepped), so it no
-#longer overlaps the LR warmup or the post-advance critic warm-up
-BC_HOLD_UPDATES   = int(os.environ.get("BC_HOLD_UPDATES", "60"))     #full coefficient while the policy absorbs the heuristic
-BC_ANNEAL_UPDATES = int(os.environ.get("BC_ANNEAL_UPDATES", "150"))  #then linear anneal to BC_FLOOR
-#KL controller. approx_kl is now the SUM of per-head KL estimates over K+3 heads (3 cell picks,
-#speed, direction, gate). Calibrated on a 45-update smoke run: at 2.5x base LR the per-head sum
-#settled at ~0.011 with 2-6% clip fraction, so the band [target/1.5, target*1.5] = [0.01, 0.0225]
-#brackets that operating point instead of pinning the controller against a bound
+BC_HOLD_UPDATES   = int(os.environ.get("BC_HOLD_UPDATES", "60"))
+BC_ANNEAL_UPDATES = int(os.environ.get("BC_ANNEAL_UPDATES", "150"))
 TARGET_KL       = float(os.environ.get("TARGET_KL", "0.015"))
-KL_EMA_ALPHA    = 0.5               #smoothing of the per-update KL before the controller looks at it
-KL_LR_STEP      = 1.15              #symmetric multiplicative step (old ±6%/-15% drifted the scale down)
-LR_WARMUP_UPDATES = 20              #linear warmup before cosine decay
+KL_EMA_ALPHA    = 0.5
+KL_LR_STEP      = 1.15
+LR_WARMUP_UPDATES = 20
 KL_LR_SCALE_BOUNDS = (0.2, 2.5)     #range the KL controller may scale the base LR by (old 6x ceiling caused the overshoot)
 CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
@@ -716,11 +702,8 @@ def train():
     rollout_transfer = BatchTransfer(DEVICE)
     train_transfer   = BatchTransfer(DEVICE)
     max_updates = int(os.environ.get("MAX_UPDATES", "50001"))
-    _stage_start_update = max(0, start_update - getattr(curriculum, '_updates_in_stage', 0))   #track start of each curriculum stage for LR schedule
+    _stage_start_update = max(0, start_update - getattr(curriculum, '_updates_in_stage', 0))
     for update in range(start_update, max_updates):
-        #LR schedule. Critic: linear warmup then cosine decay per-stage. Actor: warmup only —
-        #its step size is owned by the KL controller below, so a cosine decay on top would just
-        #be fought back up by kl_lr_scale and waste the controller's range.
         updates_in_stage = update - _stage_start_update
         stage_horizon = max(300, getattr(curriculum.stage, 'min_updates', 100) * 3)
         warm = min(1.0, updates_in_stage / max(1, LR_WARMUP_UPDATES))
@@ -735,8 +718,6 @@ def train():
         for pg in opt_critic.param_groups:
             pg['_base_lr'] = pg.get('_base_lr', LR_CRITIC)
             pg['lr'] = pg['_base_lr'] * critic_mult
-        #BC schedule in actor updates: hold at the stage's initial coefficient, then anneal to BC_FLOOR.
-        #bc_decay_step only ticks when the actor stepped, so warmups no longer eat the imitation phase
         stage_bc_init = STAGE_BC_INIT[min(curriculum.stage_idx, len(STAGE_BC_INIT) - 1)]
         anneal_pos = max(0, bc_decay_step - BC_HOLD_UPDATES)
         bc_frac = max(0.0, 1.0 - anneal_pos / max(1, BC_ANNEAL_UPDATES))
@@ -1106,34 +1087,23 @@ def train():
                 ema_return = mean_ret
             else:
                 ema_return = 0.95 * ema_return + 0.05 * mean_ret
-        #synchronous on-policy PPO optimization
         actor_stepped = (critic_warmup_remaining <= 0) and (warm >= 1.0)
         if actor_stepped:
             bc_decay_step += 1
         metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_dir, ds_gate, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms, ent_coef)
-        #entropy controller: hold the cell picks' summed entropy near ENT_TARGET. Only adapts when
-        #the actor actually stepped, for the same reason as the KL controller below
         measured_cell_ent = metrics["cell_entropy"] / max(1, metrics["n_batches"])
         if actor_stepped:
             if measured_cell_ent < ENT_TARGET:
                 ent_coef = min(ENT_COEF_BOUNDS[1], ent_coef * ENT_COEF_STEP)
             else:
                 ent_coef = max(ENT_COEF_BOUNDS[0], ent_coef / ENT_COEF_STEP)
-        #KL-tracking LR controller: the joint log-prob made the old fixed LR wildly
-        #mis-scaled in both directions, so steer the actor LR to hold approx_kl near TARGET_KL
-        #only adapt on updates where the actor actually moved — during LR warmup and the
-        #post-advance critic warm-up the measured KL is ~0 and would ratchet the scale up for nothing
         measured_kl = metrics["approx_kl"] / max(1, metrics["n_batches"])
         if actor_stepped:
-            #smooth the noisy per-update KL and take symmetric steps in log space. The old raw-value,
-            #+6%/-15% controller random-walked the scale to 5.7x during warmup, overshot, then sat on
-            #the floor for 1800 updates because the joint-ratio KL kept rising as the policy sharpened
             kl_ema = measured_kl if kl_ema is None else (KL_EMA_ALPHA * measured_kl + (1.0 - KL_EMA_ALPHA) * kl_ema)
             if kl_ema < TARGET_KL / 1.5:
                 kl_lr_scale = min(KL_LR_SCALE_BOUNDS[1], kl_lr_scale * KL_LR_STEP)
             elif kl_ema > TARGET_KL * 1.5:
                 kl_lr_scale = max(KL_LR_SCALE_BOUNDS[0], kl_lr_scale / KL_LR_STEP)
-        #update return running statistics after PPO optimization
         ret_rms.update(ds_ret)
         actor_rollout.load_state_dict(actor.state_dict())
         critic_rollout.load_state_dict(critic.state_dict())
@@ -1178,11 +1148,8 @@ def train():
             vec_env.sync_predictor(predictor.state_dict())
             torch.cuda.empty_cache()
             current_returns = [0.0] * NUM_ENVS
-            #reset BC decay so each new stage gets fresh heuristic guidance; restart the KL EMA too
             bc_decay_step = 0
             kl_ema = None
-            #decay the critic base LR by 0.8× per stage advance, with a floor. The actor's
-            #effective LR is KL-controlled, so it re-finds its own step size on the new stage.
             for pg in opt_critic.param_groups:
                 pg['_base_lr'] = max(0.8e-4, pg.get('_base_lr', LR_CRITIC) * 0.80)
             _stage_start_update = update  #reset LR warmup for new stage

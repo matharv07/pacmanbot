@@ -46,12 +46,12 @@ MEMORY_FRAMES     = 10
 HEARTBEAT_EVERY   = 5
 HEARTBEAT_TIMEOUT = 25
 RESYNC_EVERY      = 100
-OSCILLATION_WINDOW = 8   #position history length to prevent oscillations
+OSCILLATION_WINDOW = 8     #position history length to prevent oscillations
 RL_MAX_DEVIATION   = 1.05  #max residual rotation (rad) the policy may apply to the heuristic heading
 RL_TACTICAL_RADIUS = 6.0   #range to Pacman inside which a steering hijack is allowed
 EVADE_TRIGGER_DIST = 16.0  #start running before Pacman is close enough to lock on
-LIDAR_SWEEP_EVERY  = 3   #lidar sweep + LOS checks every N frames
-BELIEF_DIFFUSE_EVERY = 4 #belief map diffusion every N frames
+LIDAR_SWEEP_EVERY  = 3     #lidar sweep + LOS checks every N frames
+BELIEF_DIFFUSE_EVERY = 4   #belief map diffusion every N frames
 
 _ANGLES = np.linspace(0, 2*math.pi, RAY_COUNT, endpoint=False)
 _DX = np.cos(_ANGLES) * 0.5

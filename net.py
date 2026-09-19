@@ -221,13 +221,8 @@ class GhostActor(nn.Module):
         else:
             gate_lp = torch.zeros_like(speed_lp)
             gate_ent = torch.zeros_like(speed_ent)
-        #per-head log-probs (K cell picks, speed, direction, gate) so PPO can clip and measure KL
-        #head by head. Summing into one joint log-prob let a single low-probability tail sample
-        #(2nd/3rd sequential pick, Beta tail) blow up the whole ratio and inflate approx_kl
+        #per-head log-probs (K cell picks, speed, direction, gate) so PPO can clip and measure KL head by head
         logprobs = torch.cat([torch.stack(lp_list, 1), speed_lp.unsqueeze(1), dir_lp.unsqueeze(1), gate_lp.unsqueeze(1)], dim=1)
-        #cell_ent is the summed entropy of the K categorical cell picks alone. The Beta heads have
-        #negative, unbounded-below entropy, so a bonus on the total let the trunk trade cell-pick
-        #diversity against speed-head sharpness; the exploration bonus targets cell_ent only
         cell_ent = torch.stack(ent_list, 1).sum(1)
         entropy  = cell_ent + speed_ent + dir_ent + gate_ent
         speed_params = torch.stack([dist_speed.concentration1, dist_speed.concentration0], dim=1)

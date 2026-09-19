@@ -8,13 +8,6 @@ Defines training stages that gradually increase grid complexity:
   Stage 3: 27x33 grid, 6 ghosts - full swarm pressure
   Stage 4: 33x41 grid, 7 ghosts - full game (final fine-tuning)
 
-Measured note: difficulty is NOT monotone in map size. Smaller boards are HARDER for the
-swarm — a team wipe needs fewer deaths, episodes are short enough that there is no time to
-coordinate, and the fixed 40-frame power window covers a much larger share of the episode.
-A 9x13 / 2-ghost stage measured 35% kills and 60% team wipes, well below 13x17 / 3 ghosts,
-so the ladder starts at 13x17. Power pellet count ramps with the board so the powered share
-of each episode stays roughly flat until the final stage, which is the README's full game.
-
 Advancement is triggered when the rolling kill rate over ADVANCE_WINDOW updates reaches the
 stage target, or plateaus above 0.92x the target. Mean return is recorded for logging only.
 """
@@ -88,9 +81,7 @@ class CurriculumScheduler:
         if avg_kill >= self.stage.target_kill_rate:
             print(f"Curriculum advancing: kill {avg_kill:.1%} >= target {self.stage.target_kill_rate:.1%} (avg ret: {avg_ret:.2f})")
             return True
-        #plateau: kill rate has flattened above the competency bar. The bar is 0.92x target
-        #(0.69 at stage 0), which is ~2.5 standard errors above the 0.667 stage-0 heuristic on a
-        #40-update window, so a policy that merely re-learnt the heuristic does not pass on plateau
+        #plateau: kill rate has flattened above the competency bar (0.92x target)
         if self._updates_in_stage >= self.stage.min_updates + 2 * ADVANCE_WINDOW:
             half = ADVANCE_WINDOW // 2
             hist = list(self._kill_history)
