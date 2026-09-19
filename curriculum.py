@@ -15,8 +15,8 @@ A 9x13 / 2-ghost stage measured 35% kills and 60% team wipes, well below 13x17 /
 so the ladder starts at 13x17. Power pellet count ramps with the board so the powered share
 of each episode stays roughly flat until the final stage, which is the README's full game.
 
-Advancement is triggered when the rolling mean return AND kill rate
-sustain above per-stage thresholds for a sustained window of updates.
+Advancement is triggered when the rolling kill rate over ADVANCE_WINDOW updates reaches the
+stage target, or plateaus above 0.92x the target. Mean return is recorded for logging only.
 """
 
 from __future__ import annotations
@@ -30,9 +30,9 @@ class Stage:
     obs_resolution: float
     n_ghosts: int
     n_power: int
-    advance_return: float
+    advance_return: float          #logging/reference only; gates use kill rate (see should_advance)
     min_updates: int
-    target_kill_rate: float = 0.35
+    target_kill_rate: float
 
     @property
     def rows(self) -> int:
@@ -72,32 +72,33 @@ class CurriculumScheduler:
         self._updates_in_stage += 1
 
     def should_advance(self) -> bool:
+        """Advance on kill rate alone. Return is dominated by shaping and unavoidable penalties
+        (power pellets -2 each, wipes -15, timeouts -10): run 12 held 0.667 kill for 1850 updates
+        with a 40-update mean return between -4.5 and -2.1, so the old `avg_ret >= 0` clause in
+        every gate made stage 0 unwinnable regardless of hunting skill."""
         if self.is_final:
             return False
         #strictly enforce min_updates before allowing ANY stage advancement
         if self._updates_in_stage < self.stage.min_updates:
             return False
-        if len(self._return_history) < ADVANCE_WINDOW:
+        if len(self._kill_history) < ADVANCE_WINDOW:
             return False
+        avg_kill = sum(self._kill_history) / len(self._kill_history)
         avg_ret = sum(self._return_history) / len(self._return_history)
-        avg_kill = (sum(self._kill_history) / len(self._kill_history)) if self._kill_history else 0.0
-        #dominant performance gate: exceeds stage kill target by 10% relative
-        dominant_gate = min(0.95, self.stage.target_kill_rate * 1.10)
-        if avg_kill >= dominant_gate and avg_ret >= 0.0:
+        if avg_kill >= self.stage.target_kill_rate:
+            print(f"Curriculum advancing: kill {avg_kill:.1%} >= target {self.stage.target_kill_rate:.1%} (avg ret: {avg_ret:.2f})")
             return True
-        #solid target: meets both calibrated advance_return and target_kill_rate
-        if avg_ret >= self.stage.advance_return and avg_kill >= self.stage.target_kill_rate:
-            return True
-        #plateau detection: if training has stalled after min_updates + ADVANCE_WINDOW
-        if self._updates_in_stage >= self.stage.min_updates + ADVANCE_WINDOW:
+        #plateau: kill rate has flattened above the competency bar. The bar is 0.92x target
+        #(0.69 at stage 0), which is ~2.5 standard errors above the 0.667 stage-0 heuristic on a
+        #40-update window, so a policy that merely re-learnt the heuristic does not pass on plateau
+        if self._updates_in_stage >= self.stage.min_updates + 2 * ADVANCE_WINDOW:
             half = ADVANCE_WINDOW // 2
-            hist = list(self._return_history)
-            avg_first = sum(hist[:half]) / half
-            avg_second = sum(hist[half:]) / half
-            competency_kill = self.stage.target_kill_rate * 0.88
-            #if return progress has flattened (< 0.20) and policy maintains competent baseline
-            if (avg_second - avg_first) < 0.50 and avg_kill >= competency_kill and avg_ret >= 0.0:
-                print(f"Curriculum advancing due to plateau: progress {avg_second - avg_first:.2f} < 0.50 (avg ret: {avg_second:.2f}, kill: {avg_kill:.1%})")
+            hist = list(self._kill_history)
+            kill_first = sum(hist[:half]) / half
+            kill_second = sum(hist[half:]) / half
+            competency_kill = self.stage.target_kill_rate * 0.92
+            if (kill_second - kill_first) < 0.02 and avg_kill >= competency_kill:
+                print(f"Curriculum advancing due to plateau: kill progress {kill_second - kill_first:+.3f} < 0.02 (kill: {avg_kill:.1%} >= {competency_kill:.1%}, avg ret: {avg_ret:.2f})")
                 return True
         return False
 

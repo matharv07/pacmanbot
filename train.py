@@ -59,7 +59,14 @@ PPO_EPOCHS      = 2
 GAMMA           = 0.985
 GAE_LAMBDA      = 0.96
 CLIP_EPS        = 0.20
-ENT_COEF        = 0.001
+#entropy is controlled, not fixed. Run 12 (1850 updates): with a fixed 0.001 the cell-pick entropy
+#fell from ~12 to 0.3 by update 1150 and the policy sat frozen on the cloned heuristic (0.667 kill)
+#for the remaining 700 updates. The coefficient now ratchets up whenever the K cell picks' summed
+#entropy drops below ENT_TARGET and decays back toward the floor when there is slack
+ENT_COEF_INIT   = float(os.environ.get("ENT_COEF_INIT", "0.01"))
+ENT_TARGET      = float(os.environ.get("ENT_TARGET", "3.0"))    #nats, summed over the K=3 cell picks (~e^1 candidates each)
+ENT_COEF_BOUNDS = (0.001, 0.2)
+ENT_COEF_STEP   = 1.10
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 1.2e-4
@@ -440,6 +447,7 @@ def train():
     bc_decay_step = 0
     kl_lr_scale  = 1.0
     kl_ema       = None   #EMA of measured approx_kl driving the LR controller
+    ent_coef     = ENT_COEF_INIT
     if "--resume" in sys.argv:
         ckpts = sorted(glob.glob(os.path.join(CKPT_DIR, "ckpt_*.pt")), key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[1]))
         if ckpts:
@@ -502,6 +510,7 @@ def train():
             bc_decay_step = ckpt.get("bc_decay_step", 0)
             kl_lr_scale  = ckpt.get("kl_lr_scale", 1.0)
             kl_ema       = ckpt.get("kl_ema", None)
+            ent_coef     = ckpt.get("ent_coef", ENT_COEF_INIT)
             global critic_warmup_remaining
             critic_warmup_remaining = ckpt.get("critic_warmup_remaining", 0)
             if "rng_state" in ckpt:
@@ -518,9 +527,9 @@ def train():
     print("VecEnv initialized. Starting training...")
     t0 = time.time()
 
-    def run_ppo(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_act, b_spd, b_dir, b_gate, b_olp, b_adv, b_ret, lam_bc, ret_rms):
+    def run_ppo(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_act, b_spd, b_dir, b_gate, b_olp, b_adv, b_ret, lam_bc, ret_rms, ent_coef):
         t_ppo_start = time.time()
-        metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "approx_kl": 0, "clip_fraction": 0, "n_batches": 0}    
+        metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "cell_entropy": 0, "approx_kl": 0, "clip_fraction": 0, "n_batches": 0}    
         N_total = b_sp.shape[0]
         uid_to_indices = defaultdict(list)
         b_gsp_ids_np = b_gsp_ids.cpu().numpy()
@@ -572,6 +581,7 @@ def train():
                     mb_v_loss = 0.0
                     mb_bc_loss = 0.0
                     mb_ent = 0.0
+                    mb_cell_ent = 0.0
                     mb_approx_kl = 0.0
                     mb_clip_fraction = 0.0
                     try:
@@ -601,7 +611,7 @@ def train():
                                 push_discord_warning(f"⚠️ Action OOB at update {update}: max_act={mb_act.max().item()}, H*W={_hw}, sp={tuple(mb_sp.shape)}")
                                 mb_act = mb_act.clamp(max=_hw - 1)
                             with torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
-                                new_lp, ent, pool, vec, flat_logits, speed_params = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act, mb_spd, mb_dir, mb_gate)
+                                new_lp, ent, pool, vec, flat_logits, speed_params, cell_ent = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act, mb_spd, mb_dir, mb_gate)
                                 unique_ids, inv_idx = torch.unique(mb_gsp_ids, return_inverse=True)
                                 mb_gsp_unique = b_gsp_unique[unique_ids]
                                 mb_c_pool = critic.encode_spatial(mb_gsp_unique)
@@ -645,7 +655,7 @@ def train():
                                         bc = torch.tensor(0.0, device=DEVICE)
                                 else:
                                     bc = torch.tensor(0.0, device=DEVICE)
-                                loss_actor = a_loss - ENT_COEF * ent.mean() + lam_bc * bc
+                                loss_actor = a_loss - ent_coef * cell_ent.mean() + lam_bc * bc
                                 loss_critic = VF_COEF * v_loss
                             (loss_critic * weight).backward()
                             if critic_warmup_remaining <= 0:
@@ -654,6 +664,7 @@ def train():
                             mb_v_loss += v_loss.item() * weight
                             mb_bc_loss += bc.item() * weight
                             mb_ent += ent.mean().item() * weight
+                            mb_cell_ent += cell_ent.mean().item() * weight
                             mb_approx_kl += approx_kl.item() * weight
                             mb_clip_fraction += clip_fraction.item() * weight
                     except torch.cuda.OutOfMemoryError:
@@ -689,6 +700,7 @@ def train():
                 metrics["value_loss"] += mb_v_loss
                 metrics["bc_loss"]    += mb_bc_loss
                 metrics["entropy"]    += mb_ent
+                metrics["cell_entropy"] += mb_cell_ent
                 metrics["approx_kl"]  += mb_approx_kl
                 metrics["clip_fraction"] += mb_clip_fraction
                 metrics["n_batches"]  += 1
@@ -1098,7 +1110,15 @@ def train():
         actor_stepped = (critic_warmup_remaining <= 0) and (warm >= 1.0)
         if actor_stepped:
             bc_decay_step += 1
-        metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_dir, ds_gate, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms)
+        metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_dir, ds_gate, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms, ent_coef)
+        #entropy controller: hold the cell picks' summed entropy near ENT_TARGET. Only adapts when
+        #the actor actually stepped, for the same reason as the KL controller below
+        measured_cell_ent = metrics["cell_entropy"] / max(1, metrics["n_batches"])
+        if actor_stepped:
+            if measured_cell_ent < ENT_TARGET:
+                ent_coef = min(ENT_COEF_BOUNDS[1], ent_coef * ENT_COEF_STEP)
+            else:
+                ent_coef = max(ENT_COEF_BOUNDS[0], ent_coef / ENT_COEF_STEP)
         #KL-tracking LR controller: the joint log-prob made the old fixed LR wildly
         #mis-scaled in both directions, so steer the actor LR to hold approx_kl near TARGET_KL
         #only adapt on updates where the actor actually moved — during LR warmup and the
@@ -1128,6 +1148,8 @@ def train():
             "value_loss": round(metrics["value_loss"] / nb, 5),
             "bc_loss":    round(metrics["bc_loss"] / nb, 5),
             "entropy":    round(metrics["entropy"] / nb, 5),
+            "cell_entropy": round(metrics["cell_entropy"] / nb, 5),
+            "ent_coef":   round(ent_coef, 5),
             "approx_kl":  round(metrics["approx_kl"] / nb, 5),
             "clip_frac":  round(metrics["clip_fraction"] / nb, 4),
             "bc_coef":    round(lam_bc, 4),
@@ -1185,6 +1207,7 @@ def train():
                          "bc_decay_step": bc_decay_step,
                          "kl_lr_scale": kl_lr_scale,
                          "kl_ema": kl_ema,
+                         "ent_coef": ent_coef,
                          "rng_state": torch.get_rng_state(),
                          "np_rng_state": np.random.get_state()}, path)
             with open(log_path, "a") as f:
@@ -1210,7 +1233,7 @@ def train():
                 print(f"│  Episodes: {episodes:<8}  Steps: {total_steps:<10}  LR: {cur_lr:.2e}")
                 print(f"│  BC Coef:   {lam_bc:.4f}    Policy Loss: {row['actor_loss']:>+.5f}")
                 print(f"│  Value Loss: {row['value_loss']:.5f}    LR scale: {kl_lr_scale:.2f} (KL ema: {kl_ema if kl_ema is None else round(kl_ema, 4)})")
-                print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f} (KL: {row['approx_kl']:.4f}, Clip: {row['clip_frac']:.1%})")
+                print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f} (cells {row['cell_entropy']:.3f}, coef {ent_coef:.4f}; KL: {row['approx_kl']:.4f}, Clip: {row['clip_frac']:.1%})")
                 ret_str = f"{row['mean_return']:.3f}" if row['mean_return'] is not None else "—"
                 pac_str = f"{row['pacman_score']:.1f}" if row['pacman_score'] is not None else "—"
                 kill_str = f"{row['kill_rate']:.1%}" if row.get('kill_rate') is not None else "—"
@@ -1238,6 +1261,7 @@ def train():
                          "bc_decay_step": bc_decay_step,
                          "kl_lr_scale": kl_lr_scale,
                          "kl_ema": kl_ema,
+                         "ent_coef": ent_coef,
                          "rng_state": torch.get_rng_state(),
                          "np_rng_state": np.random.get_state()}, path)
             with open(log_path, "a") as f:

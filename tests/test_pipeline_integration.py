@@ -81,7 +81,7 @@ def test_actor_critic_shapes_and_logprobs():
     assert dir_lp.shape == (2, 1), f"dir_lp shape mismatch: {dir_lp.shape}"
     assert gate.shape == (2, 1), f"gate shape mismatch: {gate.shape}"
     assert gate_lp.shape == (2, 1), f"gate_lp shape mismatch: {gate_lp.shape}"
-    eval_lp, eval_ent, _pool, _vec, flat_logits, speed_params = actor.evaluate_actions(sp, ve, vm, idx, speed, direction, gate)
+    eval_lp, eval_ent, _pool, _vec, flat_logits, speed_params, _cell_ent = actor.evaluate_actions(sp, ve, vm, idx, speed, direction, gate)
     assert eval_lp.shape == (2, 6), f"eval_lp shape mismatch: {eval_lp.shape}"
     assert eval_ent.shape == (2,), f"eval_ent shape mismatch: {eval_ent.shape}"
     rollout_lp = torch.cat([lp, speed_lp, dir_lp, gate_lp], dim=1)

@@ -170,7 +170,8 @@ class GhostActor(nn.Module):
         Returns
         -------
         logprobs    : (B, K+3)      — per-head log-probs: K cell picks, speed, direction, gate
-        entropy     : (B,)          — mean entropy across K steps + speed + direction entropy
+        entropy     : (B,)          — summed entropy: K cell picks + speed + direction + gate
+        cell_ent    : (B,)          — summed entropy of the K cell picks only (exploration bonus target)
         pool        : (B, 128)      — spatial pool token
         vec         : (B, 128)      — vector embedding token
         flat_logits : (B, H*W)      — reusable for BC loss (NOT detached)
@@ -224,9 +225,13 @@ class GhostActor(nn.Module):
         #head by head. Summing into one joint log-prob let a single low-probability tail sample
         #(2nd/3rd sequential pick, Beta tail) blow up the whole ratio and inflate approx_kl
         logprobs = torch.cat([torch.stack(lp_list, 1), speed_lp.unsqueeze(1), dir_lp.unsqueeze(1), gate_lp.unsqueeze(1)], dim=1)
-        entropy  = torch.stack(ent_list, 1).sum(1) + speed_ent + dir_ent + gate_ent
+        #cell_ent is the summed entropy of the K categorical cell picks alone. The Beta heads have
+        #negative, unbounded-below entropy, so a bonus on the total let the trunk trade cell-pick
+        #diversity against speed-head sharpness; the exploration bonus targets cell_ent only
+        cell_ent = torch.stack(ent_list, 1).sum(1)
+        entropy  = cell_ent + speed_ent + dir_ent + gate_ent
         speed_params = torch.stack([dist_speed.concentration1, dist_speed.concentration0], dim=1)
-        return logprobs, entropy, pool, vec, flat_clean, speed_params
+        return logprobs, entropy, pool, vec, flat_clean, speed_params, cell_ent
 
 class GhostCritic(nn.Module):
     #Independent CNN-based Critic: evaluates each ghost state
