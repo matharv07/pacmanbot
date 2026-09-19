@@ -139,7 +139,7 @@ def test_worker_swarm_catch_bonus():
     # Step 0 frames to evaluate kill logic
     # Perform dummy actions
     actions = {0: ([(10, 10)], [1.0], 1.0), 1: ([(10, 10)], [1.0], 1.0)}
-    obs, rewards, done, info = env.step(actions, bc_prob=0.0)
+    obs, rewards, done, info = env.step(actions, want_bc=False)
     
     print(f"Pincer kill rewards: {rewards}, Done: {done}, Caught: {info.get('pacman_caught')}")
     assert done, "Game should end when Pacman is caught"

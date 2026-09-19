@@ -21,7 +21,7 @@ if __name__ == '__main__':
             scores = np.zeros((rows, cols), dtype=np.float32)
             scores[r, c] = 1.0
             action_dict[gid] = ([(r, c)], scores, 1.0)
-        env.step(action_dict, bc_prob=0.0)
+        env.step(action_dict, want_bc=False)
     profiler.disable()
     with open('profile.txt', 'w') as f:
         stats = pstats.Stats(profiler, stream=f).sort_stats('cumtime')

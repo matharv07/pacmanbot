@@ -169,7 +169,7 @@ class GhostActor(nn.Module):
 
         Returns
         -------
-        logprobs    : (B,)          — sum of log-probs for the K actions + speed + direction
+        logprobs    : (B, K+3)      — per-head log-probs: K cell picks, speed, direction, gate
         entropy     : (B,)          — mean entropy across K steps + speed + direction entropy
         pool        : (B, 128)      — spatial pool token
         vec         : (B, 128)      — vector embedding token
@@ -220,8 +220,10 @@ class GhostActor(nn.Module):
         else:
             gate_lp = torch.zeros_like(speed_lp)
             gate_ent = torch.zeros_like(speed_ent)
-        #every component is emitted each step, so the ratio uses the true joint log-prob
-        logprobs = torch.stack(lp_list, 1).sum(1) + speed_lp + dir_lp + gate_lp
+        #per-head log-probs (K cell picks, speed, direction, gate) so PPO can clip and measure KL
+        #head by head. Summing into one joint log-prob let a single low-probability tail sample
+        #(2nd/3rd sequential pick, Beta tail) blow up the whole ratio and inflate approx_kl
+        logprobs = torch.cat([torch.stack(lp_list, 1), speed_lp.unsqueeze(1), dir_lp.unsqueeze(1), gate_lp.unsqueeze(1)], dim=1)
         entropy  = torch.stack(ent_list, 1).sum(1) + speed_ent + dir_ent + gate_ent
         speed_params = torch.stack([dist_speed.concentration1, dist_speed.concentration0], dim=1)
         return logprobs, entropy, pool, vec, flat_clean, speed_params

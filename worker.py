@@ -45,10 +45,8 @@ class Env:
         self.frame      = 0
         self.shaper     = RewardShaper()
         self.recent_nom: dict[int, np.ndarray] = {}
-        self._cached_ht: dict[int, np.ndarray] = {}   #heuristic targets cached at auction boundary
+        self._cached_ht: dict[int, np.ndarray] = {}   #heuristic BC targets for the CURRENT observation
         self._cached_hspeed: dict[int, float] = {}
-        self._cached_htasks: dict[int, list] = {}
-        self._cached_hdists: dict[int, dict] = {}
         self.max_frames = int(world_height * world_width * 2) + 1000
         self._pending_pred = None
         self._stored_predictor_weights = None
@@ -104,32 +102,8 @@ class Env:
         r = int(self.world_height * self.obs_resolution)
         c = int(self.world_width * self.obs_resolution)
         self.recent_nom = { i: np.zeros((r, c), dtype=np.float32) for i in range(self.num_ghosts) }
-        self._cached_ht = {}
-        self._cached_hspeed = {}
-        self._cached_htasks = {}
-        self._cached_hdists = {}
-        #pre-populate heuristic targets for the initial observation
-        for gid in self.ghosts:
-            g = self.ghosts[gid]
-            if not g.dead:
-                h_tasks, h_task_dists = heuristic_generate_tasks(g, self.frame)
-                self._cached_htasks[gid] = h_tasks
-                self._cached_hdists[gid] = h_task_dists
-                target = np.zeros((r, c), dtype=np.float32)
-                for t in h_tasks[:3]:
-                    r_t, c_t = int(t.target_pos[0] * self.obs_resolution), int(t.target_pos[1] * self.obs_resolution)
-                    if 0 <= r_t < r and 0 <= c_t < c:
-                        target[r_t, c_t] = t.score
-                        for dr in (-1, 0, 1):
-                            for dc in (-1, 0, 1):
-                                if dr == 0 and dc == 0: continue
-                                nr, nc = r_t + dr, c_t + dc
-                                if 0 <= nr < r and 0 <= nc < c:
-                                    wy = (float(nr) + 0.5) / self.obs_resolution
-                                    wx = (float(nc) + 0.5) / self.obs_resolution
-                                    if self.world.is_passable(wx, wy, radius=0.35):
-                                        target[nr, nc] += t.score * 0.5
-                self._cached_ht[gid] = target
+        #heuristic BC targets for the initial observation (cheap: once per episode)
+        self._refresh_bc_targets()
         for gid in self.ghosts:
             self.ghosts[gid].cbba_agent.reset_caches()
         return self.observe()
@@ -170,44 +144,47 @@ class Env:
                     z((0, R, C)), z((0, 1)), z((GLOBAL_SPATIAL_CH, R, C)), (R, C))
         return (alive, np.stack(sp), np.stack(ve), np.stack(vm), np.stack(ht), np.stack(hs), global_sp, (R, C))
 
-    def step(self, action_dict: dict, bc_prob: float = 0.0):
-        info_heuristic_merges = 0
-        info_total_auctions = 0
+    def _refresh_bc_targets(self):
+        """Rebuild the heuristic (allocator) BC targets for every alive ghost from the CURRENT world
+        state, i.e. the state the returned observation describes. Previously these were computed at
+        the top of step() before the ghosts moved and refreshed only every 2 decisions, so the BC
+        target lagged the observation it was paired with by 6-12 frames."""
+        R = int(self.world_height * self.obs_resolution)
+        C = int(self.world_width * self.obs_resolution)
+        self._cached_ht = {}
+        self._cached_hspeed = {}
+        for gid, g in self.ghosts.items():
+            if g.dead:
+                continue
+            h_tasks, _h_dists = heuristic_generate_tasks(g, self.frame)
+            target = np.zeros((R, C), dtype=np.float32)
+            if h_tasks:
+                self._cached_hspeed[gid] = mult_to_throttle(h_tasks[0].target_speed)
+                for t in h_tasks[:3]:
+                    r_t, c_t = int(t.target_pos[0] * self.obs_resolution), int(t.target_pos[1] * self.obs_resolution)
+                    if 0 <= r_t < R and 0 <= c_t < C:
+                        target[r_t, c_t] = t.score
+                        for dr in (-1, 0, 1):
+                            for dc in (-1, 0, 1):
+                                if dr == 0 and dc == 0: continue
+                                nr, nc = r_t + dr, c_t + dc
+                                if 0 <= nr < R and 0 <= nc < C:
+                                    wy = (float(nr) + 0.5) / self.obs_resolution
+                                    wx = (float(nc) + 0.5) / self.obs_resolution
+                                    if self.world.is_passable(wx, wy, radius=0.35):
+                                        target[nr, nc] += t.score * 0.5
+            else:
+                self._cached_hspeed[gid] = mult_to_throttle(1.0)
+            self._cached_ht[gid] = target
+
+    def step(self, action_dict: dict, want_bc: bool = False):
+        """want_bc: build heuristic BC targets for the returned observation (costs ~10% worker time).
+        RL nominations always replace the heuristic's task generation — nothing is 'mixed'."""
         alive = [gid for gid, g in self.ghosts.items() if not g.dead]
         R = int(self.world_height * self.obs_resolution)
         C = int(self.world_width * self.obs_resolution)
         for gid in alive:
             g = self.ghosts[gid]
-            HEURISTIC_EVERY = DECISION_INTERVAL * 2
-            need_h_tasks = (bc_prob > 0.0) and ((self.frame % HEURISTIC_EVERY == 0) or (gid not in self._cached_ht))
-            if need_h_tasks:
-                h_tasks, h_task_dists = heuristic_generate_tasks(g, self.frame)
-                self._cached_htasks[gid] = h_tasks
-                self._cached_hdists[gid] = h_task_dists
-                target = np.zeros((R, C), dtype=np.float32)
-                if h_tasks:
-                    self._cached_hspeed[gid] = mult_to_throttle(h_tasks[0].target_speed)
-                    for t in h_tasks[:3]:
-                        r_t, c_t = int(t.target_pos[0] * self.obs_resolution), int(t.target_pos[1] * self.obs_resolution)
-                        if 0 <= r_t < R and 0 <= c_t < C:
-                            target[r_t, c_t] = t.score
-                            for dr in (-1, 0, 1):
-                                for dc in (-1, 0, 1):
-                                    if dr == 0 and dc == 0: continue
-                                    nr, nc = r_t + dr, c_t + dc
-                                    if 0 <= nr < R and 0 <= nc < C:
-                                        wy = (float(nr) + 0.5) / self.obs_resolution
-                                        wx = (float(nc) + 0.5) / self.obs_resolution
-                                        if self.world.is_passable(wx, wy, radius=0.35):
-                                            target[nr, nc] += t.score * 0.5
-                else:
-                    self._cached_hspeed[gid] = mult_to_throttle(1.0)
-                self._cached_ht[gid] = target
-            else:
-                h_tasks = self._cached_htasks.get(gid, []) if bc_prob > 0.0 else []
-                if gid not in self._cached_ht:
-                    self._cached_ht[gid] = np.zeros((R, C), dtype=np.float32)
-                    self._cached_hspeed[gid] = 1.0
             if gid in action_dict:      #merge RL tasks with CBBA
                 act_data = action_dict[gid]
                 indices, scores_map, speed = act_data[0], act_data[1], act_data[2]
@@ -249,7 +226,6 @@ class Env:
                     if gid in action_dict:
                         g = self.ghosts[gid]
                         g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
-                        info_total_auctions += 1
                         h_dists = g.plan_dists(all_targets)
                         g.cbba_agent._phase1(g, all_pooled_tasks, h_dists)
         rewards = {gid: 0.0 for gid in alive}
@@ -436,6 +412,14 @@ class Env:
                     rewards[gid] += (0.0 - self.shaper._prev.pop(gid, 0.0)) * 0.3
                 else:
                     rewards[gid] += self.shaper.shaping(g, self.ghosts)
-        obs = self.observe() if not done else None
+        if done:
+            obs = None
+        else:
+            if want_bc:
+                self._refresh_bc_targets()
+            else:
+                self._cached_ht = {}
+                self._cached_hspeed = {}
+            obs = self.observe()
         pacman_caught = bool(getattr(self.player, "dead", False))
-        return obs, rewards, done, {"pacman_score": getattr(self.player, "score", 0), "heuristic_merges": info_heuristic_merges, "total_auctions": info_total_auctions, "pacman_caught": pacman_caught, "pred_samples": pred_samples}
+        return obs, rewards, done, {"pacman_score": getattr(self.player, "score", 0), "pacman_caught": pacman_caught, "pred_samples": pred_samples}

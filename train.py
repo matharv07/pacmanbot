@@ -65,14 +65,23 @@ MAX_GRAD_NORM   = 0.5
 LR              = 1.2e-4
 LR_CRITIC       = 3.0e-4
 STAGE_BC_INIT   = [0.35, 0.25, 0.15, 0.08, 0.04]
-BC_FLOOR        = 0.02
+BC_FLOOR        = 0.0               #anneal all the way off: a permanent pull toward the 0.667-kill heuristic caps the policy
 K_NOMINATIONS   = 3
 LOG_DIR         = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file__), "logs"))
 CKPT_DIR        = os.environ.get("CKPT_DIR", os.path.join(os.path.dirname(__file__), "checkpoints"))
-BC_ANNEAL_UPDATES = 120
-TARGET_KL       = 0.025
+#BC schedule is counted in ACTOR updates (ticks only when the actor actually stepped), so it no
+#longer overlaps the LR warmup or the post-advance critic warm-up
+BC_HOLD_UPDATES   = int(os.environ.get("BC_HOLD_UPDATES", "60"))     #full coefficient while the policy absorbs the heuristic
+BC_ANNEAL_UPDATES = int(os.environ.get("BC_ANNEAL_UPDATES", "150"))  #then linear anneal to BC_FLOOR
+#KL controller. approx_kl is now the SUM of per-head KL estimates over K+3 heads (3 cell picks,
+#speed, direction, gate). Calibrated on a 45-update smoke run: at 2.5x base LR the per-head sum
+#settled at ~0.011 with 2-6% clip fraction, so the band [target/1.5, target*1.5] = [0.01, 0.0225]
+#brackets that operating point instead of pinning the controller against a bound
+TARGET_KL       = float(os.environ.get("TARGET_KL", "0.015"))
+KL_EMA_ALPHA    = 0.5               #smoothing of the per-update KL before the controller looks at it
+KL_LR_STEP      = 1.15              #symmetric multiplicative step (old ±6%/-15% drifted the scale down)
 LR_WARMUP_UPDATES = 20              #linear warmup before cosine decay
-KL_LR_SCALE_BOUNDS = (0.25, 6.0)    #range the KL controller may scale the base LR by
+KL_LR_SCALE_BOUNDS = (0.2, 2.5)     #range the KL controller may scale the base LR by (old 6x ceiling caused the overshoot)
 CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -136,8 +145,7 @@ def push_to_discord(metrics_row):
         f"Approx KL:        {metrics_row['approx_kl']:.5f}\n"
         f"Clip Fraction:    {metrics_row['clip_frac']:.1%}\n"
         f"-----------------------------------------\n"
-        f"BC Coef / Prob:   {bc_coef:.4f} / {metrics_row.get('bc_prob', 0.0):.4f}\n"
-        f"Merge Rate:       {metrics_row.get('merge_rate', 0.0):.1%}\n"
+        f"BC Coef:          {bc_coef:.4f}\n"
         f"Timings:          Rollout {metrics_row.get('t_rollout', 0.0)}s | PPO {metrics_row.get('t_ppo', 0.0)}s\n"
         f"```")
     try:
@@ -242,8 +250,8 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power):
             cmd, data = conn.recv()
             if cmd == "step":
                 if isinstance(data, tuple) and len(data) == 2:
-                    a, bc_prob = data
-                    result = env.step(a, bc_prob)
+                    a, want_bc = data
+                    result = env.step(a, want_bc)
                 else:
                     result = env.step(data)
                 obs, rew, done, info = result
@@ -337,16 +345,16 @@ class VecEnv:
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
         return self.current_obs
 
-    def step(self, actions: list[dict], bc_prob: float = 0.0):
+    def step(self, actions: list[dict], want_bc: bool = False):
         if not actions:
             print("vec_env.step() with empty actions")
             for p in self.parent:
-                p.send(("step", ({}, bc_prob)))
+                p.send(("step", ({}, want_bc)))
             results = _recv_unordered(self.parent, procs=self.procs)
             print("vec_env.step() returned")
         else:
             for p, a in zip(self.parent, actions):
-                p.send(("step", (a, bc_prob)))
+                p.send(("step", (a, want_bc)))
             results = _recv_unordered(self.parent, procs=self.procs)
         obs_list, rew_list, done_list, info_list = [], [], [], []
         for i, (obs, rew, done, info) in enumerate(results):
@@ -431,6 +439,7 @@ def train():
     ema_return   = 0.0
     bc_decay_step = 0
     kl_lr_scale  = 1.0
+    kl_ema       = None   #EMA of measured approx_kl driving the LR controller
     if "--resume" in sys.argv:
         ckpts = sorted(glob.glob(os.path.join(CKPT_DIR, "ckpt_*.pt")), key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[1]))
         if ckpts:
@@ -492,6 +501,7 @@ def train():
             ema_return   = ckpt.get("ema_return", 0.0)
             bc_decay_step = ckpt.get("bc_decay_step", 0)
             kl_lr_scale  = ckpt.get("kl_lr_scale", 1.0)
+            kl_ema       = ckpt.get("kl_ema", None)
             global critic_warmup_remaining
             critic_warmup_remaining = ckpt.get("critic_warmup_remaining", 0)
             if "rng_state" in ckpt:
@@ -596,14 +606,22 @@ def train():
                                 mb_gsp_unique = b_gsp_unique[unique_ids]
                                 mb_c_pool = critic.encode_spatial(mb_gsp_unique)
                                 v_pred = critic.forward_from_pool(mb_c_pool[inv_idx], mb_cve).squeeze(-1)
+                                #per-head PPO: (B, K+3) log-ratios clipped head by head. At ratio≈1 the
+                                #gradient equals the joint objective's, but one tail sample can no longer
+                                #saturate the whole ratio. The direction head only acts when the hijack
+                                #gate fired, so on gate=0 samples its log-ratio is zeroed (pure noise otherwise)
                                 log_ratio = torch.clamp(new_lp - mb_olp, -10.0, 10.0)
+                                head_w = torch.ones_like(log_ratio)
+                                head_w[:, K_NOMINATIONS + 1] = mb_gate.reshape(-1).float()
+                                log_ratio = log_ratio * head_w
                                 ratio = torch.exp(log_ratio)
                                 with torch.no_grad():
-                                    approx_kl = 0.5 * log_ratio.pow(2).mean()
-                                    clip_fraction = (torch.abs(ratio - 1.0) > CLIP_EPS).float().mean()
-                                s1 = ratio * mb_adv
-                                s2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * mb_adv
-                                a_loss = -torch.min(s1, s2).mean()
+                                    approx_kl = (0.5 * log_ratio.pow(2)).sum(dim=1).mean()
+                                    clip_fraction = ((torch.abs(ratio - 1.0) > CLIP_EPS).float() * head_w).sum() / head_w.sum().clamp(min=1.0)
+                                adv_h = mb_adv.unsqueeze(1)
+                                s1 = ratio * adv_h
+                                s2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * adv_h
+                                a_loss = -torch.min(s1, s2).sum(dim=1).mean()
                                 v_loss = F.smooth_l1_loss(v_pred, ret_rms(mb_ret))
                                 if lam_bc > 1e-6:
                                     mb_ht_masked = mb_ht * mb_vm.float()
@@ -705,10 +723,13 @@ def train():
         for pg in opt_critic.param_groups:
             pg['_base_lr'] = pg.get('_base_lr', LR_CRITIC)
             pg['lr'] = pg['_base_lr'] * critic_mult
+        #BC schedule in actor updates: hold at the stage's initial coefficient, then anneal to BC_FLOOR.
+        #bc_decay_step only ticks when the actor stepped, so warmups no longer eat the imitation phase
         stage_bc_init = STAGE_BC_INIT[min(curriculum.stage_idx, len(STAGE_BC_INIT) - 1)]
-        bc_frac = max(0.0, 1.0 - bc_decay_step / BC_ANNEAL_UPDATES)
+        anneal_pos = max(0, bc_decay_step - BC_HOLD_UPDATES)
+        bc_frac = max(0.0, 1.0 - anneal_pos / max(1, BC_ANNEAL_UPDATES))
         lam_bc = max(BC_FLOOR, stage_bc_init * bc_frac)
-        bc_prob = lam_bc
+        bc_active = lam_bc > 1e-6   #workers only build heuristic targets while BC is on
         t_start_rollout = time.time()
         #per-env, per-step storage (lists of length ROLLOUT_STEPS)
         buf_spatial   = [[] for _ in range(NUM_ENVS)]
@@ -731,8 +752,6 @@ def train():
         ep_returns       = []
         ep_pacman_scores = []
         ep_kills         = []
-        ep_heuristic_merges = 0
-        ep_total_auctions = 0
         env_pred_trajs = [[] for _ in range(NUM_ENVS)]
         completed_pred_seqs = []
         for _ in range(ROLLOUT_STEPS):
@@ -763,7 +782,7 @@ def train():
                     buf_speeds[e].append(np.empty((0, 1), dtype=np.float32))
                     buf_directions[e].append(np.empty((0, 1), dtype=np.float32))
                     buf_gates[e].append(np.empty((0, 1), dtype=np.float32))
-                    buf_logprobs[e].append(np.empty((0,), dtype=np.float32))
+                    buf_logprobs[e].append(np.empty((0, K_NOMINATIONS + 3), dtype=np.float32))
                     continue
                 #Pad trimmed observations to current stage size for CNN
                 sp_padded = _pad_spatial(sp, target_h=stage.rows, target_w=stage.cols)
@@ -877,11 +896,11 @@ def train():
                     buf_speeds[e].append(e_spd)
                     buf_directions[e].append(e_dir)
                     buf_gates[e].append(e_gate)
-                    buf_logprobs[e].append(e_lp.sum(axis=1) + e_spd_lp.squeeze(-1) + e_dir_lp.squeeze(-1) + e_gate_lp.squeeze(-1))
+                    buf_logprobs[e].append(np.concatenate([e_lp, e_spd_lp.reshape(n_g, 1), e_dir_lp.reshape(n_g, 1), e_gate_lp.reshape(n_g, 1)], axis=1).astype(np.float32))
                     v_dict = {gids[i]: float(e_val[i]) for i in range(n_g)}
                     buf_values[e].append(v_dict)
                     offset += n_g
-            obs_list, rew_list, done_list, info_list = vec_env.step(step_actions, bc_prob)
+            obs_list, rew_list, done_list, info_list = vec_env.step(step_actions, bc_active)
             for e in range(NUM_ENVS):
                 if "pred_samples" in info_list[e] and info_list[e]["pred_samples"]:
                     env_pred_trajs[e].extend(info_list[e]["pred_samples"])
@@ -900,8 +919,6 @@ def train():
                     ep_returns.append(current_returns[e])
                     ep_pacman_scores.append(info_list[e].get("pacman_score", 0))
                     ep_kills.append(1.0 if info_list[e].get("pacman_caught", False) else 0.0)
-                    ep_heuristic_merges += info_list[e].get("heuristic_merges", 0)
-                    ep_total_auctions += info_list[e].get("total_auctions", 0)
                     current_returns[e] = 0.0
         total_steps += ROLLOUT_STEPS * NUM_ENVS
         for e in range(NUM_ENVS):
@@ -1068,7 +1085,6 @@ def train():
         indices = np.arange(N_total)
         #normalize advantages GLOBALLY across the entire batch, not per-minibatch
         ds_adv = (ds_adv - ds_adv.mean()) / (ds_adv.std() + 1e-8)
-        realized_merge_rate = (ep_heuristic_merges / ep_total_auctions) if ep_total_auctions > 0 else 0.0
         t_rollout = time.time() - t_start_rollout
         mean_ret = round(float(np.mean(ep_returns)), 3) if ep_returns else None
         mean_pac = round(float(np.mean(ep_pacman_scores)), 1) if ep_pacman_scores else None
@@ -1078,9 +1094,10 @@ def train():
                 ema_return = mean_ret
             else:
                 ema_return = 0.95 * ema_return + 0.05 * mean_ret
-        bc_decay_step += 1
         #synchronous on-policy PPO optimization
         actor_stepped = (critic_warmup_remaining <= 0) and (warm >= 1.0)
+        if actor_stepped:
+            bc_decay_step += 1
         metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_dir, ds_gate, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms)
         #KL-tracking LR controller: the joint log-prob made the old fixed LR wildly
         #mis-scaled in both directions, so steer the actor LR to hold approx_kl near TARGET_KL
@@ -1088,10 +1105,14 @@ def train():
         #post-advance critic warm-up the measured KL is ~0 and would ratchet the scale up for nothing
         measured_kl = metrics["approx_kl"] / max(1, metrics["n_batches"])
         if actor_stepped:
-            if measured_kl < 0.5 * TARGET_KL:
-                kl_lr_scale = min(KL_LR_SCALE_BOUNDS[1], kl_lr_scale * 1.06)
-            elif measured_kl > 1.5 * TARGET_KL:
-                kl_lr_scale = max(KL_LR_SCALE_BOUNDS[0], kl_lr_scale * 0.85)
+            #smooth the noisy per-update KL and take symmetric steps in log space. The old raw-value,
+            #+6%/-15% controller random-walked the scale to 5.7x during warmup, overshot, then sat on
+            #the floor for 1800 updates because the joint-ratio KL kept rising as the policy sharpened
+            kl_ema = measured_kl if kl_ema is None else (KL_EMA_ALPHA * measured_kl + (1.0 - KL_EMA_ALPHA) * kl_ema)
+            if kl_ema < TARGET_KL / 1.5:
+                kl_lr_scale = min(KL_LR_SCALE_BOUNDS[1], kl_lr_scale * KL_LR_STEP)
+            elif kl_ema > TARGET_KL * 1.5:
+                kl_lr_scale = max(KL_LR_SCALE_BOUNDS[0], kl_lr_scale / KL_LR_STEP)
         #update return running statistics after PPO optimization
         ret_rms.update(ds_ret)
         actor_rollout.load_state_dict(actor.state_dict())
@@ -1110,8 +1131,7 @@ def train():
             "approx_kl":  round(metrics["approx_kl"] / nb, 5),
             "clip_frac":  round(metrics["clip_fraction"] / nb, 4),
             "bc_coef":    round(lam_bc, 4),
-            "bc_prob":    round(bc_prob, 4),
-            "merge_rate": round(realized_merge_rate, 4),
+            "kl_ema":     (round(kl_ema, 5) if kl_ema is not None else None),
             "mean_return": mean_ret,
             "pacman_score": mean_pac,
             "kill_rate": kill_rate,
@@ -1136,8 +1156,9 @@ def train():
             vec_env.sync_predictor(predictor.state_dict())
             torch.cuda.empty_cache()
             current_returns = [0.0] * NUM_ENVS
-            #reset BC decay so each new stage gets fresh heuristic guidance
+            #reset BC decay so each new stage gets fresh heuristic guidance; restart the KL EMA too
             bc_decay_step = 0
+            kl_ema = None
             #decay the critic base LR by 0.8× per stage advance, with a floor. The actor's
             #effective LR is KL-controlled, so it re-finds its own step size on the new stage.
             for pg in opt_critic.param_groups:
@@ -1163,6 +1184,7 @@ def train():
                          "ema_return": ema_return,
                          "bc_decay_step": bc_decay_step,
                          "kl_lr_scale": kl_lr_scale,
+                         "kl_ema": kl_ema,
                          "rng_state": torch.get_rng_state(),
                          "np_rng_state": np.random.get_state()}, path)
             with open(log_path, "a") as f:
@@ -1187,7 +1209,7 @@ def train():
                 print(f"│  Phase: {phase}   Curriculum: Stage {curriculum.stage_idx} ({stg.rows}×{stg.cols}, {stg.n_ghosts}g)")
                 print(f"│  Episodes: {episodes:<8}  Steps: {total_steps:<10}  LR: {cur_lr:.2e}")
                 print(f"│  BC Coef:   {lam_bc:.4f}    Policy Loss: {row['actor_loss']:>+.5f}")
-                print(f"│  BC Prob:   {bc_prob:.4f} ({row['merge_rate']:.1%} merge)    Value Loss: {row['value_loss']:.5f}")
+                print(f"│  Value Loss: {row['value_loss']:.5f}    LR scale: {kl_lr_scale:.2f} (KL ema: {kl_ema if kl_ema is None else round(kl_ema, 4)})")
                 print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f} (KL: {row['approx_kl']:.4f}, Clip: {row['clip_frac']:.1%})")
                 ret_str = f"{row['mean_return']:.3f}" if row['mean_return'] is not None else "—"
                 pac_str = f"{row['pacman_score']:.1f}" if row['pacman_score'] is not None else "—"
@@ -1215,6 +1237,7 @@ def train():
                          "ema_return": ema_return,
                          "bc_decay_step": bc_decay_step,
                          "kl_lr_scale": kl_lr_scale,
+                         "kl_ema": kl_ema,
                          "rng_state": torch.get_rng_state(),
                          "np_rng_state": np.random.get_state()}, path)
             with open(log_path, "a") as f:

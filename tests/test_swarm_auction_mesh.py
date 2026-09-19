@@ -187,7 +187,7 @@ def test_env_mesh_rewards_and_common_pool():
         0: ([(2, 2)], [1.0], 1.0),
         1: ([(2, 6)], [1.0], 1.0)
     }
-    obs, rewards, done, info = env.step(actions, bc_prob=0.0)
+    obs, rewards, done, info = env.step(actions, want_bc=False)
     assert 0 in rewards and 1 in rewards
 
     # Separate ghosts beyond 12.0: g0 at (2.0, 2.0), g1 at (18.0, 24.0) (dist > 25.0)
@@ -198,7 +198,7 @@ def test_env_mesh_rewards_and_common_pool():
     env.player.y = 10.0
     env.player.x = 10.0
     env.shaper.reset()
-    obs, rewards_isolated, done, info = env.step(actions, bc_prob=0.0)
+    obs, rewards_isolated, done, info = env.step(actions, want_bc=False)
     assert 0 in rewards_isolated and 1 in rewards_isolated
     assert not math.isnan(rewards_isolated[0]) and not math.isnan(rewards[0])
 
@@ -225,7 +225,7 @@ def test_cross_ghost_task_pooling_and_bidding():
 
     # Both ghosts nominate both waypoints into the common pool
     actions = {0: ([(r0, c0), (r1, c1)], [5.0, 5.0], 1.0), 1: ([(r0, c0), (r1, c1)], [5.0, 5.0], 1.0)}
-    obs, rewards, done, info = env.step(actions, bc_prob=0.0)
+    obs, rewards, done, info = env.step(actions, want_bc=False)
 
     # Within mesh radio range, consensus resolves:
     # Ghost 0 wins task near itself, Ghost 1 wins task near itself
@@ -279,8 +279,9 @@ def test_belief_grounded_heuristic_tasks():
     assert any(math.hypot(t.target_pos[0] - target_pos[0], t.target_pos[1] - target_pos[1]) < 2.0 for t in hunt_tasks)
 
     # 2. Verify worker.py's _cached_ht generates target heatmap peak around belief mode
-    actions = {0: ([], [], 1.0), 1: ([], [], 1.0)}
-    env.step(actions, bc_prob=1.0)
+    #targets are built from the CURRENT state (post-step), so call the builder directly instead
+    #of stepping the world, which would advance the belief map away from the injected mode
+    env._refresh_bc_targets()
 
     cached_map = env._cached_ht[0]
     assert np.max(cached_map) > 0.0, "Expected non-zero target heatmap for Ghost 0"

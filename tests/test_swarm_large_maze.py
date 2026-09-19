@@ -15,7 +15,7 @@ def test_stage4_false_death_elimination():
 
     false_dead_events = 0
     for step in range(150):
-        obs, rewards, done, info = env.step({}, bc_prob=1.0)
+        obs, rewards, done, info = env.step({}, want_bc=True)
         for gid, g in env.ghosts.items():
             if g.dead:
                 continue
@@ -92,7 +92,7 @@ def test_zero_freeze_frames_stage4():
 
     frozen_count = 0
     for step in range(100):
-        obs, rewards, done, info = env.step({}, bc_prob=1.0)
+        obs, rewards, done, info = env.step({}, want_bc=True)
         for gid, g in env.ghosts.items():
             if g.dead:
                 continue

@@ -59,7 +59,7 @@ def _run_episode(actor, env, stage):
         for i, gid in enumerate(gids):
             pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in idx_np[i]]
             action_dict[gid] = (pairs, scores_np[i], float(speed_np[i].item()), float(dir_np[i].item()), float(gate_np[i].item()))
-        obs, _rewards, done, info = env.step(action_dict, bc_prob=0.0)
+        obs, _rewards, done, info = env.step(action_dict, want_bc=False)
         if done:
             surviving = sum(1 for g in env.ghosts.values() if not g.dead)
             pac_score = float(info.get('pacman_score', 0))

@@ -30,7 +30,7 @@ def test_single_env_rollout_and_step():
     for i, gid in enumerate(gids):
         pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in idx[i].numpy()]
         action_dict[gid] = (pairs, scores[i].numpy(), float(speed[i].item()), float(direction[i].item()), float(gate[i].item()))
-    obs, rewards, done, info = env.step(action_dict, bc_prob=0.0)
+    obs, rewards, done, info = env.step(action_dict, want_bc=False)
     print(f"Step successful. Rewards: {rewards}, Done: {done}, Info: {info}")
     assert "pacman_caught" in info
     assert "pacman_score" in info

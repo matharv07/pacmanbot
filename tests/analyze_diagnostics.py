@@ -88,7 +88,7 @@ def run_diagnostics(ckpt_path: str = None, stage_idx: int = 1, seed: int = 42, m
             action_dict[gid] = (pairs, scores_np[i], float(speed_np[i].item()), float(dir_np[i].item()), float(gate_np[i].item()))
             
         # Step environment
-        obs, rewards, done, info = env.step(action_dict, bc_prob=0.0)
+        obs, rewards, done, info = env.step(action_dict, want_bc=False)
         total_steps += 1
         
         # Check Ghost 0
