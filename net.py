@@ -11,9 +11,9 @@ import torch.nn.functional as F
 from obs import SPATIAL_CH, MAX_H, MAX_W, VEC_DIM, CRITIC_VEC_DIM, GLOBAL_SPATIAL_CH
 
 SPEED_FLOOR   = 0.55
-SPEED_PRIOR_A = 2.6
-SPEED_PRIOR_B = -2.0
-GATE_PRIOR_LOGIT = -2.2
+SPEED_PRIOR_A = 8.0
+SPEED_PRIOR_B = -6.0
+GATE_PRIOR_LOGIT = -3.0
 RL_MAX_DEVIATION = 1.05
 
 def speed_to_mult(throttle):            #throttle in [0,1] -> speed multiplier in [SPEED_FLOOR, 1.0]
@@ -65,15 +65,9 @@ class GhostActor(nn.Module):
         self.res3 = ResBlock(128, 128, cond_dim=128)
         #1×1 conv to logit map (combines 128 local spatial channels + 128 global context channels)
         self.head = nn.Conv2d(256, 1, 1)
-        #continuous speed head (alpha, beta for Beta distribution over the [0,1] throttle)
-        #the throttle is remapped to SPEED_FLOOR..1.0 of the ghost speed cap in worker.py
         self.speed_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 2))
-        #continuous tactical steering head (alpha, beta) — a RESIDUAL rotation of the
-        #heuristic heading, not an absolute angle, so an untrained head is a no-op
         self.dir_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 2))
-        #binary hijack gate: does the policy take over micro-navigation this step?
         self.gate_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 1))
-        #priors: start near the speed cap, steer straight, and defer to the heuristic controller
         nn.init.zeros_(self.speed_head[-1].weight)
         self.speed_head[-1].bias.data = torch.tensor([SPEED_PRIOR_A, SPEED_PRIOR_B])
         nn.init.zeros_(self.dir_head[-1].weight)
@@ -109,7 +103,7 @@ class GhostActor(nn.Module):
         -------
         indices  : (B, K) long — flattened cell indices
         logprobs : (B, K)      — log-prob of each sequential pick
-        scores   : (B, H, W)   — relative preference (softmax / max) in [0, 1] for CBBA
+        scores   : (B, H, W)   — confidence above uniform, log-scaled to [0, 1], for CBBA
         pool     : (B, 128)    — spatial pool for critic token
         vec      : (B, 128)    — vector embedding for critic token
         speed    : (B, 1)      — sampled continuous speed [0, 1]
@@ -118,8 +112,10 @@ class GhostActor(nn.Module):
         feats, pool, vec = self.encode(spatial, vector)
         logits = self.logits_from_features(feats, pool, mask)
         B0 = logits.shape[0]
-        p_flat = torch.softmax(torch.nan_to_num(logits.view(B0, -1), nan=float('-inf')), dim=1)
-        scores = (p_flat / p_flat.max(dim=1, keepdim=True).values.clamp(min=1e-12)).view_as(logits)
+        flat_l = torch.nan_to_num(logits.view(B0, -1), nan=float('-inf'))
+        p_flat = torch.softmax(flat_l, dim=1)
+        n_valid = torch.isfinite(flat_l).sum(dim=1, keepdim=True).clamp(min=2).to(p_flat.dtype)
+        scores = (torch.log(p_flat * n_valid + 1e-12) / torch.log(n_valid)).clamp(0.0, 1.0).view_as(logits)
         scores = torch.nan_to_num(scores, nan=0.0)
         B = spatial.shape[0]
         base_invalid = ~mask.reshape(B, -1)

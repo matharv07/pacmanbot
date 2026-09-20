@@ -14,6 +14,8 @@ ALPHA_MOMENTUM     = 0.15
 MOMENTUM_DECAY     = 15
 TAU_RECENCY        = 60
 MIN_CONFIDENCE     = 0.02
+MERGE_CONF_MIN     = 0.25
+MERGE_CONF_MAX     = 0.85
 LOS_CERTAINTY      = 1.0
 LOST_SPREAD        = 0.60
 COMPRESS_THRESHOLD = 0.0005
@@ -607,7 +609,9 @@ class BeliefMap:
             return
         delta_fss = self.frames_since_sighting - sender_fss
         if delta_fss > 0:
-            confidence = min(0.35, 1.0 - math.exp(-delta_fss / 12.0))
+            recency = math.exp(-sender_fss / 20.0)
+            cap = MERGE_CONF_MIN + (MERGE_CONF_MAX - MERGE_CONF_MIN) * recency
+            confidence = min(cap, 1.0 - math.exp(-delta_fss / 12.0))
         elif delta_fss == 0:
             confidence = 0.05
         else:

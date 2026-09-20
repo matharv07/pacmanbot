@@ -135,7 +135,12 @@ def test_prolonged_silence_orphaned():
 
 
 def test_extended_mesh_potential():
-    """Verify that RewardShaper computes connected component size and applies tension gradient."""
+    """Verify the mesh potential rewards multi-hop reachability and is indifferent to spacing.
+
+    The nearest-peer `tension` penalty was removed 2026-09-20: measured with sensing cut to 4 cells,
+    going from a 2-cell radio to global comms cut deaths 3.70 -> 2.87 but cut kills 0.867 -> 0.800,
+    because a fully shared belief makes ghosts converge and cover less ground. Being reachable is
+    worth a reward; being bunched up is not."""
     shaper = RewardShaper(beta_mesh=3.0)
 
     # 3 ghosts in a chain: g0 at (0, 0), g1 at (0, 7), g2 at (0, 14)
@@ -146,24 +151,22 @@ def test_extended_mesh_potential():
     g2 = DummyGhost(2, y=0.0, x=14.0)
     ghosts = {0: g0, 1: g1, 2: g2}
 
-    # Since min_dist for g0 is 7.0 (<= 8.0), tension is 0.0. All 3 connected: frac_connected = 1.0
+    # all 3 reachable via g1 -> frac_connected = 1.0
     phi0 = shaper._phi_mesh(g0, ghosts)
-    assert math.isclose(phi0, 3.0 * (1.0 - 0.0), abs_tol=1e-3)
+    assert math.isclose(phi0, 3.0, abs_tol=1e-3)
 
-    # Move g1 to (0, 10.0) -> min_dist for g0 is 10.0 (in tension window 8..12)
-    # tension = ((10.0 - 8.0) / 4.0)**2 = (0.5)**2 = 0.25
-    g1.x = 10.0
-    phi0_tension = shaper._phi_mesh(g0, ghosts)
-    expected_phi = 3.0 * (1.0 - 0.5 * 0.25)
-    assert math.isclose(phi0_tension, expected_phi, abs_tol=1e-3)
-    assert phi0_tension < phi0
+    # stretch the chain to the edge of radio range: still fully reachable, so still full reward.
+    # This is the case the old tension term penalised and the new one must not.
+    g1.x = 11.5
+    g2.x = 23.0
+    phi0_stretched = shaper._phi_mesh(g0, ghosts)
+    assert math.isclose(phi0_stretched, 3.0, abs_tol=1e-3)
 
-    # Move g0 far away to (0, 50.0) -> isolated!
+    # break the chain: g0 is now reachable only from itself -> frac_connected = 1/3
     g0.x = 50.0
     phi0_isolated = shaper._phi_mesh(g0, ghosts)
-    # g0 is only connected to itself: frac_connected = 1/3, tension = 1.0
-    assert math.isclose(phi0_isolated, 3.0 * (1.0/3.0 - 0.5 * 1.0), abs_tol=1e-3)
-    assert phi0_isolated < 0.0
+    assert math.isclose(phi0_isolated, 3.0 * (1.0 / 3.0), abs_tol=1e-3)
+    assert phi0_isolated < phi0_stretched
 
 
 def test_env_mesh_rewards_and_common_pool():

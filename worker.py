@@ -15,7 +15,7 @@ from ghost  import Ghost, GHOST_COLORS
 import pathfinder
 from obs import (build_spatial, build_global_spatial, build_vector, build_valid_mask, actions_to_tasks, MAX_H, MAX_W, MAX_GHOSTS, UNKNOWN, SPATIAL_CH, GLOBAL_SPATIAL_CH, VEC_DIM)
 from reward import RewardShaper
-from allocator import generate_tasks as heuristic_generate_tasks, _score_convert as heuristic_score_convert
+from allocator import generate_tasks as heuristic_generate_tasks
 from beliefmap import extract_movement_features
 from net import speed_to_mult, mult_to_throttle
 
@@ -31,9 +31,16 @@ _DEFAULT_COLS = 41
 _DEFAULT_GHOSTS = 7
 _DEFAULT_POWER = 28
 
+KILL_BASE    = 16.0
+KILL_SPEED_W = 0.5
+SURVIVOR_W   = 10.0
+DEATH_SELF   = -12.0
+DEATH_PEER   = -1.5
+
 class Env:
-    def __init__(self, env_id: int = 0, num_ghosts: int = _DEFAULT_GHOSTS, world_height: float = float(_DEFAULT_ROWS), world_width: float = float(_DEFAULT_COLS), obs_resolution: float = 1.0, n_power: int = _DEFAULT_POWER):
+    def __init__(self, env_id: int = 0, num_ghosts: int = _DEFAULT_GHOSTS, world_height: float = float(_DEFAULT_ROWS), world_width: float = float(_DEFAULT_COLS), obs_resolution: float = 1.0, n_power: int = _DEFAULT_POWER, randomize_opponent: bool = True):
         self.env_id     = env_id
+        self.randomize_opponent = randomize_opponent
         self.num_ghosts = num_ghosts
         self.world_height = world_height
         self.world_width  = world_width
@@ -47,6 +54,8 @@ class Env:
         self.recent_nom: dict[int, np.ndarray] = {}
         self._cached_ht: dict[int, np.ndarray] = {}   #heuristic BC targets for the CURRENT observation
         self._cached_hspeed: dict[int, float] = {}
+        self._cached_htasks: dict[int, list] = {}     #heuristic candidate tasks for the CURRENT observation
+        self._cached_hdists: dict[int, dict] = {}     #and the belief-space distances computed for them
         self.max_frames = int(world_height * world_width * 2) + 1000
         self._pending_pred = None
         self._stored_predictor_weights = None
@@ -66,6 +75,8 @@ class Env:
         self.grid, self._player_start, self.world = generate_map(
             world_height=self.world_height, world_width=self.world_width, n_power=self.n_power, random_spawn=False, obs_resolution=self.obs_resolution)
         self.player = Player(self.grid, self._player_start, self.world, obs_resolution=self.obs_resolution)
+        if self.randomize_opponent:
+            self._randomize_opponent()
         open_cells = np.array(self.world.prm_nodes) if hasattr(self.world, 'prm_nodes') and self.world.prm_nodes else np.array([[float(self._player_start[0]), float(self._player_start[1])]])
         if len(open_cells) < self.num_ghosts:
             open_cells = np.array([self.world.random_open_point() for _ in range(self.num_ghosts * 2)])
@@ -108,6 +119,22 @@ class Env:
             self.ghosts[gid].cbba_agent.reset_caches()
         return self.observe()
 
+    def _randomize_opponent(self):
+        """Draw a fresh Pacman personality each episode.
+
+        Training against one fixed controller teaches the swarm that controller's quirks, not pursuit.
+        The ranges span reckless-greedy (ignores ghosts, ignores power pellets) to cautious-power-hungry
+        (detours hard around ghosts, beelines for power pellets, hunts aggressively once powered).
+        Drawn from np.random so a seeded episode is still exactly reproducible.
+        """
+        p = self.player
+        p.power_weight   = float(np.random.uniform(0.25, 1.40))
+        p.danger_weight  = float(np.random.uniform(5.0, 35.0))
+        p.danger_radius  = float(np.random.uniform(3.0, 6.5))
+        p.replan_age     = int(np.random.randint(8, 27))
+        p.emergency_dist = float(np.random.uniform(1.5, 4.5))
+        p.chase_margin   = float(np.random.uniform(5.0, 30.0))
+
     def observe(self):
         """
         Returns
@@ -145,18 +172,19 @@ class Env:
         return (alive, np.stack(sp), np.stack(ve), np.stack(vm), np.stack(ht), np.stack(hs), global_sp, (R, C))
 
     def _refresh_bc_targets(self):
-        """Rebuild the heuristic (allocator) BC targets for every alive ghost from the CURRENT world
-        state, i.e. the state the returned observation describes. Previously these were computed at
-        the top of step() before the ghosts moved and refreshed only every 2 decisions, so the BC
-        target lagged the observation it was paired with by 6-12 frames."""
         R = int(self.world_height * self.obs_resolution)
         C = int(self.world_width * self.obs_resolution)
         self._cached_ht = {}
         self._cached_hspeed = {}
+        self._cached_htasks = {}
+        self._cached_hdists = {}
         for gid, g in self.ghosts.items():
             if g.dead:
                 continue
             h_tasks, _h_dists = heuristic_generate_tasks(g, self.frame)
+            self._cached_htasks[gid] = h_tasks
+            self._cached_hdists[gid] = _h_dists
+            g._rl_candidates = h_tasks
             target = np.zeros((R, C), dtype=np.float32)
             if h_tasks:
                 self._cached_hspeed[gid] = mult_to_throttle(h_tasks[0].target_speed)
@@ -178,8 +206,9 @@ class Env:
             self._cached_ht[gid] = target
 
     def step(self, action_dict: dict, want_bc: bool = False):
-        """want_bc: build heuristic BC targets for the returned observation (costs ~10% worker time).
-        RL nominations always replace the heuristic's task generation — nothing is 'mixed'."""
+        """The heuristic candidate set is rebuilt for every returned observation regardless of want_bc: it is
+        the actor's channel 11 and the auction floor, not just the BC target. RL nominations are pooled on top
+        of it, so the swarm always has hunt/flank/evade/convert/explore vocabulary and the actor can only add."""
         alive = [gid for gid, g in self.ghosts.items() if not g.dead]
         R = int(self.world_height * self.obs_resolution)
         C = int(self.world_width * self.obs_resolution)
@@ -223,17 +252,20 @@ class Env:
                         pooled_tasks[k].assigned_to = -1
                     if k not in pooled_tasks or t.score > pooled_tasks[k].score:
                         pooled_tasks[k] = t
-            if pooled_tasks:
-                all_pooled_tasks = list(pooled_tasks.values())
-                all_targets = [t.target_pos for t in all_pooled_tasks]
-                for gid in alive:
-                    if gid in action_dict:
-                        g = self.ghosts[gid]
-                        g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
-                        pellet_targets = [(p[1], p[0]) for p in g.known_power_pellets]
-                        h_dists = g.plan_dists(all_targets + pellet_targets)
-                        own_convert = heuristic_score_convert(g, h_dists, self.frame)
-                        g.cbba_agent._phase1(g, all_pooled_tasks + own_convert, h_dists)
+            all_pooled_tasks = list(pooled_tasks.values())
+            all_targets = [t.target_pos for t in all_pooled_tasks]
+            for gid in alive:
+                if gid not in action_dict:
+                    continue
+                g = self.ghosts[gid]
+                own_h = list(self._cached_htasks.get(gid, []))
+                if not all_pooled_tasks and not own_h:
+                    continue
+                g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
+                h_dists = dict(self._cached_hdists.get(gid, {}))
+                if all_targets:
+                    h_dists.update(g.plan_dists(all_targets))
+                g.cbba_agent._phase1(g, all_pooled_tasks + own_h, h_dists)
         rewards = {gid: 0.0 for gid in alive}
         done = False
         pred_samples = []
@@ -246,11 +278,8 @@ class Env:
             if score_diff > 0:
                 for a_gid in alive:
                     if a_gid in rewards and not self.ghosts[a_gid].dead:
-                        rewards[a_gid] -= 0.004 * score_diff  #-0.04 per normal pellet (10 score)
+                        rewards[a_gid] -= 0.004 * score_diff
             if not powered_before and getattr(self.player, 'powered', False):
-                #activation penalty attributed by distance to the pellet Pacman just ate (it is standing on it):
-                #a flat -2 to every ghost gave the actor nothing to connect to its own nominations. The ghosts
-                #that could have converted or denied it carry most of the cost; far ghosts share a small base
                 for a_gid in alive:
                     if a_gid in rewards and not self.ghosts[a_gid].dead:
                         g_a = self.ghosts[a_gid]
@@ -346,40 +375,20 @@ class Env:
                                     if witnesses:
                                         og.witness_death(gid, self.ghosts)
                             if gid in rewards:
-                                rewards[gid] -= 15.0
+                                rewards[gid] += DEATH_SELF
                             for o_gid, og in self.ghosts.items():
                                 if o_gid != gid and not og.dead and o_gid in rewards:
-                                    rewards[o_gid] -= 3.0   #losing a node costs the whole mesh
+                                    rewards[o_gid] += DEATH_PEER   #losing a node costs the whole mesh
                         else:
                             self.player.die()
                             done = True
-                            if gid in rewards:
-                                rewards[gid] += 20.0
-                            for other_gid, other_ghost in self.ghosts.items():
-                                if other_gid != gid and not other_ghost.dead and other_gid in rewards:
-                                    dist = math.hypot(other_ghost.y - self.player.y, other_ghost.x - self.player.x)
-                                    proximity_bonus = min(3.0, 3.0 * math.exp(-dist / 7.0))
-                                    rewards[other_gid] += 14.0 + proximity_bonus
-                            swarm_ghosts = []
-                            angles = []
-                            for cand_gid, cand_ghost in self.ghosts.items():
-                                if not cand_ghost.dead:
-                                    cd = math.hypot(cand_ghost.y - self.player.y, cand_ghost.x - self.player.x)
-                                    if cd <= 7.0:
-                                        swarm_ghosts.append(cand_gid)
-                                        dy = cand_ghost.y - self.player.y
-                                        dx = cand_ghost.x - self.player.x
-                                        if dy != 0 or dx != 0:
-                                            angles.append(math.atan2(dy, dx))
-                            if len(swarm_ghosts) >= 2 and len(angles) >= 2:
-                                N = len(angles)
-                                R = math.hypot(sum(math.cos(a) for a in angles) / N,
-                                               sum(math.sin(a) for a in angles) / N)
-                                angular_enclosure = 1.0 - R
-                                swarm_bonus = 6.0 * angular_enclosure
-                                for sg_id in swarm_ghosts:
-                                    if sg_id in rewards:
-                                        rewards[sg_id] += swarm_bonus
+                            alive_now = [g2 for g2 in self.ghosts.values() if not g2.dead]
+                            time_left = 1.0 - min(1.0, self.frame / max(1.0, float(self.max_frames)))
+                            kill_pay = KILL_BASE * (1.0 + KILL_SPEED_W * time_left)
+                            surv_frac = len(alive_now) / max(1, self.num_ghosts)
+                            for a_g in alive_now:
+                                if a_g.gid in rewards:
+                                    rewards[a_g.gid] += kill_pay + SURVIVOR_W * surv_frac
                             break
                 if not any(not g.dead for g in self.ghosts.values()):
                     done = True
@@ -397,7 +406,6 @@ class Env:
                 for o in rewards:
                     rewards[o] -= 10.0   #ran out of time
                 break
-
             step_cost = 0.010 / DECISION_INTERVAL
             for gid in rewards:
                 if self.ghosts[gid].dead:
@@ -426,11 +434,7 @@ class Env:
         if done:
             obs = None
         else:
-            if want_bc:
-                self._refresh_bc_targets()
-            else:
-                self._cached_ht = {}
-                self._cached_hspeed = {}
+            self._refresh_bc_targets()
             obs = self.observe()
         pacman_caught = bool(getattr(self.player, "dead", False))
         return obs, rewards, done, {"pacman_score": getattr(self.player, "score", 0), "pacman_caught": pacman_caught, "pred_samples": pred_samples}

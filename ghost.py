@@ -38,9 +38,10 @@ LEFT  = ( 0, -1)
 RIGHT = ( 0,  1)
 DIRS  = [UP, DOWN, LEFT, RIGHT]
 
-RADIUS            = 12
+import os as _os
+RADIUS            = float(_os.environ.get("GHOST_RADIO", "12"))
 RAY_COUNT         = 90
-MAX_RAY_DIST      = 10
+MAX_RAY_DIST      = float(_os.environ.get("GHOST_LIDAR", "10"))
 UNKNOWN           = -1
 MEMORY_FRAMES     = 10
 HEARTBEAT_EVERY   = 5

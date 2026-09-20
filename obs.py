@@ -16,19 +16,20 @@ UNKNOWN = -1
 MAX_H = 33
 MAX_W = 41
 MAX_GHOSTS   = 7
-SPATIAL_CH   = 11        #number of spatial channels (see channel map below)
+SPATIAL_CH   = 12        #number of spatial channels (see channel map below)
 GLOBAL_SPATIAL_CH = 12   #number of channels in the omniscient global state
 VEC_DIM      = 70
 CRITIC_VEC_DIM = MAX_GHOSTS * VEC_DIM + MAX_GHOSTS
-RL_SCORE_BASE = 1.0      #CBBA score of the least-preferred nomination
-RL_SCORE_SPAN = 3.0      #CBBA score of the favourite nomination = BASE + SPAN
+RL_SCORE_BASE   = 0.2
+RL_SCORE_SPAN   = 10.0
+RL_ENDORSE_GAIN = 2.0
 
 """
 Channel Map:
     0  is_wall           4  belief_map       8  peer_ghosts (with staleness decay)
     1  is_pellet         5  safety_map       9  staleness
     2  is_power          6  own_position     10 recent_nominations
-    3  peer_intent       7  pacman_position
+    3  peer_intent       7  pacman_position  11 heuristic_candidates (score / max score)
 """
 
 def _pacman_target(ghost):
@@ -174,6 +175,14 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_reso
                     stale_ch[ri, ci] = stale_val
     out[9] = stale_ch
     out[10] = recent_noms[:rows, :cols]
+    #the heuristic's current proposals, so the actor arbitrates over them instead of guessing blind
+    cands = getattr(ghost, '_rl_candidates', None)
+    if cands:
+        s_max = max(float(t.score) for t in cands) or 1.0
+        for t in cands:
+            r_t, c_t = int(t.target_pos[0] * obs_resolution), int(t.target_pos[1] * obs_resolution)
+            if 0 <= r_t < rows and 0 <= c_t < cols:
+                out[11, r_t, c_t] = max(out[11, r_t, c_t], float(t.score) / s_max)
     return out
 
 def build_vector(ghost) -> np.ndarray:
@@ -285,6 +294,7 @@ def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int, o
     bm_top = []
     if hasattr(ghost, 'belief_map') and ghost.belief_map is not None and hasattr(ghost.belief_map, 'top_cells'):
         bm_top = ghost.belief_map.top_cells(n=5)
+    cands = getattr(ghost, '_rl_candidates', None) or []
     for r, c in indices:
         if r < 0 or r >= rows or c < 0 or c >= cols:
             continue
@@ -293,7 +303,16 @@ def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int, o
         if not ghost.world.is_passable(world_x, world_y, radius=0.35):
             continue
         rel = min(1.0, max(0.0, float(scores_map[r, c])))
-        score = RL_SCORE_BASE + RL_SCORE_SPAN * rel
+        conf = rel * rel
+        score = RL_SCORE_BASE + RL_SCORE_SPAN * conf
+        near = None
+        for t in cands:
+            if abs(t.target_pos[0] - world_y) + abs(t.target_pos[1] - world_x) <= 1.5:
+                near = t
+                break
+        if near is not None:
+            tasks.append(Task(task_type=near.task_type, target_pos=near.target_pos, score=max(float(near.score) * (1.0 + RL_ENDORSE_GAIN * conf), score), created_frame=frame, owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed))
+            continue
         is_power = any(abs(world_y - p[1]) < 0.5 and abs(world_x - p[0]) < 0.5 for p in ghost.known_power_pellets)
         near_belief = any((abs(world_y - bc[0]) + abs(world_x - bc[1])) <= 3.0 for bc in bm_top)
         if is_power:

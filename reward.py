@@ -18,14 +18,14 @@ import numpy as np
 class RewardShaper:
     """Tracks per-ghost potentials and returns the shaping delta each step."""
 
-    def __init__(self, alpha=6.0, beta=7.0, gamma_ex=0.008, delta_peak=2.5,
-                 delta_spread=2.5, delta_ent=1.0, beta_mesh=3.5,
-                 alpha_corner=4.0, gamma=0.99):
+    def __init__(self, alpha=6.0, beta=1.75, gamma_ex=0.008, delta_peak=2.5,
+                 delta_spread=2.5, delta_ent=1.0, beta_mesh=1.0,
+                 alpha_corner=1.0, beta_disp=0.6, gamma=0.99):
         """
         Parameters
         ----------
         alpha        : hunt shaping weight — steep close-range gradient
-        beta         : encirclement shaping weight — coordinated pincer reward
+        beta         : encirclement shaping weight — a hint toward pincers, no longer a mandate
         gamma_ex     : exploration shaping weight (low: exploration is secondary to pursuit)
         delta_peak   : belief peak certainty weight
         delta_spread : belief spatial standard deviation penalty weight
@@ -42,8 +42,20 @@ class RewardShaper:
         self.delta_ent    = delta_ent
         self.beta_mesh    = beta_mesh
         self.alpha_corner = alpha_corner
+        self.beta_disp    = beta_disp
         self.gamma        = gamma
         self._prev: dict[int, float] = {}
+
+    @staticmethod
+    def _engage_radius(ghost) -> float:
+        """Encirclement/cornering radius scaled to the board. A fixed 12 cells covered almost the whole
+        13x17 stage but only a corner of 33x41, so the same weights meant different things per stage."""
+        w = getattr(ghost, 'world', None)
+        h = getattr(w, 'height', None)
+        wd = getattr(w, 'width', None)
+        if h is None or wd is None:
+            return 12.0
+        return max(4.0, min(12.0, 0.35 * min(float(h), float(wd))))
 
     @staticmethod
     def _pac_target(ghost):
@@ -129,7 +141,7 @@ class RewardShaper:
             if dy == 0 and dx == 0:
                 continue
             dist = math.hypot(dy, dx)
-            if dist <= 12.0:
+            if dist <= self._engage_radius(ghost):
                 angles.append(math.atan2(dy, dx))
                 dists.append(dist)
         if len(angles) < 2:
@@ -191,14 +203,14 @@ class RewardShaper:
                 min_dist = dist
         repulsion_radius = max(2.0, min(ghost.world.height, ghost.world.width) * 0.15)
         if min_dist < repulsion_radius:
-            return -self.gamma_ex * ((repulsion_radius - min_dist) / repulsion_radius)
+            return -self.beta_disp * ((repulsion_radius - min_dist) / repulsion_radius)
         return 0.0
 
     def _phi_mesh(self, ghost, all_ghosts) -> float:
         """
         Extended mesh connectivity potential.
-        Evaluates whether the ghost is part of the multi-hop connected radio mesh
-        (radio radius = 12.0) and applies an elastic tension gradient before links sever.
+        Rewards being inside the multi-hop connected radio mesh (radio radius = 12.0). Multi-hop means a
+        strung-out CHAIN counts as fully connected, so this does not ask the swarm to bunch up.
         """
         alive = [g for g in all_ghosts.values() if not getattr(g, 'dead', False)]
         if len(alive) < 2:
@@ -206,13 +218,6 @@ class RewardShaper:
 
         visited = {ghost.gid}
         queue = [ghost]
-        min_dist = math.inf
-        for g in alive:
-            if g.gid != ghost.gid:
-                d = math.hypot(ghost.y - g.y, ghost.x - g.x)
-                if d < min_dist:
-                    min_dist = d
-
         while queue:
             curr = queue.pop(0)
             for g in alive:
@@ -222,10 +227,7 @@ class RewardShaper:
                         queue.append(g)
 
         frac_connected = len(visited) / len(alive)
-        tension = 0.0
-        if min_dist > 8.0:
-            tension = min(1.0, ((min_dist - 8.0) / 4.0) ** 2)
-        return self.beta_mesh * (frac_connected - 0.5 * tension)
+        return self.beta_mesh * frac_connected
 
     def _phi_corner(self, ghost, all_ghosts, target) -> float:
         """Rewards closing in on and trapping Pacman in a dead-end or restricted corridor."""
@@ -233,7 +235,7 @@ class RewardShaper:
             return 0.0
         pr, pc = target
         dist_pac = math.hypot(ghost.y - pr, ghost.x - pc)
-        if dist_pac > 6.0 or getattr(ghost, 'world', None) is None or not hasattr(ghost.world, 'is_passable'):
+        if dist_pac > 0.5 * self._engage_radius(ghost) or getattr(ghost, 'world', None) is None or not hasattr(ghost.world, 'is_passable'):
             return 0.0
         p_radius = 0.35
         cardinals = [(0.7, 0.0), (-0.7, 0.0), (0.0, 0.7), (0.0, -0.7)]

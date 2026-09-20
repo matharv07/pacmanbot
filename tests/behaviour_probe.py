@@ -64,7 +64,7 @@ def _run_game(mode, actor, env, stage, seed, log):
     np.random.seed(seed); torch.manual_seed(seed)
     import random as _r; _r.seed(seed)
     obs = env.reset()
-    if mode != 'rl':
+    if mode == 'heuristic':
         for g in env.ghosts.values():
             g.rl_mode = False; g.cbba_agent.rl_mode = False
     H, W = stage.rows, stage.cols
@@ -80,7 +80,7 @@ def _run_game(mode, actor, env, stage, seed, log):
         if not gids: break
         action = {}
         probs_per_ghost = {}
-        if mode == 'rl':
+        if mode in ('rl', 'floor'):
             t_sp = torch.from_numpy(_pad(sp.astype(np.float32), H, W))
             t_vm = torch.from_numpy(_pad(vm.astype(np.float32), H, W).astype(bool))
             t_ve = torch.from_numpy(ve.astype(np.float32))
@@ -91,6 +91,8 @@ def _run_game(mode, actor, env, stage, seed, log):
             idx_np = idx.numpy(); sc = scores.float().numpy(); spd = speed.float().numpy(); dr = direction.float().numpy(); gt = gate.float().numpy()
             for i, gid in enumerate(gids):
                 pairs = [(int(x // W), int(x % W)) for x in idx_np[i]]
+                if mode == 'floor':
+                    pairs = []          #ablation: heuristic floor decides the auction on its own
                 action[gid] = (pairs, sc[i], float(spd[i].item()), float(dr[i].item()), float(gt[i].item()))
                 fl = raw_logits[i].double().numpy()
                 fin = fl[np.isfinite(fl)]
@@ -135,7 +137,7 @@ def _run_game(mode, actor, env, stage, seed, log):
                 log['bm_peak_err'].append(math.hypot(peak[0] - true_pac[0], peak[1] - true_pac[1]))
                 if not knows:
                     log['bm_peak_err_unseen'].append(math.hypot(peak[0] - true_pac[0], peak[1] - true_pac[1]))
-                    if gid in action:
+                    if gid in action and action[gid][0]:
                         dn = min(math.hypot((r + 0.5) - peak[0], (c + 0.5) - peak[1]) for (r, c) in action[gid][0])
                         log['nom_to_peak'].append(dn)
                         dg = np.mean([math.hypot((r + 0.5) - g.y, (c + 0.5) - g.x) for (r, c) in action[gid][0]])
@@ -171,6 +173,24 @@ def _run_game(mode, actor, env, stage, seed, log):
                     learned_at[gid] = env.frame
                     if d_true < 16: log['aware_latency'].append(env.frame - power_start_frame)
         if any_known: frames_known_by_any += 1
+        alive_g = [gg for gg in env.ghosts.values() if not gg.dead]
+        n_al = len(alive_g)
+        if n_al >= 2:
+            import ghost as _gh
+            rad = float(_gh.RADIUS)
+            seen_i, comps = set(), []
+            for i0 in range(n_al):
+                if i0 in seen_i: continue
+                stack, csz = [i0], 0
+                while stack:
+                    k = stack.pop()
+                    if k in seen_i: continue
+                    seen_i.add(k); csz += 1
+                    for j0 in range(n_al):
+                        if j0 not in seen_i and math.hypot(alive_g[k].y - alive_g[j0].y, alive_g[k].x - alive_g[j0].x) <= rad:
+                            stack.append(j0)
+                comps.append(csz)
+            log['connectivity'].append(sum(c * c for c in comps) / float(n_al * n_al))
         obs, rew, done, info = env.step(action, want_bc=False)
         #--- frame-level facts we can only see after stepping ---
         if pac.powered and not prev_powered:
@@ -207,15 +227,21 @@ def _new_log():
     return {'cell_entropy': [], 'eff_cells': [], 'logit_mean': [], 'logit_std': [], 'score_sat': [], 'throttle': [], 'gate': [], 'speed': [], 'fallback': [], 'no_task': [],
             'task_type': collections.Counter(), 'disp30': [], 'loiter': [], 'bm_peak_err': [], 'bm_peak_err_unseen': [],
             'nom_to_peak': [], 'nom_to_self': [], 'task_to_peak': [], 'task_to_self': [], 'policy_mass_top10bm': [], 'bm_empty': 0,
-            'denial_opps': 0, 'denial_taken': 0, 'denial_dist': [], 'dist_at_activation': [], 'aware_latency': [], 'knows_pac': [], 'los_dist': [], 'powered_aware': []}
+            'denial_opps': 0, 'denial_taken': 0, 'denial_dist': [], 'dist_at_activation': [], 'aware_latency': [], 'connectivity': [], 'knows_pac': [], 'los_dist': [], 'powered_aware': []}
 
-def _worker(mode, ckpt, stage_idx, seeds):
+def _worker(mode, ckpt, stage_idx, seeds, radio=None, lidar=None):
     os.environ['OMP_NUM_THREADS'] = '1'; torch.set_num_threads(1)
+    if radio is not None:
+        import ghost as _gh
+        _gh.RADIUS = float(radio)
+    if lidar is not None:
+        import ghost as _gh
+        _gh.MAX_RAY_DIST = float(lidar)
     from worker import Env
     from net import GhostActor
     stage = STAGES[stage_idx]
     actor = None
-    if mode == 'rl':
+    if mode in ('rl', 'floor'):
         ck = torch.load(ckpt, map_location='cpu', weights_only=False)
         actor = GhostActor(); actor.load_state_dict(ck['actor']); actor.eval()
     env = Env(env_id=seeds[0], num_ghosts=stage.n_ghosts, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=1.0, n_power=stage.n_power)
@@ -254,6 +280,7 @@ def report(mode, games, log):
             for lo, hi in [(0, 5), (5, 8), (8, 12), (12, 16), (16, 25), (25, 99)]:
                 n_all = int(((all_da >= lo) & (all_da < hi)).sum()); n_d = int(((da >= lo) & (da < hi)).sum())
                 if n_all: print(f"    {lo:>2}-{hi:<2} cells: {n_d / n_all:5.0%}  ({n_d}/{n_all})")
+    print(f"radio-graph connectivity (mean frac of swarm reachable): {_m(log['connectivity']):.0%}")
     print(f"powered-awareness while Pacman IS powered: {_m(log['powered_aware']):.0%} of ghost-decisions | ghosts within 16 cells learned of it after median {_q(log['aware_latency'], 50):.0f} frames (p75 {_q(log['aware_latency'], 75):.0f}) of the 40-frame window")
     print("--- movement ---")
     print(f"|v|/vmax mean {_m(log['speed']):.2f} | fallback-mode {_m(log['fallback']):.0%} | no active task {_m(log['no_task']):.0%} | "
@@ -280,11 +307,13 @@ def report(mode, games, log):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--ckpt', default='checkpoints/ckpt_1000.pt')
-    ap.add_argument('--mode', default='rl', choices=['rl', 'heuristic', 'random'])
+    ap.add_argument('--mode', default='rl', choices=['rl', 'heuristic', 'random', 'floor'])
     ap.add_argument('--n', type=int, default=30)
     ap.add_argument('--workers', type=int, default=10)
-    ap.add_argument('--stage', type=int, default=4)
+    ap.add_argument('--stage', type=int, default=len(STAGES) - 1)
     ap.add_argument('--seed0', type=int, default=0)
+    ap.add_argument('--radio', type=float, default=None, help='override ghost comms radius (default: repo value)')
+    ap.add_argument('--lidar', type=float, default=None, help='override ghost sensing range (default: repo value)')
     args = ap.parse_args()
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ckpt = args.ckpt if os.path.isabs(args.ckpt) else os.path.join(root, args.ckpt)
@@ -292,7 +321,7 @@ def main():
     chunks = [seeds[i::args.workers] for i in range(args.workers) if seeds[i::args.workers]]
     t0 = time.time(); games = []; log = _new_log()
     with ProcessPoolExecutor(max_workers=len(chunks)) as ex:
-        futs = [ex.submit(_worker, args.mode, ckpt, args.stage, c) for c in chunks]
+        futs = [ex.submit(_worker, args.mode, ckpt, args.stage, c, args.radio, args.lidar) for c in chunks]
         for f in as_completed(futs):
             g, l = f.result(); games.extend(g); _merge(log, l)
             print(f"  {len(games)}/{args.n} games ({time.time() - t0:.0f}s)", end='\r', flush=True)

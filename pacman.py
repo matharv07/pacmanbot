@@ -161,8 +161,6 @@ def generate_map(world_height: float = ROWS, world_width: float = COLS, n_power:
     blocked = np.any(dist_sq <= (r + 0.35)**2, axis=1)
     grid_flat = np.where(blocked, WALL, EMPTY)
     grid = grid_flat.reshape((rows, cols))
-
-    # Keep only the largest 4-connected component to guarantee 100% pellet reachability
     import cv2
     passable = (grid == EMPTY).astype(np.uint8)
     num_labels, labels = cv2.connectedComponents(passable, connectivity=4)
@@ -217,7 +215,6 @@ def generate_map(world_height: float = ROWS, world_width: float = COLS, n_power:
             gr, gc = int(demoted[1] * obs_resolution), int(demoted[0] * obs_resolution)
             grid[gr, gc] = PELLET
     world._update_pellet_arrays()
-
     valid_spawns = []
     for sp in getattr(world, 'safe_area', []):
         spr = int(sp[1] * obs_resolution)
@@ -264,6 +261,13 @@ class Player:
         self.frame_counter = 0
         self.pos_history = deque(maxlen=20)
         self._unreachable_targets = {}
+        self.power_weight    = 0.5
+        self.pellet_weight   = 1.5
+        self.danger_weight   = 15.0
+        self.danger_radius   = 4.0
+        self.replan_age      = 15
+        self.emergency_dist  = 2.5
+        self.chase_margin    = 15.0
 
     def set_dir(self, d):
         self.next_dir = d
@@ -280,7 +284,7 @@ class Player:
             for g in ghosts.values():
                 if not g.dead:
                     d = abs(self.y - g.y) + abs(self.x - g.x)
-                    if d < best_ghost_dist and self.power_timer > (d * 2.0) + 15:
+                    if d < best_ghost_dist and self.power_timer > (d * 2.0) + self.chase_margin:
                         best_ghost_dist = d
                         best_ghost_target = (g.y, g.x)
             if best_ghost_target is not None:
@@ -306,12 +310,12 @@ class Player:
             for g in ghosts.values():
                 if not g.dead:
                     gd = abs(tgt[0] - g.y) + abs(tgt[1] - g.x)
-                    if gd < 4:
-                        danger += (4 - gd) * 15.0
+                    if gd < self.danger_radius:
+                        danger += (self.danger_radius - gd) * self.danger_weight
             orig_tgt = (tgt[1], tgt[0])
             power_set = getattr(self.world, 'power_pellet_set', None)
             is_power = (orig_tgt in power_set) if power_set is not None else (orig_tgt in self.world.power_pellets)
-            weight = 0.5 if is_power else 1.5
+            weight = self.power_weight if is_power else self.pellet_weight
             score = dist * weight + danger
             if score < best_score:
                 best_score = score
@@ -380,7 +384,7 @@ class Player:
                     if gd < min_ghost_dist:
                         min_ghost_dist = gd
             #check if route needs replanning
-            ghost_emergency = not self.powered and min_ghost_dist < 2.5 and self._route_age >= 3
+            ghost_emergency = not self.powered and min_ghost_dist < self.emergency_dist and self._route_age >= 3
             power_changed = self.powered != self._route_power_state
             target_eaten = False
             if self._route_target is not None and not self.powered:
@@ -403,7 +407,7 @@ class Player:
                     else:
                         target_eaten = True
             path_exhausted = not self._route
-            needs_replan = (path_exhausted or ghost_emergency or power_changed or target_eaten or self._route_age > 15)
+            needs_replan = (path_exhausted or ghost_emergency or power_changed or target_eaten or self._route_age > self.replan_age)
             if needs_replan and not ghost_emergency and not path_exhausted and self._route_age < 4:
                 needs_replan = False
             if needs_replan:
@@ -821,9 +825,13 @@ class Game:
                 alive = [gid for gid, g in self.ghosts.items() if not g.dead]
                 R = min(MAX_H, len(self.grid))
                 C = min(MAX_W, len(self.grid[0]))
+                from allocator import generate_tasks as _heuristic_tasks
                 sp, ve, vm = [], [], []
+                h_cands, h_dists_all = {}, {}
                 for gid in alive:
                     g = self.ghosts[gid]
+                    h_cands[gid], h_dists_all[gid] = _heuristic_tasks(g, self.frame_counter)
+                    g._rl_candidates = h_cands[gid]
                     sp.append(build_spatial(g, self.recent_nom[gid], R, C, obs_resolution=1.0))
                     ve.append(build_vector(g))
                     vm.append(build_valid_mask(g, R, C, obs_resolution=1.0, spatial_walls=sp[-1][0]))
@@ -868,17 +876,19 @@ class Game:
                                 pooled_tasks[k].assigned_to = -1
                             if k not in pooled_tasks or t.score > pooled_tasks[k].score:
                                 pooled_tasks[k] = t
-                    if pooled_tasks:
-                        all_pooled_tasks = list(pooled_tasks.values())
-                        all_targets = [t.target_pos for t in all_pooled_tasks]
-                        from allocator import _score_convert
-                        for gid in alive:
-                            g = self.ghosts[gid]
-                            g.cbba_agent._last_auction = self.frame_counter + 6
-                            pellet_targets = [(p[1], p[0]) for p in g.known_power_pellets]
-                            dists = g.plan_dists(all_targets + pellet_targets)
-                            own_convert = _score_convert(g, dists, self.frame_counter)
-                            g.cbba_agent._phase1(g, all_pooled_tasks + own_convert, dists)
+                    all_pooled_tasks = list(pooled_tasks.values())
+                    all_targets = [t.target_pos for t in all_pooled_tasks]
+                    for gid in alive:
+                        g = self.ghosts[gid]
+                        #floor runs even when no nomination survived actions_to_tasks (wall / unreachable)
+                        own_h = list(h_cands.get(gid, []))
+                        if not all_pooled_tasks and not own_h:
+                            continue
+                        g.cbba_agent._last_auction = self.frame_counter + 6
+                        dists = dict(h_dists_all.get(gid, {}))
+                        if all_targets:
+                            dists.update(g.plan_dists(all_targets))
+                        g.cbba_agent._phase1(g, all_pooled_tasks + own_h, dists)
         self.player.update(self.ghosts)
         powered = self.player.powered
         for ghost in self.ghosts.values():

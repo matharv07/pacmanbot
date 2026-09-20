@@ -64,10 +64,10 @@ def test_ghost_evasion_controller_sets_topological_velocity():
 
 def test_3_stage_curriculum_configuration():
     """Verify STAGES is a monotone ramp ending on the README's full game."""
-    # Stage 0: 13x17, 3 ghosts — the smallest board the swarm can actually coordinate on
+    # Stage 0: 13x17, 2 ghosts — solo-skills stage (survive, deny, track); kills need cooperation
     assert STAGES[0].rows == 13
     assert STAGES[0].cols == 17
-    assert STAGES[0].n_ghosts == 3
+    assert STAGES[0].n_ghosts == 2
     # board size, swarm size and power pellet count all ramp monotonically
     for a, b in zip(STAGES, STAGES[1:]):
         assert b.rows >= a.rows and b.cols >= a.cols
