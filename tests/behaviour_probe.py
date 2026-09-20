@@ -26,7 +26,7 @@ import torch
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from curriculum import STAGES
-from allocator import TaskType
+from allocator import TaskType, ORIGIN_HEURISTIC, ORIGIN_RL_ENDORSE, ORIGIN_RL_NOVEL
 
 DECISION_INTERVAL = 6
 K = 3
@@ -69,6 +69,7 @@ def _run_game(mode, actor, env, stage, seed, log):
             g.rl_mode = False; g.cbba_agent.rl_mode = False
     H, W = stage.rows, stage.cols
     pos_hist = {gid: collections.deque(maxlen=6) for gid in env.ghosts}
+    eff_hist = {gid: collections.deque(maxlen=6) for gid in env.ghosts}
     power_before = len(env.world.power_pellets)
     activations = 0; powered_frames = 0; frames_known_by_any = 0
     deaths = []
@@ -127,6 +128,16 @@ def _run_game(mode, actor, env, stage, seed, log):
             log['fallback'].append(1.0 if g.in_fallback_mode else 0.0)
             log['no_task'].append(1.0 if task is None else 0.0)
             log['task_type'][int(task.task_type) if task else -1] += 1
+            #ATTRIBUTION: who actually won this ghost's executed task, and does it close on Pacman?
+            org = int(getattr(task, 'origin', ORIGIN_HEURISTIC)) if task is not None else -1
+            log['origin'][org] += 1
+            if task is not None:
+                log['origin_score'][org].append(float(task.score))
+            eff_hist[gid].append((org, d_true))
+            if len(eff_hist[gid]) == eff_hist[gid].maxlen:
+                old_org, old_d = eff_hist[gid][0]
+                if old_org >= 0:
+                    log['closing'][old_org].append(d_true - old_d)
             if len(pos_hist[gid]) == pos_hist[gid].maxlen:
                 (y0, x0) = pos_hist[gid][0]; disp = math.hypot(g.y - y0, g.x - x0)
                 engaged = knows and d_true < 4.5
@@ -227,7 +238,8 @@ def _new_log():
     return {'cell_entropy': [], 'eff_cells': [], 'logit_mean': [], 'logit_std': [], 'score_sat': [], 'throttle': [], 'gate': [], 'speed': [], 'fallback': [], 'no_task': [],
             'task_type': collections.Counter(), 'disp30': [], 'loiter': [], 'bm_peak_err': [], 'bm_peak_err_unseen': [],
             'nom_to_peak': [], 'nom_to_self': [], 'task_to_peak': [], 'task_to_self': [], 'policy_mass_top10bm': [], 'bm_empty': 0,
-            'denial_opps': 0, 'denial_taken': 0, 'denial_dist': [], 'dist_at_activation': [], 'aware_latency': [], 'connectivity': [], 'knows_pac': [], 'los_dist': [], 'powered_aware': []}
+            'denial_opps': 0, 'denial_taken': 0, 'denial_dist': [], 'dist_at_activation': [], 'aware_latency': [], 'connectivity': [],
+            'origin': collections.Counter(), 'origin_score': collections.defaultdict(list), 'closing': collections.defaultdict(list), 'knows_pac': [], 'los_dist': [], 'powered_aware': []}
 
 def _worker(mode, ckpt, stage_idx, seeds, radio=None, lidar=None):
     os.environ['OMP_NUM_THREADS'] = '1'; torch.set_num_threads(1)
@@ -241,9 +253,18 @@ def _worker(mode, ckpt, stage_idx, seeds, radio=None, lidar=None):
     from net import GhostActor
     stage = STAGES[stage_idx]
     actor = None
-    if mode in ('rl', 'floor'):
+    if mode == 'rl':
         ck = torch.load(ckpt, map_location='cpu', weights_only=False)
         actor = GhostActor(); actor.load_state_dict(ck['actor']); actor.eval()
+    elif mode == 'floor':
+        if os.path.exists(ckpt):
+            try:
+                ck = torch.load(ckpt, map_location='cpu', weights_only=False)
+                actor = GhostActor(); actor.load_state_dict(ck['actor']); actor.eval()
+            except Exception:
+                actor = GhostActor(); actor.eval()
+        else:
+            actor = GhostActor(); actor.eval()
     env = Env(env_id=seeds[0], num_ghosts=stage.n_ghosts, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=1.0, n_power=stage.n_power)
     log = _new_log(); games = []
     for s in seeds:
@@ -252,8 +273,10 @@ def _worker(mode, ckpt, stage_idx, seeds, radio=None, lidar=None):
 
 def _merge(dst, src):
     for k, v in src.items():
-        if isinstance(v, list): dst[k].extend(v)
-        elif isinstance(v, collections.Counter): dst[k].update(v)
+        if isinstance(v, collections.Counter): dst[k].update(v)
+        elif isinstance(v, collections.defaultdict):
+            for kk, vv in v.items(): dst[k][kk].extend(vv)
+        elif isinstance(v, list): dst[k].extend(v)
         else: dst[k] += v
 
 def _q(xs, p): return float(np.percentile(xs, p)) if len(xs) else float('nan')
@@ -299,6 +322,17 @@ def report(mode, games, log):
     if log['cell_entropy']:
         print(f"policy cell entropy: mean {_m(log['cell_entropy']):.2f} nats -> effective cells {_m(log['eff_cells']):.0f} | throttle mean {_m(log['throttle']):.2f} | hijack gate rate {_m(log['gate']):.2f}")
         print(f"raw logits: mean {_m(log['logit_mean']):.1f} (std within map {_m(log['logit_std']):.2f}) -> sigmoid CBBA scores saturated at 1.0 for {_m(log['score_sat']):.0%} of open cells")
+    ONAMES = {-1: 'no task', ORIGIN_HEURISTIC: 'heuristic', ORIGIN_RL_ENDORSE: 'RL-endorsed', ORIGIN_RL_NOVEL: 'RL-novel'}
+    o_tot = sum(log['origin'].values()) or 1
+    print("--- RL attribution (who won the executed task) ---")
+    for k in sorted(log['origin']):
+        sc = log['origin_score'].get(k, [])
+        cl = log['closing'].get(k, [])
+        cl_s = f"{_m(cl):+.2f}" if cl else "  n/a"
+        sc_s = f"{_m(sc):.2f}" if sc else " n/a"
+        print(f"  {ONAMES.get(k, k):<12} {log['origin'][k] / o_tot:>5.0%} of decisions | mean winning score {sc_s} | dist to Pacman over next 5 decisions {cl_s}")
+    rl_share = (log['origin'][ORIGIN_RL_ENDORSE] + log['origin'][ORIGIN_RL_NOVEL]) / o_tot
+    print(f"  RL share of executed tasks: {rl_share:.1%}   (negative 'dist' = closing in; compare RL rows against heuristic)")
     print("--- power pellet denial ---")
     if log['denial_opps']:
         print(f"opportunities (pellet known within {DENIAL_RADIUS:.0f}, Pacman not a threat): {log['denial_opps']} ghost-decisions, ghost heading for it / holding CONVERT: {log['denial_taken'] / log['denial_opps']:.0%} | median pellet dist {_q(log['denial_dist'], 50):.1f}")

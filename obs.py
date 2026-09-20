@@ -7,7 +7,7 @@ and converts the RL actor's sampled waypoints back into CBBA Task objects.
 
 import math
 import numpy as np
-from allocator import Task, TaskType
+from allocator import Task, TaskType, ORIGIN_RL_ENDORSE, ORIGIN_RL_NOVEL
 
 WALL    = 1
 PELLET  = 2
@@ -311,7 +311,7 @@ def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int, o
                 near = t
                 break
         if near is not None:
-            tasks.append(Task(task_type=near.task_type, target_pos=near.target_pos, score=max(float(near.score) * (1.0 + RL_ENDORSE_GAIN * conf), score), created_frame=frame, owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed))
+            tasks.append(Task(task_type=near.task_type, target_pos=near.target_pos, score=max(float(near.score) * (1.0 + RL_ENDORSE_GAIN * conf), score), created_frame=frame, owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed, origin=ORIGIN_RL_ENDORSE))
             continue
         is_power = any(abs(world_y - p[1]) < 0.5 and abs(world_x - p[0]) < 0.5 for p in ghost.known_power_pellets)
         near_belief = any((abs(world_y - bc[0]) + abs(world_x - bc[1])) <= 3.0 for bc in bm_top)
@@ -321,7 +321,7 @@ def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int, o
             tt = TaskType.HUNT
         else:
             tt = TaskType.DYNAMIC
-        tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame, owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed))
+        tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame, owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed, origin=ORIGIN_RL_NOVEL))
     return tasks
 
 def build_global_spatial(env, rows: int, cols: int, obs_resolution: float = 1.0) -> np.ndarray:

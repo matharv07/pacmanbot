@@ -195,9 +195,14 @@ class CBBA_Agent:
         candidate_tasks = []
         for t in tasks:
             k = _task_key(t)
-            candidate_keys.add(k)
-            candidate_tasks.append(t)
-            self._task_map[k] = t
+            if k not in candidate_keys:
+                candidate_keys.add(k)
+                candidate_tasks.append(t)
+                self._task_map[k] = t
+            else:
+                existing = self._task_map.get(k)
+                if existing is None or t.score > existing.score:
+                    self._task_map[k] = t
             if k not in self._task_created_frame:
                 self._task_created_frame[k] = ghost.frame
         #include active orphaned or outbiddable tasks from self._task_map

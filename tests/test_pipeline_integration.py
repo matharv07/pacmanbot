@@ -14,7 +14,7 @@ def test_curriculum_logic():
     print("Testing curriculum logic...")
     cs = CurriculumScheduler(start_stage=0)
     assert cs.stage_idx == 0
-    assert len(STAGES) == 5, f"Expected 5 curriculum stages, got {len(STAGES)}"
+    assert len(STAGES) == 4, f"Expected 4 curriculum stages, got {len(STAGES)}"
 
     # Test that partial/None updates do not corrupt the rolling window
     cs.record_return(mean_return=None, kill_rate=None)

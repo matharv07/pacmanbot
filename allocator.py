@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import List, Optional
 import numpy as np
+import os as _os
 from pathfinder import ghost_dists
 
 WALL    = 1
@@ -33,9 +34,11 @@ RECENCY_SCALE = 20.0       #sets up quantity to prioritize revisiting older mapp
 EXPLORE_SCALE = 6.0
 UNKNOWN_BONUS = 40         #5x reward(?) of looking for new locations over updating old ones
 EXPLORE_TOP_K = 3          #number of top explore candidates passed to CBBA
-PELLET_THREAT_DIST = 3.0   #Pacman this close to an unconverted power pellet arms itself before we can close
-PELLET_THREAT_HOLD = 6.0   #hunters inside this radius when the pellet goes died 60-90% of the time (probe, run 13)
-PELLET_THREAT_DAMP = 0.3   #hunt/flank score multiplier while the threat stands
+PELLET_THREAT_DIST = float(_os.environ.get("PELLET_THREAT_DIST", "4.5"))
+PELLET_THREAT_HOLD = float(_os.environ.get("PELLET_THREAT_HOLD", "8.5"))
+PELLET_THREAT_DAMP = float(_os.environ.get("PELLET_THREAT_DAMP", "0.3"))
+CONVERT_RACE_RATIO = float(_os.environ.get("CONVERT_RACE_RATIO", "0.5"))
+CONVERT_RACE_LOSS  = float(_os.environ.get("CONVERT_RACE_LOSS", "0.0"))
 
 class TaskType(IntEnum):
     HUNT        = 0
@@ -44,6 +47,10 @@ class TaskType(IntEnum):
     EXPLORE     = 3
     DYNAMIC     = 4        #rl generated waypoints that dont fit the above
     FLANK       = 5        #multi-directional cutoff/corridor intercept
+
+ORIGIN_HEURISTIC  = 0      #proposed by the allocator
+ORIGIN_RL_ENDORSE = 1      #actor nominated a cell within 1.5 of an allocator proposal and amplified its score
+ORIGIN_RL_NOVEL   = 2      #actor nominated a cell no allocator rule proposed
 
 @dataclass
 class Task:
@@ -54,6 +61,7 @@ class Task:
     created_frame: int = 0
     owner:         int = -1
     target_speed:  float = 1.0
+    origin:        int = ORIGIN_HEURISTIC
 
 def _dist_score(d: float, scale: float) -> float:   #normalize the distances received from dijkstra
     return math.exp(-d/scale) if d != math.inf and d >= 0 else 0.0
@@ -191,7 +199,7 @@ def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
         if pac is not None:
             d_pac = abs(pac[0] - yx_pos[0]) + abs(pac[1] - yx_pos[1])
             threat = math.exp(-d_pac / 7.0)
-            race = 1.0 if dist <= d_pac * 0.9 else 0.35
+            race = 1.0 if dist <= d_pac * CONVERT_RACE_RATIO else CONVERT_RACE_LOSS
             score += CONVERT_DENIAL_W * threat * race
         if powered:
             score *= 0.4   #never walk into a powered Pacman for a pellet
