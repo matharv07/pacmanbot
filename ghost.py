@@ -6,7 +6,7 @@ import numpy as np
 from pathfinder import next_step, path_belief, ghost_dists, find_topological_flee_target_belief
 from cbba import CBBA_Agent
 from beliefmap import BeliefMap
-from allocator import TaskType
+from allocator import TaskType, pellet_threat, PELLET_THREAT_HOLD
 
 CELL = 20
 COLS = 41
@@ -246,7 +246,25 @@ class Ghost:
             pr, pc = self.known_pacman
             pac_y, pac_x = float(pr), float(pc)
             dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
-            if dist_pac < 4.5:
+            threat = pellet_threat(self, (pac_y, pac_x)) if 1.8 <= dist_pac < PELLET_THREAT_HOLD else None
+            if threat is not None:
+                d_me = math.hypot(threat[0] - self.y, threat[1] - self.x)
+                d_pac_pellet = math.hypot(threat[0] - pac_y, threat[1] - pac_x)
+                if d_me * 2.0 < d_pac_pellet:          #we arrive first at the 2:1 speed ratio
+                    dx, dy = threat[1] - self.x, threat[0] - self.y
+                    d = math.hypot(dx, dy)
+                    if d > 0.01:
+                        desired_vx, desired_vy = dx / d, dy / d
+                        moved = True
+                else:                                   #back off along the line away from Pacman
+                    dx, dy = self.x - pac_x, self.y - pac_y
+                    d = math.hypot(dx, dy)
+                    if d > 0.01:
+                        desired_vx, desired_vy = dx / d, dy / d
+                        moved = True
+                if moved and hasattr(self, '_committed_path'):
+                    self._committed_path = []
+            if not moved and dist_pac < 4.5:
                 has_los = True
                 if self.world and hasattr(self.world, 'line_of_sight'):
                     has_los = self.world.line_of_sight((self.x, self.y), (pac_x, pac_y), radius=self.radius, step_size=0.5)
@@ -273,7 +291,10 @@ class Ghost:
                     if moved and hasattr(self, '_committed_path'):
                         self._committed_path = []
         GRAB_DIST = 2.0
-        if not moved and (not self.known_pacman or self.pacman_powered or dist_pac > 4.5):
+        #never detour for a pellet while a powered Pacman is within lock-on range (it chases inside ~12.5)
+        powered_near = self.pacman_powered and (self.known_pacman or self.last_lost_pacman) is not None and \
+            math.hypot((self.known_pacman or self.last_lost_pacman)[0] - self.y, (self.known_pacman or self.last_lost_pacman)[1] - self.x) < 13.0
+        if not moved and not powered_near and (not self.known_pacman or self.pacman_powered or dist_pac > 4.5):
             best_power = None
             best_pd = float('inf')
             #denial uses only power pellets this ghost has seen or been told about

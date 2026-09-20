@@ -862,16 +862,23 @@ class Game:
                                 cand_tasks.append(cur_active)
                         for t in cand_tasks:
                             k = _task_key(t)
+                            if k in pooled_tasks and pooled_tasks[k].owner != t.owner:
+                                #nominated by more than one ghost: nobody gets the own-waypoint bid edge, distance decides
+                                t.assigned_to = -1
+                                pooled_tasks[k].assigned_to = -1
                             if k not in pooled_tasks or t.score > pooled_tasks[k].score:
                                 pooled_tasks[k] = t
                     if pooled_tasks:
                         all_pooled_tasks = list(pooled_tasks.values())
                         all_targets = [t.target_pos for t in all_pooled_tasks]
+                        from allocator import _score_convert
                         for gid in alive:
                             g = self.ghosts[gid]
                             g.cbba_agent._last_auction = self.frame_counter + 6
-                            dists = g.plan_dists(all_targets)
-                            g.cbba_agent._phase1(g, all_pooled_tasks, dists)
+                            pellet_targets = [(p[1], p[0]) for p in g.known_power_pellets]
+                            dists = g.plan_dists(all_targets + pellet_targets)
+                            own_convert = _score_convert(g, dists, self.frame_counter)
+                            g.cbba_agent._phase1(g, all_pooled_tasks + own_convert, dists)
         self.player.update(self.ghosts)
         powered = self.player.powered
         for ghost in self.ghosts.values():

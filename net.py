@@ -13,7 +13,7 @@ from obs import SPATIAL_CH, MAX_H, MAX_W, VEC_DIM, CRITIC_VEC_DIM, GLOBAL_SPATIA
 SPEED_FLOOR   = 0.55
 SPEED_PRIOR_A = 2.6
 SPEED_PRIOR_B = -2.0
-GATE_PRIOR_LOGIT = -1.2
+GATE_PRIOR_LOGIT = -2.2
 RL_MAX_DEVIATION = 1.05
 
 def speed_to_mult(throttle):            #throttle in [0,1] -> speed multiplier in [SPEED_FLOOR, 1.0]
@@ -97,6 +97,9 @@ class GhostActor(nn.Module):
         combined = torch.cat([feats, pool_expanded], dim=1)  #(B, 256, H, W)
         logits = self.head(combined).squeeze(1)              #(B, H, W)
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+        m = mask.to(logits.dtype)
+        n_valid = m.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
+        logits = logits - (logits * m).sum(dim=(1, 2), keepdim=True) / n_valid
         logits = logits.masked_fill(~mask, float('-inf'))
         return logits
 
@@ -106,7 +109,7 @@ class GhostActor(nn.Module):
         -------
         indices  : (B, K) long — flattened cell indices
         logprobs : (B, K)      — log-prob of each sequential pick
-        scores   : (B, H, W)   — independent sigmoid for CBBA
+        scores   : (B, H, W)   — relative preference (softmax / max) in [0, 1] for CBBA
         pool     : (B, 128)    — spatial pool for critic token
         vec      : (B, 128)    — vector embedding for critic token
         speed    : (B, 1)      — sampled continuous speed [0, 1]
@@ -114,8 +117,10 @@ class GhostActor(nn.Module):
         """
         feats, pool, vec = self.encode(spatial, vector)
         logits = self.logits_from_features(feats, pool, mask)
-        #independent sigmoid scores for CBBA
-        scores = torch.sigmoid(logits)
+        B0 = logits.shape[0]
+        p_flat = torch.softmax(torch.nan_to_num(logits.view(B0, -1), nan=float('-inf')), dim=1)
+        scores = (p_flat / p_flat.max(dim=1, keepdim=True).values.clamp(min=1e-12)).view_as(logits)
+        scores = torch.nan_to_num(scores, nan=0.0)
         B = spatial.shape[0]
         base_invalid = ~mask.reshape(B, -1)
         flat = logits.view(B, -1).clone()

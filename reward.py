@@ -87,7 +87,6 @@ class RewardShaper:
             lead_x = target[1] + p_dir[1] * 3.0
             d_lead = abs(ghost.y - lead_y) + abs(ghost.x - lead_x)
             d = min(d, d_lead + 0.5)
-        #three-scale hunt potential for aggressive pursuit: - kill zone (sigma=2.5): extremely steep reward within striking distance - near chase (sigma=5.0): strong pull during active pursuit - far guide (sigma=14.0): gentle gradient across the whole map
         kill_zone  = 0.4 * math.exp(-d / 2.5)
         near_chase = 0.35 * math.exp(-d / 5.0)
         far_guide  = 0.25 * math.exp(-d / 14.0)
@@ -278,7 +277,7 @@ class RewardShaper:
             return 0.0
         r = (self.gamma * phi - self._prev[gid]) * 0.3
         self._prev[gid] = phi
-        return max(-0.5, min(0.5, r))
+        return max(-2.0, min(2.0, r))
 
     def reset(self):
         self._prev.clear()

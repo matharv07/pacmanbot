@@ -26,21 +26,24 @@ UNKNOWN = -1
 
 HUNT_SCALE    = 14.0
 CONVERT_SCALE = 8.0
-CONVERT_DENIAL_W = 7.0  #weight on racing Pacman to a power pellet it is closing on
-SAFE_RADIUS   = 14      #min safe distance from a powered Pacman
+CONVERT_DENIAL_W = 7.0     #weight on racing Pacman to a power pellet it is closing on
+SAFE_RADIUS   = 14         #min safe distance from a powered Pacman
 SAFE_SCALE    = 8.0
-RECENCY_SCALE = 20.0    #sets up quantity to prioritize revisiting older mapped locations
+RECENCY_SCALE = 20.0       #sets up quantity to prioritize revisiting older mapped locations
 EXPLORE_SCALE = 6.0
-UNKNOWN_BONUS = 40      #5x reward(?) of looking for new locations over updating old ones
-EXPLORE_TOP_K = 3       #number of top explore candidates passed to CBBA
+UNKNOWN_BONUS = 40         #5x reward(?) of looking for new locations over updating old ones
+EXPLORE_TOP_K = 3          #number of top explore candidates passed to CBBA
+PELLET_THREAT_DIST = 3.0   #Pacman this close to an unconverted power pellet arms itself before we can close
+PELLET_THREAT_HOLD = 6.0   #hunters inside this radius when the pellet goes died 60-90% of the time (probe, run 13)
+PELLET_THREAT_DAMP = 0.3   #hunt/flank score multiplier while the threat stands
 
 class TaskType(IntEnum):
     HUNT        = 0
     CONVERT     = 1
     EVADE_TRACK = 2
     EXPLORE     = 3
-    DYNAMIC     = 4     #rl generated waypoints that dont fit the above
-    FLANK       = 5     #multi-directional cutoff/corridor intercept
+    DYNAMIC     = 4        #rl generated waypoints that dont fit the above
+    FLANK       = 5        #multi-directional cutoff/corridor intercept
 
 @dataclass
 class Task:
@@ -102,6 +105,24 @@ def _lookup_dist(dists: dict, target: tuple) -> Optional[tuple]:
             best_info = v
     return best_info
 
+def pellet_threat(ghost, pac_pos) -> Optional[tuple]:
+    """Nearest KNOWN unconverted power pellet within PELLET_THREAT_DIST of the Pacman estimate that Pacman is
+    not moving away from, as (y, x). None when there is no such pellet."""
+    if pac_pos is None or not getattr(ghost, 'known_power_pellets', None):
+        return None
+    p_dir = getattr(ghost, '_player_dir', (0.0, 0.0))
+    p_speed = math.hypot(p_dir[0], p_dir[1])
+    best, bd = None, PELLET_THREAT_DIST
+    for px, py in ghost.known_power_pellets:
+        dy, dx = py - pac_pos[0], px - pac_pos[1]
+        d = math.hypot(dy, dx)
+        if d >= bd:
+            continue
+        if p_speed > 0.05 and d > 1.0 and (dy * p_dir[0] + dx * p_dir[1]) / (d * p_speed) < -0.2:
+            continue   #Pacman is heading away from this pellet
+        bd, best = d, (py, px)
+    return best
+
 def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
     if ghost.pacman_powered:
         return []
@@ -119,6 +140,7 @@ def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
     if not hunt_targets:
         return []
     tasks = []
+    threat = pellet_threat(ghost, hunt_targets[0][0]) if hunt_targets[0][2] else None
     for target, conf, is_primary in hunt_targets:
         pr, pc = target
         pr_r, pc_r = round(float(pr), 1), round(float(pc), 1)
@@ -130,6 +152,8 @@ def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
         base_score = _dist_score(dist, HUNT_SCALE)
         close_gradient = 2.5 * math.exp(-dist / 6.0)
         score = (1.2 + 2.0 * base_score + close_gradient) * conf
+        if threat is not None and dist < PELLET_THREAT_HOLD:
+            score *= PELLET_THREAT_DAMP
         tasks.append(Task(task_type=TaskType.HUNT, target_pos=(pr_r, pc_r), score=score, created_frame=frame, owner=ghost.gid, target_speed=1.0))
         if is_primary:
             for cr, cc in _get_cutoff_candidates(ghost, pr, pc):
@@ -138,6 +162,8 @@ def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
                 if cutoff_info and cutoff_info[0] != math.inf:
                     c_dist = cutoff_info[0]
                     cutoff_score = (1.2 + 2.0 * _dist_score(c_dist, HUNT_SCALE) + 2.5 * math.exp(-c_dist / 6.0)) * conf
+                    if threat is not None and c_dist < PELLET_THREAT_HOLD:
+                        cutoff_score *= PELLET_THREAT_DAMP
                     #multi-directional flank task: assigned_to = -1 so CBBA bids purely on agent distance & positioning
                     tasks.append(Task(task_type=TaskType.FLANK, target_pos=(cr_r, cc_r), score=1.15 * cutoff_score, assigned_to=-1, created_frame=frame, owner=ghost.gid, target_speed=1.0))
     return tasks

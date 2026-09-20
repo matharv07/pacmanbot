@@ -20,6 +20,8 @@ SPATIAL_CH   = 11        #number of spatial channels (see channel map below)
 GLOBAL_SPATIAL_CH = 12   #number of channels in the omniscient global state
 VEC_DIM      = 70
 CRITIC_VEC_DIM = MAX_GHOSTS * VEC_DIM + MAX_GHOSTS
+RL_SCORE_BASE = 1.0      #CBBA score of the least-preferred nomination
+RL_SCORE_SPAN = 3.0      #CBBA score of the favourite nomination = BASE + SPAN
 
 """
 Channel Map:
@@ -280,6 +282,9 @@ def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int, o
     rows, cols = scores_map.shape
     tasks = []
     target = _pacman_target(ghost)
+    bm_top = []
+    if hasattr(ghost, 'belief_map') and ghost.belief_map is not None and hasattr(ghost.belief_map, 'top_cells'):
+        bm_top = ghost.belief_map.top_cells(n=5)
     for r, c in indices:
         if r < 0 or r >= rows or c < 0 or c >= cols:
             continue
@@ -287,18 +292,17 @@ def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int, o
         world_x = (float(c) + 0.5) / obs_resolution
         if not ghost.world.is_passable(world_x, world_y, radius=0.35):
             continue
-        score = float(scores_map[r, c])
+        rel = min(1.0, max(0.0, float(scores_map[r, c])))
+        score = RL_SCORE_BASE + RL_SCORE_SPAN * rel
         is_power = any(abs(world_y - p[1]) < 0.5 and abs(world_x - p[0]) < 0.5 for p in ghost.known_power_pellets)
-        bm_prob = 0.0
-        if hasattr(ghost, 'belief_map') and ghost.belief_map is not None:
-            bm_prob = ghost.belief_map.probability_at((world_y, world_x))
+        near_belief = any((abs(world_y - bc[0]) + abs(world_x - bc[1])) <= 3.0 for bc in bm_top)
         if is_power:
             tt = TaskType.CONVERT
-        elif (target is not None and (abs(world_y - target[0]) + abs(world_x - target[1])) <= 3.0) or bm_prob >= 0.15:
+        elif (target is not None and (abs(world_y - target[0]) + abs(world_x - target[1])) <= 3.0) or near_belief:
             tt = TaskType.HUNT
         else:
             tt = TaskType.DYNAMIC
-        tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame, owner=ghost.gid, assigned_to=-1, target_speed=target_speed))
+        tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame, owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed))
     return tasks
 
 def build_global_spatial(env, rows: int, cols: int, obs_resolution: float = 1.0) -> np.ndarray:

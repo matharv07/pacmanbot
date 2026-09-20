@@ -74,8 +74,8 @@ TARGET_KL       = float(os.environ.get("TARGET_KL", "0.015"))
 KL_EMA_ALPHA    = 0.5
 KL_LR_STEP      = 1.15
 LR_WARMUP_UPDATES = 20
-KL_LR_SCALE_BOUNDS = (0.2, 2.5)     #range the KL controller may scale the base LR by (old 6x ceiling caused the overshoot)
-CURRICULUM_START_STAGE = 0
+KL_LR_SCALE_BOUNDS = (0.2, 2.5)
+CURRICULUM_START_STAGE = 2
 critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 AMP_DTYPE = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
@@ -589,8 +589,6 @@ def train():
                             mb_olp = b_olp[chunk_idx]
                             mb_adv = b_adv[chunk_idx]
                             mb_ret = b_ret[chunk_idx]
-                            #safety clamp: actions must be in [0, H*W-1]
-                            #guards against any grid/padding mismatch between rollout and PPO
                             _hw = mb_sp.shape[-2] * mb_sp.shape[-1]
                             if mb_act.max().item() >= _hw:
                                 print(f"  ⚠️  Action index OOB: max={mb_act.max().item()} >= H*W={_hw}, clamping")
@@ -602,17 +600,13 @@ def train():
                                 mb_gsp_unique = b_gsp_unique[unique_ids]
                                 mb_c_pool = critic.encode_spatial(mb_gsp_unique)
                                 v_pred = critic.forward_from_pool(mb_c_pool[inv_idx], mb_cve).squeeze(-1)
-                                #per-head PPO: (B, K+3) log-ratios clipped head by head. At ratio≈1 the
-                                #gradient equals the joint objective's, but one tail sample can no longer
-                                #saturate the whole ratio. The direction head only acts when the hijack
-                                #gate fired, so on gate=0 samples its log-ratio is zeroed (pure noise otherwise)
                                 log_ratio = torch.clamp(new_lp - mb_olp, -10.0, 10.0)
                                 head_w = torch.ones_like(log_ratio)
                                 head_w[:, K_NOMINATIONS + 1] = mb_gate.reshape(-1).float()
                                 log_ratio = log_ratio * head_w
                                 ratio = torch.exp(log_ratio)
                                 with torch.no_grad():
-                                    approx_kl = (0.5 * log_ratio.pow(2)).sum(dim=1).mean()
+                                    approx_kl = (0.5 * log_ratio.pow(2)).sum(dim=1).mean() / log_ratio.shape[1]
                                     clip_fraction = ((torch.abs(ratio - 1.0) > CLIP_EPS).float() * head_w).sum() / head_w.sum().clamp(min=1.0)
                                 adv_h = mb_adv.unsqueeze(1)
                                 s1 = ratio * adv_h
@@ -1091,7 +1085,7 @@ def train():
         if actor_stepped:
             bc_decay_step += 1
         metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_dir, ds_gate, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms, ent_coef)
-        measured_cell_ent = metrics["cell_entropy"] / max(1, metrics["n_batches"])
+        measured_cell_ent = metrics["cell_entropy"] / max(1, metrics["n_batches"]) / K_NOMINATIONS
         if actor_stepped:
             if measured_cell_ent < ENT_TARGET:
                 ent_coef = min(ENT_COEF_BOUNDS[1], ent_coef * ENT_COEF_STEP)
@@ -1150,6 +1144,7 @@ def train():
             current_returns = [0.0] * NUM_ENVS
             bc_decay_step = 0
             kl_ema = None
+            kl_lr_scale = 1.0   #run 13 carried the 0.2 floor from stage 3 into stage 4 for the rest of the run
             for pg in opt_critic.param_groups:
                 pg['_base_lr'] = max(0.8e-4, pg.get('_base_lr', LR_CRITIC) * 0.80)
             _stage_start_update = update  #reset LR warmup for new stage

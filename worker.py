@@ -15,7 +15,7 @@ from ghost  import Ghost, GHOST_COLORS
 import pathfinder
 from obs import (build_spatial, build_global_spatial, build_vector, build_valid_mask, actions_to_tasks, MAX_H, MAX_W, MAX_GHOSTS, UNKNOWN, SPATIAL_CH, GLOBAL_SPATIAL_CH, VEC_DIM)
 from reward import RewardShaper
-from allocator import generate_tasks as heuristic_generate_tasks
+from allocator import generate_tasks as heuristic_generate_tasks, _score_convert as heuristic_score_convert
 from beliefmap import extract_movement_features
 from net import speed_to_mult, mult_to_throttle
 
@@ -217,6 +217,10 @@ class Env:
                         cand_tasks.append(cur_active)
                 for t in cand_tasks:
                     k = _task_key(t)
+                    if k in pooled_tasks and pooled_tasks[k].owner != t.owner:
+                        #nominated by more than one ghost: nobody gets the own-waypoint bid edge, distance decides
+                        t.assigned_to = -1
+                        pooled_tasks[k].assigned_to = -1
                     if k not in pooled_tasks or t.score > pooled_tasks[k].score:
                         pooled_tasks[k] = t
             if pooled_tasks:
@@ -226,8 +230,10 @@ class Env:
                     if gid in action_dict:
                         g = self.ghosts[gid]
                         g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
-                        h_dists = g.plan_dists(all_targets)
-                        g.cbba_agent._phase1(g, all_pooled_tasks, h_dists)
+                        pellet_targets = [(p[1], p[0]) for p in g.known_power_pellets]
+                        h_dists = g.plan_dists(all_targets + pellet_targets)
+                        own_convert = heuristic_score_convert(g, h_dists, self.frame)
+                        g.cbba_agent._phase1(g, all_pooled_tasks + own_convert, h_dists)
         rewards = {gid: 0.0 for gid in alive}
         done = False
         pred_samples = []
@@ -242,9 +248,14 @@ class Env:
                     if a_gid in rewards and not self.ghosts[a_gid].dead:
                         rewards[a_gid] -= 0.004 * score_diff  #-0.04 per normal pellet (10 score)
             if not powered_before and getattr(self.player, 'powered', False):
+                #activation penalty attributed by distance to the pellet Pacman just ate (it is standing on it):
+                #a flat -2 to every ghost gave the actor nothing to connect to its own nominations. The ghosts
+                #that could have converted or denied it carry most of the cost; far ghosts share a small base
                 for a_gid in alive:
                     if a_gid in rewards and not self.ghosts[a_gid].dead:
-                        rewards[a_gid] -= 2.0    #flat power pellet activation penalty
+                        g_a = self.ghosts[a_gid]
+                        d_pel = math.hypot(g_a.y - self.player.y, g_a.x - self.player.x)
+                        rewards[a_gid] -= 0.5 + 2.0 * math.exp(-d_pel / 6.0)
             powered = self.player.powered
             new_pac_v = np.array([float(self.player.vy), float(self.player.vx)], dtype=np.float32)
             if self._pending_pred is not None:

@@ -4,6 +4,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra as _sp_dijkstra
 
+FLEE_SPEED_RATIO = 2.0
 def _euclidean(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
@@ -445,10 +446,20 @@ def find_topological_flee_target_belief(belief_map, ghost_pos: tuple, pac_pos: t
     reachable = np.isfinite(d_ghost) & np.isfinite(d_pac)
     if not np.any(reachable):
         return None
-    #prefer nodes Pacman is far from and the ghost can still reach before being caught
+    graph = _belief_csr(belief_map)
+    deg_bonus = np.zeros(d_pac.shape)
+    if graph is not None and graph.shape[0] == len(deg_bonus):
+        deg = np.diff(graph.indptr)
+        deg_bonus = np.where(deg >= 3, 4.0, np.where(deg <= 1, -12.0, 0.0))
     score = np.full(d_pac.shape, -np.inf)
-    score[reachable] = d_pac[reachable] - 0.6 * d_ghost[reachable]
-    best = int(np.argmax(score))
+    score[reachable] = d_pac[reachable] - 0.6 * d_ghost[reachable] + deg_bonus[reachable]
+    lead = np.zeros(d_pac.shape, dtype=bool)
+    lead[reachable] = d_pac[reachable] > FLEE_SPEED_RATIO * d_ghost[reachable] + 1.0
+    if np.any(lead):
+        safe = np.where(lead, score, -np.inf)
+        best = int(np.argmax(safe))
+    else:
+        best = int(np.argmax(score))
     if not np.isfinite(score[best]):
         return None
     node = belief_map._open_cells[best]
