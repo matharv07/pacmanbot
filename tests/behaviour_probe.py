@@ -253,9 +253,14 @@ def _worker(mode, ckpt, stage_idx, seeds, radio=None, lidar=None):
     from net import GhostActor
     stage = STAGES[stage_idx]
     actor = None
-    if mode == 'rl':
-        ck = torch.load(ckpt, map_location='cpu', weights_only=False)
-        actor = GhostActor(); actor.load_state_dict(ck['actor']); actor.eval()
+    if mode in ('rl', 'floor'):
+        if os.path.basename(str(ckpt)) == 'fresh':
+            torch.manual_seed(0)
+            actor = GhostActor()
+        else:
+            ck = torch.load(ckpt, map_location='cpu', weights_only=False)
+            actor = GhostActor(); actor.load_state_dict(ck['actor'])
+        actor.eval()
     elif mode == 'floor':
         if os.path.exists(ckpt):
             try:
@@ -288,7 +293,10 @@ def report(mode, games, log):
     deaths = [d for g in games for d in g['deaths']]
     print(f"\n==================== {mode.upper()}  ({n} games) ====================")
     print(f"outcomes: " + ", ".join(f"{k} {v / n:.0%}" for k, v in sorted(oc.items())))
+    kf = [g['frames'] for g in games if g['outcome'] == 'kill']
     print(f"kill rate {oc['kill'] / n:.3f} | mean frames {_m([g['frames'] for g in games]):.0f} | pac score {_m([g['pac_score'] for g in games]):.0f}")
+    print(f"TARGET METRICS  time-to-kill {_m(kf):.0f} frames (median {_q(kf, 50):.0f}, p90 {_q(kf, 90):.0f}, kills only)"
+          f" | ghosts lost {len(deaths) / n:.2f}/game | pacman score {_m([g['pac_score'] for g in games]):.0f}")
     print(f"ghost deaths/game {len(deaths) / n:.2f} | powered share of game {_m([g['powered_frames'] / max(1, g['frames']) for g in games]):.0%} | some ghost knows Pacman {_m([g['known_frac'] for g in games]):.0%} of decisions")
     conv = [g['power_start'] - g['power_left'] - g['activations'] for g in games]
     print(f"power pellets: start {_m([g['power_start'] for g in games]):.1f} | eaten by Pacman {_m([g['activations'] for g in games]):.1f}/game | converted by ghosts {_m(conv):.1f}/game | left at end {_m([g['power_left'] for g in games]):.1f}")

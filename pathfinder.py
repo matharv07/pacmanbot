@@ -404,6 +404,14 @@ def leg_cost_belief(belief_map, a, b):
     ia, ib = _node_idx(belief_map, a), _node_idx(belief_map, b)
     if ia < 0 or ib < 0:
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
+    if ia == ib:
+        return 0.0
+    base = getattr(belief_map, '_plan_base', None)
+    if base is not None:
+        rows = base.get('rows', {})
+        if ib in rows and ia not in rows:
+            d = rows[ib][0][ia]
+            return float(d) if math.isfinite(d) else abs(a[0] - b[0]) + abs(a[1] - b[1])
     dist, _ = _dist_row(belief_map, ia, allow_stale=True)
     d = dist[ib]
     return float(d) if math.isfinite(d) else abs(a[0] - b[0]) + abs(a[1] - b[1])

@@ -1,6 +1,7 @@
 import pytest
 import math
 import numpy as np
+import random
 from world import World
 from ghost import Ghost
 from pathfinder import find_topological_flee_target, astar
@@ -8,6 +9,9 @@ from curriculum import STAGES
 
 def test_topological_flee_picks_safe_node():
     """Verify find_topological_flee_target selects a safe node with positive lead margin."""
+    #seeded: the maze is random, and without this the test's outcome depended on how much RNG the
+    #tests before it consumed, so the suite failed intermittently and could not be trusted as a gate
+    random.seed(7); np.random.seed(7)
     w = World(21, 27, resolution=0.5)
     w.generate(n_obstacles=15, n_power=8)
 

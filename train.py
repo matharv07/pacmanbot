@@ -13,6 +13,7 @@ if mp.current_process().name == 'MainProcess':
         setup_dependencies.main()
     except Exception as e:
         print(f"Failed to check dependencies: {e}")
+import collections
 import numpy as np
 import torch
 import torch.nn as nn
@@ -74,7 +75,13 @@ TARGET_KL       = float(os.environ.get("TARGET_KL", "0.008"))
 KL_EMA_ALPHA    = 0.5
 KL_LR_STEP      = 1.15
 LR_WARMUP_UPDATES = 20
-KL_LR_SCALE_BOUNDS = (0.2, 1.5)     
+KL_LR_SCALE_BOUNDS = (0.2, float(os.environ.get("KL_LR_MAX", "4.0")))   #run 15 sat at the 1.5 ceiling for 98% of
+#stage-3 updates with measured per-head KL 0.0016-0.0021 against a 0.008 target: the optimiser was throttled,
+#not unstable. 1456 updates moved the actor 34% in weight space and changed the kill rate by exactly zero.
+METRIC_WINDOW = int(os.environ.get("METRIC_WINDOW", "20"))   #rolling window for the three target metrics.
+#At ~14 episodes/update a single update has an SE of ~117 frames on time-to-kill, so it is unreadable.
+#Window 10 resolves a 74-frame change, 20 resolves 52, 40 resolves 37. 20 matches the 10-update post
+#cadence while staying mostly fresh.
 CURRICULUM_START_STAGE = 0
 critic_warmup_remaining = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -118,6 +125,8 @@ def push_to_discord(metrics_row):
         phase = "IL -> RL Transition"
     else:
         phase = "Pure RL"
+    def _r(v, suf='', nd=0):
+        return f"{v:.{nd}f}{suf}" if v is not None else "—"
     ret_str = f"{metrics_row['mean_return']:.3f}" if metrics_row['mean_return'] is not None else "—"
     kill_str = f"{metrics_row['kill_rate']:.1%}" if metrics_row.get('kill_rate') is not None else "—"
     pac_str = f"{metrics_row['pacman_score']:.1f}" if metrics_row['pacman_score'] is not None else "—"
@@ -129,7 +138,11 @@ def push_to_discord(metrics_row):
         f"-----------------------------------------\n"
         f"Mean Return:      {ret_str}\n"
         f"Kill Rate:        {kill_str}\n"
-        f"Pacman Score:     {pac_str}\n"
+        f"-----------------------------------------\n"
+        f"TARGETS (roll {metrics_row.get('roll_n', 0)} upd) vs heuristic bar\n"
+        f"  time-to-kill:   {_r(metrics_row.get('time_to_kill_roll'), 'f')}  (bar 605f)\n"
+        f"  ghosts lost:    {_r(metrics_row.get('ghost_deaths_roll'), '', 2)}  (bar 1.88)\n"
+        f"  pacman score:   {_r(metrics_row.get('pacman_score_roll'), '')}  (bar 1942)\n"
         f"-----------------------------------------\n"
         f"Policy Loss:      {metrics_row['actor_loss']:+.5f}\n"
         f"Value Loss:       {metrics_row['value_loss']:.5f}\n"
@@ -432,6 +445,9 @@ def train():
     ema_return   = 0.0
     bc_decay_step = 0
     kl_lr_scale  = 1.0
+    roll_ttk   = collections.deque(maxlen=METRIC_WINDOW)
+    roll_loss  = collections.deque(maxlen=METRIC_WINDOW)
+    roll_pac   = collections.deque(maxlen=METRIC_WINDOW)
     kl_ema       = None   #EMA of measured approx_kl driving the LR controller
     ent_coef     = ENT_COEF_INIT
     if "--resume" in sys.argv:
@@ -739,6 +755,8 @@ def train():
         ep_returns       = []
         ep_pacman_scores = []
         ep_kills         = []
+        ep_deaths        = []      #ghosts lost per episode  -- target metric 2
+        ep_kill_frames   = []      #frames to kill, KILLS ONLY -- target metric 1
         env_pred_trajs = [[] for _ in range(NUM_ENVS)]
         completed_pred_seqs = []
         for _ in range(ROLLOUT_STEPS):
@@ -905,7 +923,11 @@ def train():
                     episodes += 1
                     ep_returns.append(current_returns[e])
                     ep_pacman_scores.append(info_list[e].get("pacman_score", 0))
-                    ep_kills.append(1.0 if info_list[e].get("pacman_caught", False) else 0.0)
+                    _caught = bool(info_list[e].get("pacman_caught", False))
+                    ep_kills.append(1.0 if _caught else 0.0)
+                    ep_deaths.append(info_list[e].get("ghosts_dead", 0))
+                    if _caught:
+                        ep_kill_frames.append(info_list[e].get("frames", 0))
                     current_returns[e] = 0.0
         total_steps += ROLLOUT_STEPS * NUM_ENVS
         for e in range(NUM_ENVS):
@@ -1076,6 +1098,14 @@ def train():
         mean_ret = round(float(np.mean(ep_returns)), 3) if ep_returns else None
         mean_pac = round(float(np.mean(ep_pacman_scores)), 1) if ep_pacman_scores else None
         kill_rate = round(float(np.mean(ep_kills)), 3) if ep_kills else None
+        ttk       = round(float(np.mean(ep_kill_frames)), 1) if ep_kill_frames else None
+        ghost_loss = round(float(np.mean(ep_deaths)), 3) if ep_deaths else None
+        if ttk is not None: roll_ttk.append(ttk)
+        if ghost_loss is not None: roll_loss.append(ghost_loss)
+        if mean_pac is not None: roll_pac.append(mean_pac)
+        ttk_r  = round(float(np.mean(roll_ttk)), 1) if roll_ttk else None
+        loss_r = round(float(np.mean(roll_loss)), 3) if roll_loss else None
+        pac_r  = round(float(np.mean(roll_pac)), 1) if roll_pac else None
         if mean_ret is not None:
             if ema_return == 0.0:
                 ema_return = mean_ret
@@ -1121,6 +1151,12 @@ def train():
             "mean_return": mean_ret,
             "pacman_score": mean_pac,
             "kill_rate": kill_rate,
+            "time_to_kill": ttk,
+            "ghost_deaths": ghost_loss,
+            "time_to_kill_roll": ttk_r,
+            "ghost_deaths_roll": loss_r,
+            "pacman_score_roll": pac_r,
+            "roll_n":     len(roll_ttk),
             "curriculum_stage": curriculum.stage_idx,
             "grid_size": f"{curriculum.stage.rows}x{curriculum.stage.cols}",
             "lr":         opt_actor.param_groups[0]['lr'],
@@ -1200,6 +1236,13 @@ def train():
                 pac_str = f"{row['pacman_score']:.1f}" if row['pacman_score'] is not None else "—"
                 kill_str = f"{row['kill_rate']:.1%}" if row.get('kill_rate') is not None else "—"
                 print(f"│  Ghost Return: {ret_str:<10}  Kill Rate: {kill_str:<8}  Pacman Score: {pac_str}")
+                ttk_str  = f"{ttk:.0f}f" if ttk is not None else "—"
+                loss_str = f"{ghost_loss:.2f}" if ghost_loss is not None else "—"
+                print(f"│  TARGETS → time-to-kill: {ttk_str:<8} ghosts lost: {loss_str:<7} pac score: {pac_str}")
+                r1 = f"{ttk_r:.0f}f" if ttk_r is not None else "—"
+                r2 = f"{loss_r:.2f}" if loss_r is not None else "—"
+                r3 = f"{pac_r:.0f}" if pac_r is not None else "—"
+                print(f"│  rolling({len(roll_ttk)}):  time-to-kill: {r1:<8} ghosts lost: {r2:<7} pac score: {r3}   [heuristic bar 605f / 1.88 / 1942]")
                 print(f"│  Timings: Rollout {t_rollout:.1f}s | PPO {t_ppo:.1f}s")
                 print(f"└{'─'*64}")
                 sys.stdout.flush()

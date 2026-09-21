@@ -8,6 +8,7 @@ and converts the RL actor's sampled waypoints back into CBBA Task objects.
 import math
 import numpy as np
 from allocator import Task, TaskType, ORIGIN_RL_ENDORSE, ORIGIN_RL_NOVEL
+import os as _os
 
 WALL    = 1
 PELLET  = 2
@@ -20,9 +21,10 @@ SPATIAL_CH   = 12        #number of spatial channels (see channel map below)
 GLOBAL_SPATIAL_CH = 12   #number of channels in the omniscient global state
 VEC_DIM      = 70
 CRITIC_VEC_DIM = MAX_GHOSTS * VEC_DIM + MAX_GHOSTS
-RL_SCORE_BASE   = 0.2
-RL_SCORE_SPAN   = 10.0
-RL_ENDORSE_GAIN = 2.0
+RL_SCORE_BASE   = float(_os.environ.get("RL_SCORE_BASE", "0.2"))
+RL_SCORE_SPAN   = float(_os.environ.get("RL_SCORE_SPAN", "5.0"))
+RL_ENDORSE_GAIN = float(_os.environ.get("RL_ENDORSE_GAIN", "2.0"))
+RL_SNAP_RADIUS  = float(_os.environ.get("RL_SNAP_RADIUS", "3.0"))
 
 """
 Channel Map:
@@ -305,11 +307,11 @@ def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int, o
         rel = min(1.0, max(0.0, float(scores_map[r, c])))
         conf = rel * rel
         score = RL_SCORE_BASE + RL_SCORE_SPAN * conf
-        near = None
+        near, near_d = None, RL_SNAP_RADIUS
         for t in cands:
-            if abs(t.target_pos[0] - world_y) + abs(t.target_pos[1] - world_x) <= 1.5:
-                near = t
-                break
+            d_c = abs(t.target_pos[0] - world_y) + abs(t.target_pos[1] - world_x)
+            if d_c <= near_d:
+                near, near_d = t, d_c
         if near is not None:
             tasks.append(Task(task_type=near.task_type, target_pos=near.target_pos, score=max(float(near.score) * (1.0 + RL_ENDORSE_GAIN * conf), score), created_frame=frame, owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed, origin=ORIGIN_RL_ENDORSE))
             continue

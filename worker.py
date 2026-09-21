@@ -10,6 +10,7 @@ import random
 import math
 import numpy as np
 import pacman as _pac
+from os import environ as _env
 from pacman import generate_map, Player, WALL, PELLET, POWER, EMPTY
 from ghost  import Ghost, GHOST_COLORS
 import pathfinder
@@ -31,11 +32,13 @@ _DEFAULT_COLS = 41
 _DEFAULT_GHOSTS = 7
 _DEFAULT_POWER = 28
 
-KILL_BASE    = 16.0
-KILL_SPEED_W = 0.5
-SURVIVOR_W   = 10.0
-DEATH_SELF   = -12.0
-DEATH_PEER   = -1.5
+KILL_BASE       = float(_env.get("KILL_BASE", "14.0"))
+KILL_SPEED_W    = float(_env.get("KILL_SPEED_W", "1.2"))
+KILL_TIME_SCALE = float(_env.get("KILL_TIME_SCALE", "500.0"))   #frames; ~the current mean time-to-kill
+SURVIVOR_W      = float(_env.get("SURVIVOR_W", "14.0"))
+DEATH_SELF      = float(_env.get("DEATH_SELF", "-15.0"))
+DEATH_PEER      = float(_env.get("DEATH_PEER", "-1.5"))
+STEP_COST       = float(_env.get("STEP_COST", "0.035"))          #per DECISION, not per frame
 
 class Env:
     def __init__(self, env_id: int = 0, num_ghosts: int = _DEFAULT_GHOSTS, world_height: float = float(_DEFAULT_ROWS), world_width: float = float(_DEFAULT_COLS), obs_resolution: float = 1.0, n_power: int = _DEFAULT_POWER, randomize_opponent: bool = True):
@@ -383,8 +386,8 @@ class Env:
                             self.player.die()
                             done = True
                             alive_now = [g2 for g2 in self.ghosts.values() if not g2.dead]
-                            time_left = 1.0 - min(1.0, self.frame / max(1.0, float(self.max_frames)))
-                            kill_pay = KILL_BASE * (1.0 + KILL_SPEED_W * time_left)
+                            speed_bonus = math.exp(-self.frame / max(1.0, KILL_TIME_SCALE))
+                            kill_pay = KILL_BASE * (1.0 + KILL_SPEED_W * speed_bonus)
                             surv_frac = len(alive_now) / max(1, self.num_ghosts)
                             for a_g in alive_now:
                                 if a_g.gid in rewards:
@@ -406,7 +409,7 @@ class Env:
                 for o in rewards:
                     rewards[o] -= 10.0   #ran out of time
                 break
-            step_cost = 0.010 / DECISION_INTERVAL
+            step_cost = STEP_COST / DECISION_INTERVAL
             for gid in rewards:
                 if self.ghosts[gid].dead:
                     continue
@@ -437,4 +440,5 @@ class Env:
             self._refresh_bc_targets()
             obs = self.observe()
         pacman_caught = bool(getattr(self.player, "dead", False))
-        return obs, rewards, done, {"pacman_score": getattr(self.player, "score", 0), "pacman_caught": pacman_caught, "pred_samples": pred_samples}
+        return obs, rewards, done, {"pacman_score": getattr(self.player, "score", 0), "pacman_caught": pacman_caught, "frames": self.frame, 
+                                    "ghosts_dead": sum(1 for g in self.ghosts.values() if g.dead), "pred_samples": pred_samples}

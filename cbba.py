@@ -220,10 +220,19 @@ class CBBA_Agent:
                 new_dists = ghost_dists(ghost, (ghost.y, ghost.x), missing)
                 for pos, (d, _) in new_dists.items():
                     self._dist_cache[(round(float(pos[0]), 2), round(float(pos[1]), 2))] = d
+            reachable, dropped = [], 0
             for t in candidate_tasks:
                 ck = (round(float(t.target_pos[0]), 2), round(float(t.target_pos[1]), 2))
-                if ck not in self._dist_cache:
+                d_ck = self._dist_cache.get(ck)
+                if d_ck is None or math.isinf(d_ck) or math.isnan(d_ck):
+                    if getattr(t, 'owner', -1) not in (-1, self.gid):
+                        candidate_keys.discard(_task_key(t))
+                        dropped += 1
+                        continue
                     self._dist_cache[ck] = abs(ghost.y - t.target_pos[0]) + abs(ghost.x - t.target_pos[1])
+                reachable.append(t)
+            if dropped:
+                candidate_tasks = reachable
         #pruning bundle & path: keeping only tasks we still own that are valid
         new_bundle = []
         for k in self.bundle:
@@ -354,7 +363,7 @@ class CBBA_Agent:
                 else:
                     #leg cost between two tasks on the ghost's own belief topology
                     bm = getattr(ghost, 'belief_map', None)
-                    cache_key = (r1, c1, r2, c2)
+                    cache_key = (r1, c1, r2, c2) if (r1, c1) <= (r2, c2) else (r2, c2, r1, c1)
                     d = self._pair_dist_cache.get(cache_key)
                     if d is None:
                         d = leg_cost_belief(bm, (float(r1), float(c1)), (float(r2), float(c2))) if bm is not None else float(abs(r1 - r2) + abs(c1 - c2))

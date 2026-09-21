@@ -358,13 +358,12 @@ class BeliefMap:
             return
         if self._tree is None:
             self._tree = cKDTree(self._open_arr)
-
         newly_disabled = []
-        for wall_pos in unseen_walls:
-            wy, wx = float(wall_pos[0]), float(wall_pos[1])
-            close_idxs = self._tree.query_ball_point([wy, wx], r=0.6)
+        unseen_arr = np.array(unseen_walls, dtype=np.float64)
+        batch_close = self._tree.query_ball_point(unseen_arr, r=0.6)
+        for i, close_idxs in enumerate(batch_close):
             if not close_idxs:
-                dist, idx = self._tree.query([wy, wx])
+                dist, idx = self._tree.query(unseen_arr[i])
                 if dist <= 1.0:
                     close_idxs = [int(idx)]
             for idx in close_idxs:
@@ -403,7 +402,9 @@ class BeliefMap:
             self._nbr_dr[dis_arr, :] = 0.0
             self._nbr_dc[dis_arr, :] = 0.0
             self._nbr_count[dis_arr] = 0
-            sever_mask = np.isin(self._nbr_idx, dis_arr)
+            lookup = np.zeros(self.n_nodes + 1, dtype=bool)
+            lookup[dis_arr] = True
+            sever_mask = lookup[self._nbr_idx]
             if np.any(sever_mask):
                 self._nbr_idx[sever_mask] = -1
                 self._nbr_dist[sever_mask] = 0.0

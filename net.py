@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from obs import SPATIAL_CH, MAX_H, MAX_W, VEC_DIM, CRITIC_VEC_DIM, GLOBAL_SPATIAL_CH
 
-SPEED_FLOOR   = 0.55
+SPEED_FLOOR   = float(__import__("os").environ.get("SPEED_FLOOR", "0.75"))
 SPEED_PRIOR_A = 8.0
 SPEED_PRIOR_B = -6.0
 GATE_PRIOR_LOGIT = -3.0

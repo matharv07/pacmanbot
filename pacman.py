@@ -11,6 +11,7 @@ import random
 import math
 import numpy as np
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from ghost import Ghost, UNKNOWN
 import pathfinder
 import torch
@@ -139,6 +140,17 @@ def load_rl_model():
             RL_ACTOR.load_state_dict(new_actor_sd)
         RL_ACTOR.eval()
         RL_PREDICTOR_WEIGHTS = checkpoint.get("predictor", None)
+        try:
+            from obs import SPATIAL_CH, VEC_DIM
+            dummy_sp = torch.zeros((1, SPATIAL_CH, ROWS, COLS), device=RL_DEVICE, dtype=torch.float32)
+            dummy_ve = torch.zeros((1, VEC_DIM), device=RL_DEVICE, dtype=torch.float32)
+            dummy_vm = torch.ones((1, ROWS, COLS), device=RL_DEVICE, dtype=torch.bool)
+            with torch.inference_mode():
+                RL_ACTOR(dummy_sp, dummy_ve, dummy_vm, K=3)
+            if torch.cuda.is_available() and RL_DEVICE.type == 'cuda':
+                torch.cuda.synchronize()
+        except Exception:
+            pass
         print("RL Model loaded successfully.")
         return True
     except Exception as e:
@@ -694,7 +706,7 @@ class Game:
         except Exception:
             self.font  = pygame.font.Font(None, 22)
             self.small = pygame.font.Font(None, 16)
-        pass
+        self.executor = ThreadPoolExecutor(max_workers=min(max(N_GHOSTS, 2), 8))
         self.new_game()
 
     def new_game(self):
@@ -828,13 +840,23 @@ class Game:
                 from allocator import generate_tasks as _heuristic_tasks
                 sp, ve, vm = [], [], []
                 h_cands, h_dists_all = {}, {}
-                for gid in alive:
+
+                def _build_obs_task(gid):
                     g = self.ghosts[gid]
-                    h_cands[gid], h_dists_all[gid] = _heuristic_tasks(g, self.frame_counter)
-                    g._rl_candidates = h_cands[gid]
-                    sp.append(build_spatial(g, self.recent_nom[gid], R, C, obs_resolution=1.0))
-                    ve.append(build_vector(g))
-                    vm.append(build_valid_mask(g, R, C, obs_resolution=1.0, spatial_walls=sp[-1][0]))
+                    cands, dists = _heuristic_tasks(g, self.frame_counter)
+                    g._rl_candidates = cands
+                    s = build_spatial(g, self.recent_nom[gid], R, C, obs_resolution=1.0)
+                    v = build_vector(g)
+                    m = build_valid_mask(g, R, C, obs_resolution=1.0, spatial_walls=s[0])
+                    return gid, cands, dists, s, v, m
+
+                results = list(self.executor.map(_build_obs_task, alive))
+                for gid, cands, dists, s, v, m in results:
+                    h_cands[gid] = cands
+                    h_dists_all[gid] = dists
+                    sp.append(s)
+                    ve.append(v)
+                    vm.append(m)
                 if alive:
                     t_sp = torch.tensor(np.stack(sp), device=RL_DEVICE, dtype=torch.float32)
                     t_ve = torch.tensor(np.stack(ve), device=RL_DEVICE, dtype=torch.float32)
@@ -878,17 +900,18 @@ class Game:
                                 pooled_tasks[k] = t
                     all_pooled_tasks = list(pooled_tasks.values())
                     all_targets = [t.target_pos for t in all_pooled_tasks]
-                    for gid in alive:
+
+                    def _run_phase1(gid):
                         g = self.ghosts[gid]
-                        #floor runs even when no nomination survived actions_to_tasks (wall / unreachable)
                         own_h = list(h_cands.get(gid, []))
                         if not all_pooled_tasks and not own_h:
-                            continue
+                            return
                         g.cbba_agent._last_auction = self.frame_counter + 6
                         dists = dict(h_dists_all.get(gid, {}))
                         if all_targets:
                             dists.update(g.plan_dists(all_targets))
                         g.cbba_agent._phase1(g, all_pooled_tasks + own_h, dists)
+                    list(self.executor.map(_run_phase1, alive))
         self.player.update(self.ghosts)
         powered = self.player.powered
         for ghost in self.ghosts.values():

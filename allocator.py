@@ -277,25 +277,44 @@ def _score_evade_track(ghost, dists: dict, frame: int) -> Optional[Task]:
 
 def _score_explore(ghost, frame: int) -> List[Task]:
     ls = getattr(ghost, 'prm_last_seen', {})
+    if not ls:
+        return []
+    bm = getattr(ghost, 'belief_map', None)
+    if bm is not None and hasattr(bm, '_open_cells') and len(bm._open_cells) > 0 and len(getattr(bm, '_b_flat', [])) > 0:
+        bm._ensure_initialised()
+        open_cells = bm._open_cells
+        open_arr = bm._open_arr
+        b_flat = bm._b_flat
+        n = len(open_cells)
+        if len(open_arr) == n and len(b_flat) == n:
+            ls_arr = np.array([ls.get(node, -1) for node in open_cells], dtype=np.int32)
+            ages_np = np.where(ls_arr < 0, frame + UNKNOWN_BONUS, frame - ls_arr)
+            recency = 1.0 - np.exp(-ages_np / RECENCY_SCALE)
+            manhattan = np.abs(open_arr[:, 0] - ghost.y) + np.abs(open_arr[:, 1] - ghost.x)
+            dist_factor = np.exp(-manhattan / EXPLORE_SCALE)
+            belief_mult = 1.0 + 8.0 * b_flat
+            scores = 0.5 * recency * dist_factor * belief_mult
+            k = min(EXPLORE_TOP_K, n)
+            if k <= 0:
+                return []
+            top_k = np.argpartition(-scores, k - 1)[:k]
+            top_k = top_k[np.argsort(-scores[top_k])]
+            bundle_nodes = set(key[1] for key in ghost.cbba_agent.bundle) if getattr(ghost, 'cbba_agent', None) else set()
+            tasks: list = []
+            for idx in top_k:
+                pos = open_cells[idx]
+                score = float(scores[idx])
+                if pos in bundle_nodes:
+                    score += 0.5
+                tasks.append(Task(task_type=TaskType.EXPLORE, target_pos=pos, score=score, created_frame=frame, owner=ghost.gid, target_speed=0.8))
+            return tasks
     ages = {}
     for node, last_seen_frame in ls.items():
         if last_seen_frame < 0:
             ages[node] = frame + UNKNOWN_BONUS
         else:
             ages[node] = frame - last_seen_frame
-    bm = getattr(ghost, 'belief_map', None)
-    prob_map = {}
-    if bm is not None and ages:
-        pos_list = list(ages.keys())
-        if hasattr(bm, '_closest_nodes_batch') and hasattr(bm, '_b_flat') and len(getattr(bm, '_open_cells', [])) > 0:
-            bm._ensure_initialised()
-            node_indices = bm._closest_nodes_batch(pos_list)
-            if len(node_indices) == len(pos_list) and len(bm._b_flat) > 0:
-                p_locals = bm._b_flat[node_indices]
-                prob_map = dict(zip(pos_list, p_locals))
-        if not prob_map:
-            prob_map = {pos: bm.probability_at(pos) for pos in pos_list}
-
+    prob_map = {pos: bm.probability_at(pos) for pos in ages} if bm is not None else {}
     scored_nodes = []
     for pos, age in ages.items():
         recency = 1.0 - math.exp(-age / RECENCY_SCALE)
@@ -303,12 +322,11 @@ def _score_explore(ghost, frame: int) -> List[Task]:
         belief_mult = 1.0 + 8.0 * float(prob_map.get(pos, 0.0))
         scored_nodes.append((pos, 0.5 * recency * dist_factor * belief_mult))
     scored_nodes.sort(key=lambda item: item[1], reverse=True)
+    bundle_nodes = set(key[1] for key in ghost.cbba_agent.bundle) if getattr(ghost, 'cbba_agent', None) else set()
     tasks: list = []
     for pos, score in scored_nodes[:EXPLORE_TOP_K]:
-        if getattr(ghost, 'cbba_agent', None):
-            for key in ghost.cbba_agent.bundle:
-                if key[1] == pos:
-                    score += 0.5
+        if pos in bundle_nodes:
+            score += 0.5
         tasks.append(Task(task_type=TaskType.EXPLORE, target_pos=pos, score=score, created_frame=frame, owner=ghost.gid, target_speed=0.8))
     return tasks
 
