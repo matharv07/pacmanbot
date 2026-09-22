@@ -6,6 +6,17 @@ from cbba import CBBA_Agent, _task_key
 from reward import RewardShaper
 from worker import Env
 from curriculum import STAGES
+from obs import MAX_CANDIDATES
+
+def _novel_action(env, cells, score=1.0):
+    """Nominate raw cells through the actor's off-menu head, bypassing the candidate pointer. Mirrors the
+    (cand_picks, cand_scores, novel_pairs, novel_scores, speed, dir, gate) tuple that worker.step expects."""
+    rows, cols = int(env.world_height), int(env.world_width)
+    smap = np.zeros((rows, cols), dtype=np.float32)
+    for (r, c) in cells:
+        if 0 <= r < rows and 0 <= c < cols:
+            smap[r, c] = score
+    return ([], np.zeros(MAX_CANDIDATES, dtype=np.float32), list(cells), smap, 1.0, 0.5, 0.0)
 
 class DummyWorld:
     def __init__(self, h=20, w=20):
@@ -187,8 +198,8 @@ def test_env_mesh_rewards_and_common_pool():
     env.ghosts[1].x = 6.0
 
     actions = {
-        0: ([(2, 2)], [1.0], 1.0),
-        1: ([(2, 6)], [1.0], 1.0)
+        0: _novel_action(env, [(2, 2)]),
+        1: _novel_action(env, [(2, 6)])
     }
     obs, rewards, done, info = env.step(actions, want_bc=False)
     assert 0 in rewards and 1 in rewards
@@ -227,7 +238,7 @@ def test_cross_ghost_task_pooling_and_bidding():
     env.player.x = 20.0
 
     # Both ghosts nominate both waypoints into the common pool
-    actions = {0: ([(r0, c0), (r1, c1)], [5.0, 5.0], 1.0), 1: ([(r0, c0), (r1, c1)], [5.0, 5.0], 1.0)}
+    actions = {0: _novel_action(env, [(r0, c0), (r1, c1)], 5.0), 1: _novel_action(env, [(r0, c0), (r1, c1)], 5.0)}
     obs, rewards, done, info = env.step(actions, want_bc=False)
 
     # Within mesh radio range, consensus resolves:

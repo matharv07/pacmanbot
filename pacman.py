@@ -141,12 +141,15 @@ def load_rl_model():
         RL_ACTOR.eval()
         RL_PREDICTOR_WEIGHTS = checkpoint.get("predictor", None)
         try:
-            from obs import SPATIAL_CH, VEC_DIM
+            from obs import SPATIAL_CH, VEC_DIM, MAX_CANDIDATES, CAND_FEAT_DIM
             dummy_sp = torch.zeros((1, SPATIAL_CH, ROWS, COLS), device=RL_DEVICE, dtype=torch.float32)
             dummy_ve = torch.zeros((1, VEC_DIM), device=RL_DEVICE, dtype=torch.float32)
             dummy_vm = torch.ones((1, ROWS, COLS), device=RL_DEVICE, dtype=torch.bool)
+            dummy_cf = torch.zeros((1, MAX_CANDIDATES, CAND_FEAT_DIM), device=RL_DEVICE, dtype=torch.float32)
+            dummy_cc = torch.zeros((1, MAX_CANDIDATES), device=RL_DEVICE, dtype=torch.long)
+            dummy_cm = torch.ones((1, MAX_CANDIDATES), device=RL_DEVICE, dtype=torch.bool)
             with torch.inference_mode():
-                RL_ACTOR(dummy_sp, dummy_ve, dummy_vm, K=3)
+                RL_ACTOR(dummy_sp, dummy_ve, dummy_vm, dummy_cf, dummy_cc, dummy_cm)
             if torch.cuda.is_available() and RL_DEVICE.type == 'cuda':
                 torch.cuda.synchronize()
         except Exception:
@@ -833,38 +836,49 @@ class Game:
             if RL_ACTOR is None:
                 load_rl_model()
             if RL_ACTOR is not None:
-                from obs import build_spatial, build_vector, build_valid_mask, actions_to_tasks, MAX_H, MAX_W
+                from obs import (build_spatial, build_vector, build_valid_mask, build_candidates, select_candidates,
+                                 flatten_cand_cells, actions_to_tasks, MAX_H, MAX_W)
                 alive = [gid for gid, g in self.ghosts.items() if not g.dead]
                 R = min(MAX_H, len(self.grid))
                 C = min(MAX_W, len(self.grid[0]))
                 from allocator import generate_tasks as _heuristic_tasks
-                sp, ve, vm = [], [], []
+                sp, ve, vm, cf, cc, cm = [], [], [], [], [], []
                 h_cands, h_dists_all = {}, {}
 
                 def _build_obs_task(gid):
                     g = self.ghosts[gid]
                     cands, dists = _heuristic_tasks(g, self.frame_counter)
+                    #frozen ordering: the actor addresses these by index
+                    cands = select_candidates(cands, seed=self.frame_counter * 7 + gid)
                     g._rl_candidates = cands
                     s = build_spatial(g, self.recent_nom[gid], R, C, obs_resolution=1.0)
                     v = build_vector(g)
                     m = build_valid_mask(g, R, C, obs_resolution=1.0, spatial_walls=s[0])
-                    return gid, cands, dists, s, v, m
+                    f_c, c_c, m_c, _ = build_candidates(g, R, C, 1.0, dists)
+                    return gid, cands, dists, s, v, m, f_c, c_c, m_c
 
                 results = list(self.executor.map(_build_obs_task, alive))
-                for gid, cands, dists, s, v, m in results:
+                for gid, cands, dists, s, v, m, f_c, c_c, m_c in results:
                     h_cands[gid] = cands
                     h_dists_all[gid] = dists
                     sp.append(s)
                     ve.append(v)
                     vm.append(m)
+                    cf.append(f_c); cc.append(flatten_cand_cells(c_c, C)); cm.append(m_c)
                 if alive:
                     t_sp = torch.tensor(np.stack(sp), device=RL_DEVICE, dtype=torch.float32)
                     t_ve = torch.tensor(np.stack(ve), device=RL_DEVICE, dtype=torch.float32)
                     t_vm = torch.tensor(np.stack(vm), device=RL_DEVICE, dtype=torch.bool)
+                    t_cf = torch.tensor(np.stack(cf), device=RL_DEVICE, dtype=torch.float32)
+                    t_cc = torch.tensor(np.stack(cc), device=RL_DEVICE, dtype=torch.long)
+                    t_cm = torch.tensor(np.stack(cm), device=RL_DEVICE, dtype=torch.bool)
                     with torch.inference_mode():
-                        idx, _, scores, _, _, speed, _, direction, _, gate, _ = RL_ACTOR(t_sp, t_ve, t_vm, K=3)
+                        (idx, _, scores, nidx, _, nsc, _, _,
+                         speed, _, direction, _, gate, _) = RL_ACTOR(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm)
                     idx_np = idx.cpu().numpy()
                     sc_np  = scores.cpu().numpy()
+                    nidx_np = nidx.cpu().numpy()
+                    nsc_np  = nsc.cpu().numpy()
                     spd_np = speed.cpu().numpy()
                     dir_np = direction.cpu().numpy()
                     gate_np = gate.cpu().numpy()
@@ -872,18 +886,24 @@ class Game:
                     pooled_tasks = {}
                     for i, gid in enumerate(alive):
                         g = self.ghosts[gid]
-                        indices = [(int(x // C), int(x % C)) for x in idx_np[i]]
-                        scores_map = sc_np[i]
+                        novel_pairs = [(int(x // C), int(x % C)) for x in nidx_np[i]]
                         from net import speed_to_mult
                         g.current_speed_mult = speed_to_mult(float(spd_np[i][0]))
                         g.current_rl_dir = float(dir_np[i][0])
                         g.rl_hijack = bool(gate_np[i][0])
                         g.rl_mode = True
                         self.recent_nom[gid] *= 0.8
-                        for r, c in indices:
+                        marks = list(novel_pairs)
+                        for slot in idx_np[i]:
+                            if 0 <= int(slot) < len(h_cands[gid]):
+                                t_s = h_cands[gid][int(slot)]
+                                marks.append((int(t_s.target_pos[0]), int(t_s.target_pos[1])))
+                        for r, c in marks:
                             if 0 <= r < R and 0 <= c < C:
                                 self.recent_nom[gid][r, c] = 1.0
-                        tasks = actions_to_tasks(g, scores_map, indices, self.frame_counter, obs_resolution=1.0, target_speed=g.current_speed_mult)
+                        tasks = actions_to_tasks(g, sc_np[i], [int(x) for x in idx_np[i]], self.frame_counter,
+                                                 obs_resolution=1.0, target_speed=g.current_speed_mult,
+                                                 novel_scores=nsc_np[i], novel_indices=novel_pairs)
                         cand_tasks = list(tasks)
                         cur_active = g.cbba_agent.get_active_task()
                         if cur_active is not None and (self.frame_counter - cur_active.created_frame < 24):

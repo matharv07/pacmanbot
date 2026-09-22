@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from curriculum import STAGES, CurriculumScheduler
 from net import GhostActor, GhostCritic
 from worker import Env
+from obs import flatten_cand_cells
 from reward import RewardShaper
 
 def test_single_env_rollout_and_step():
@@ -19,17 +20,23 @@ def test_single_env_rollout_and_step():
     env = Env(env_id=0, num_ghosts=stage.n_ghosts, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     obs = env.reset()
     assert obs is not None
-    gids, sp, ve, vm, ht, hs, global_sp, grid_shape = obs
+    gids, sp, ve, vm, ht, hs, cf, cc, cm, cbc, global_sp, grid_shape = obs
     assert len(gids) == stage.n_ghosts
+    assert cm.any(), "the heuristic floor must offer the actor at least one candidate to arbitrate over"
     t_sp = torch.from_numpy(sp)
     t_ve = torch.from_numpy(ve)
     t_vm = torch.from_numpy(vm)
+    t_cf = torch.from_numpy(cf)
+    t_cc = torch.from_numpy(flatten_cand_cells(cc, stage.cols))
+    t_cm = torch.from_numpy(cm)
     with torch.no_grad():
-        idx, lp, scores, pool, vec, speed, speed_lp, direction, dir_lp, gate, gate_lp = actor(t_sp, t_ve, t_vm, K=3)
+        (idx, lp, scores, nidx, nlp, nsc, pool, vec,
+         speed, speed_lp, direction, dir_lp, gate, gate_lp) = actor(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm)
     action_dict = {}
     for i, gid in enumerate(gids):
-        pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in idx[i].numpy()]
-        action_dict[gid] = (pairs, scores[i].numpy(), float(speed[i].item()), float(direction[i].item()), float(gate[i].item()))
+        novel_pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in nidx[i].numpy()]
+        action_dict[gid] = ([int(x) for x in idx[i].numpy()], scores[i].numpy(), novel_pairs, nsc[i].numpy(),
+                            float(speed[i].item()), float(direction[i].item()), float(gate[i].item()))
     obs, rewards, done, info = env.step(action_dict, want_bc=False)
     print(f"Step successful. Rewards: {rewards}, Done: {done}, Info: {info}")
     assert "pacman_caught" in info

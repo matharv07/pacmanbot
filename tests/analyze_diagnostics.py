@@ -11,7 +11,8 @@ os.environ['SDL_VIDEODRIVER'] = 'dummy'
 from net import GhostActor
 from worker import Env
 from curriculum import STAGES
-from test import _pad_spatial, K_NOMINATIONS
+from test import _pad_spatial, K_CAND, K_NOVEL
+from obs import flatten_cand_cells
 
 def run_diagnostics(ckpt_path: str = None, stage_idx: int = 1, seed: int = 42, max_frames: int = 250):
     print(f"=== Running Pure RL Diagnostics on Stage {stage_idx} (seed={seed}) ===")
@@ -63,7 +64,7 @@ def run_diagnostics(ckpt_path: str = None, stage_idx: int = 1, seed: int = 42, m
     while env.frame < max_frames:
         if obs is None:
             break
-        gids, sp, ve, vm, ht, hs, global_sp, grid_shape = obs
+        gids, sp, ve, vm, ht, hs, cf, cc, cm, cbc, global_sp, grid_shape = obs
         if not gids:
             break
             
@@ -73,10 +74,17 @@ def run_diagnostics(ckpt_path: str = None, stage_idx: int = 1, seed: int = 42, m
         t_ve = torch.from_numpy(ve[:, :actor_vec_dim].astype(np.float32))
         t_vm = torch.from_numpy(vm_p)
         
+        t_cf = torch.from_numpy(cf.astype(np.float32))
+        t_cc = torch.from_numpy(flatten_cand_cells(cc, stage.cols).astype(np.int64))
+        t_cm = torch.from_numpy(cm.astype(bool))
+
         with torch.inference_mode():
-            idx, lp, scores, _pool, _vec, speed, _speed_lp, direction, _dir_lp, gate, _gate_lp = actor(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
-            
+            (idx, lp, scores, nidx, _nlp, nsc, _pool, _vec,
+             speed, _speed_lp, direction, _dir_lp, gate, _gate_lp) = actor(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm, K_cand=K_CAND, K_novel=K_NOVEL)
+
         idx_np    = idx.cpu().numpy()
+        nidx_np   = nidx.cpu().numpy()
+        nsc_np    = nsc.float().cpu().numpy()
         scores_np = scores.float().cpu().numpy()
         speed_np  = speed.float().cpu().numpy()
         dir_np    = direction.float().cpu().numpy()
@@ -84,8 +92,9 @@ def run_diagnostics(ckpt_path: str = None, stage_idx: int = 1, seed: int = 42, m
         
         action_dict = {}
         for i, gid in enumerate(gids):
-            pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in idx_np[i]]
-            action_dict[gid] = (pairs, scores_np[i], float(speed_np[i].item()), float(dir_np[i].item()), float(gate_np[i].item()))
+            novel_pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in nidx_np[i]]
+            action_dict[gid] = ([int(x) for x in idx_np[i]], scores_np[i], novel_pairs, nsc_np[i],
+                                float(speed_np[i].item()), float(dir_np[i].item()), float(gate_np[i].item()))
             
         # Step environment
         obs, rewards, done, info = env.step(action_dict, want_bc=False)

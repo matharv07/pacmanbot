@@ -1,20 +1,25 @@
 """
 MAPPO actor-critic architecture for cooperative ghost pursuit.
 
-GhostActor:  FiLM-modulated CNN - sequential categorical waypoint sampler
-GhostCritic: Sequence-agnostic multi-head self-attention centralised value head
+GhostActor:  FiLM-modulated CNN trunk feeding two action heads --
+             a pointer head that self-attends over the live heuristic candidate set and scores each
+             candidate directly, and a spatial head that nominates cells no allocator rule proposed.
+GhostCritic: CNN over the omniscient global state + MLP over the joint ghost vectors.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from obs import SPATIAL_CH, MAX_H, MAX_W, VEC_DIM, CRITIC_VEC_DIM, GLOBAL_SPATIAL_CH
+from obs import SPATIAL_CH, MAX_H, MAX_W, VEC_DIM, CRITIC_VEC_DIM, GLOBAL_SPATIAL_CH, MAX_CANDIDATES, CAND_FEAT_DIM
 
 SPEED_FLOOR   = float(__import__("os").environ.get("SPEED_FLOOR", "0.75"))
 SPEED_PRIOR_A = 8.0
 SPEED_PRIOR_B = -6.0
 GATE_PRIOR_LOGIT = -3.0
 RL_MAX_DEVIATION = 1.05
+CAND_DIM   = 128
+CAND_HEADS = 4
+CAND_LAYERS = 2
 
 def speed_to_mult(throttle):            #throttle in [0,1] -> speed multiplier in [SPEED_FLOOR, 1.0]
     return SPEED_FLOOR + (1.0 - SPEED_FLOOR) * float(throttle)
@@ -55,6 +60,63 @@ class FiLM(nn.Module):
         g = g.clamp(-10.0, 10.0)
         return g * spatial + b
 
+def _sample_k(flat, base_invalid, K: int):
+    """K sequential categorical picks without replacement over a masked logit row.
+
+    Once every remaining option is -inf the row falls back to uniform over the originally-valid options,
+    which is what keeps a ghost with fewer live options than K from producing a NaN distribution.
+    """
+    flat = torch.nan_to_num(flat, nan=float('-inf')).clone()
+    idxs, lps = [], []
+    for _ in range(K):
+        all_inf = (torch.isinf(flat) & (flat < 0)).all(dim=1, keepdim=True)
+        fallback = torch.where(base_invalid, torch.full_like(flat, float('-inf')), torch.zeros_like(flat))
+        flat = torch.where(all_inf, fallback, flat)
+        dist = torch.distributions.Categorical(logits=flat)
+        i = dist.sample()
+        idxs.append(i)
+        lps.append(dist.log_prob(i))
+        flat = flat.scatter(1, i.unsqueeze(1), float('-inf'))
+    return torch.stack(idxs, 1), torch.stack(lps, 1)
+
+def _eval_k(flat, base_invalid, actions):
+    """Re-score stored picks under the same sequential-without-replacement scheme as _sample_k."""
+    flat = torch.nan_to_num(flat, nan=float('-inf')).clone()
+    lps, ents = [], []
+    for k in range(actions.shape[1]):
+        all_inf = (torch.isinf(flat) & (flat < 0)).all(dim=1, keepdim=True)
+        fallback = torch.where(base_invalid, torch.full_like(flat, float('-inf')), torch.zeros_like(flat))
+        flat = torch.where(all_inf, fallback, flat)
+        dist = torch.distributions.Categorical(logits=flat)
+        lps.append(dist.log_prob(actions[:, k]))
+        ents.append(dist.entropy())
+        hit = torch.zeros_like(flat, dtype=torch.bool).scatter(1, actions[:, k].unsqueeze(1), True)
+        flat = torch.where(hit, float('-inf'), flat)
+    return torch.stack(lps, 1), torch.stack(ents, 1)
+
+def _confidence_above_uniform(logits, valid):
+    """Map a masked logit row to [0,1] CBBA scores: 0 = no better than guessing, 1 = all mass on one option."""
+    p = torch.softmax(torch.nan_to_num(logits, nan=float('-inf')), dim=1)
+    n_valid = valid.sum(dim=1, keepdim=True).clamp(min=2).to(p.dtype)
+    out = (torch.log(p * n_valid + 1e-12) / torch.log(n_valid)).clamp(0.0, 1.0)
+    return torch.nan_to_num(out, nan=0.0)
+
+class CandidateBlock(nn.Module):
+    """Pre-norm self-attention over the candidate set: lets a ghost score a task in the context of every
+    other task on offer and of what its peers have already claimed, rather than one cell at a time."""
+    def __init__(self, d=CAND_DIM, heads=CAND_HEADS):
+        super().__init__()
+        self.ln1  = nn.LayerNorm(d)
+        self.attn = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.ln2  = nn.LayerNorm(d)
+        self.ff   = nn.Sequential(nn.Linear(d, 2 * d), nn.GELU(), nn.Linear(2 * d, d))
+
+    def forward(self, x, key_padding_mask):
+        h = self.ln1(x)
+        a, _ = self.attn(h, h, h, key_padding_mask=key_padding_mask, need_weights=False)
+        x = x + torch.nan_to_num(a, nan=0.0)
+        return x + self.ff(self.ln2(x))
+
 class GhostActor(nn.Module):
     def __init__(self, vec_dim: int = VEC_DIM):
         super().__init__()
@@ -65,6 +127,13 @@ class GhostActor(nn.Module):
         self.res3 = ResBlock(128, 128, cond_dim=128)
         #1×1 conv to logit map (combines 128 local spatial channels + 128 global context channels)
         self.head = nn.Conv2d(256, 1, 1)
+        #pointer head: each candidate is (its own features, the trunk features at its target cell, global context)
+        self.cand_enc = nn.Sequential(nn.Linear(CAND_FEAT_DIM + 128 + 256, CAND_DIM), nn.LayerNorm(CAND_DIM), nn.GELU(),
+                                      nn.Linear(CAND_DIM, CAND_DIM), nn.LayerNorm(CAND_DIM), nn.GELU())
+        self.cand_blocks = nn.ModuleList([CandidateBlock() for _ in range(CAND_LAYERS)])
+        self.cand_head = nn.Linear(CAND_DIM, 1)
+        nn.init.zeros_(self.cand_head.weight)
+        nn.init.zeros_(self.cand_head.bias)
         self.speed_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 2))
         self.dir_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 2))
         self.gate_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 1))
@@ -97,41 +166,54 @@ class GhostActor(nn.Module):
         logits = logits.masked_fill(~mask, float('-inf'))
         return logits
 
-    def forward(self, spatial, vector, mask, K=3):
+    def candidate_logits(self, feats, pool, vec, cand_feat, cand_cell, cand_mask):
+        """
+        cand_feat : (B, M, CAND_FEAT_DIM)   tabular features of each live candidate
+        cand_cell : (B, M) long             flattened r*W+c of each candidate's target, for feature gathering
+        cand_mask : (B, M) bool             True where a real candidate sits
+
+        Returns (B, M) logits masked to the live set, and the padding-safe mask actually used.
+        """
+        B, C, H, W = feats.shape
+        M = cand_feat.shape[1]
+        flat = feats.reshape(B, C, H * W)
+        idx = cand_cell.clamp(0, H * W - 1).unsqueeze(1).expand(B, C, M)
+        local = flat.gather(2, idx).permute(0, 2, 1)                      #(B, M, 128)
+        ctx = torch.cat([pool, vec], dim=1).unsqueeze(1).expand(-1, M, -1)  #(B, M, 256)
+        x = self.cand_enc(torch.cat([cand_feat.to(local.dtype), local, ctx], dim=-1))
+        #a ghost with no candidates at all would make every key padded, and MHA returns NaN for such a row
+        safe = cand_mask | (~cand_mask.any(dim=1, keepdim=True) & (torch.arange(M, device=cand_mask.device) == 0))
+        for blk in self.cand_blocks:
+            x = blk(x, key_padding_mask=~safe)
+        logits = torch.nan_to_num(self.cand_head(x).squeeze(-1), nan=0.0, posinf=0.0, neginf=0.0)
+        #centre over the live set before masking, the same anchoring the spatial head needs
+        m = safe.to(logits.dtype)
+        n_valid = m.sum(dim=1, keepdim=True).clamp(min=1.0)
+        logits = logits - (logits * m).sum(dim=1, keepdim=True) / n_valid
+        return logits.masked_fill(~safe, float('-inf')), safe
+
+    def forward(self, spatial, vector, mask, cand_feat, cand_cell, cand_mask, K_cand=3, K_novel=1):
         """
         Returns
         -------
-        indices  : (B, K) long — flattened cell indices
-        logprobs : (B, K)      — log-prob of each sequential pick
-        scores   : (B, H, W)   — confidence above uniform, log-scaled to [0, 1], for CBBA
-        pool     : (B, 128)    — spatial pool for critic token
-        vec      : (B, 128)    — vector embedding for critic token
-        speed    : (B, 1)      — sampled continuous speed [0, 1]
-        speed_lp : (B, 1)      — log prob of sampled speed
+        cand_idx    : (B, K_cand)  long  — indices into the ghost's own candidate list
+        cand_lp     : (B, K_cand)
+        cand_scores : (B, M)             — confidence above uniform in [0,1], the CBBA nomination score
+        novel_idx   : (B, K_novel) long  — flattened cell indices for off-menu waypoints
+        novel_lp    : (B, K_novel)
+        novel_scores: (B, H, W)
+        pool, vec   : (B, 128) each      — critic tokens
+        speed / direction / gate and their log-probs, each (B, 1)
         """
         feats, pool, vec = self.encode(spatial, vector)
-        logits = self.logits_from_features(feats, pool, mask)
-        B0 = logits.shape[0]
-        flat_l = torch.nan_to_num(logits.view(B0, -1), nan=float('-inf'))
-        p_flat = torch.softmax(flat_l, dim=1)
-        n_valid = torch.isfinite(flat_l).sum(dim=1, keepdim=True).clamp(min=2).to(p_flat.dtype)
-        scores = (torch.log(p_flat * n_valid + 1e-12) / torch.log(n_valid)).clamp(0.0, 1.0).view_as(logits)
-        scores = torch.nan_to_num(scores, nan=0.0)
-        B = spatial.shape[0]
-        base_invalid = ~mask.reshape(B, -1)
-        flat = logits.view(B, -1).clone()
-        flat = torch.nan_to_num(flat, nan=float('-inf'))
-        sel_idx, sel_lp = [], []
-        for _ in range(K):
-            inf_mask = torch.isinf(flat) & (flat < 0)
-            all_inf = inf_mask.all(dim=1, keepdim=True)
-            fallback = torch.where(base_invalid, torch.full_like(flat, float('-inf')), torch.zeros_like(flat))
-            flat = torch.where(all_inf, fallback, flat)
-            dist = torch.distributions.Categorical(logits=flat)
-            idx  = dist.sample()
-            sel_idx.append(idx)
-            sel_lp.append(dist.log_prob(idx))
-            flat.scatter_(1, idx.unsqueeze(1), float('-inf'))
+        c_logits, safe = self.candidate_logits(feats, pool, vec, cand_feat, cand_cell, cand_mask)
+        cand_scores = _confidence_above_uniform(c_logits, safe)
+        cand_idx, cand_lp = _sample_k(c_logits, ~safe, K_cand)
+        s_logits = self.logits_from_features(feats, pool, mask)
+        B0 = s_logits.shape[0]
+        flat_s = s_logits.view(B0, -1)
+        novel_scores = _confidence_above_uniform(flat_s, torch.isfinite(flat_s)).view_as(s_logits)
+        novel_idx, novel_lp = _sample_k(flat_s, ~mask.reshape(B0, -1), K_novel)
         tok = torch.cat([pool, vec], dim=1)
         dist_speed = self._speed_dist(tok)
         speed = torch.clamp(dist_speed.sample(), 1e-3, 1.0 - 1e-3)
@@ -142,8 +224,9 @@ class GhostActor(nn.Module):
         dist_gate = self._gate_dist(tok)
         gate = dist_gate.sample()
         gate_lp = dist_gate.log_prob(gate)
-        return (torch.stack(sel_idx, 1), torch.stack(sel_lp, 1), scores, pool, vec, speed.unsqueeze(1), speed_lp.unsqueeze(1), 
-                direction.unsqueeze(1), dir_lp.unsqueeze(1), gate.unsqueeze(1), gate_lp.unsqueeze(1))
+        return (cand_idx, cand_lp, cand_scores, novel_idx, novel_lp, novel_scores, pool, vec,
+                speed.unsqueeze(1), speed_lp.unsqueeze(1), direction.unsqueeze(1), dir_lp.unsqueeze(1),
+                gate.unsqueeze(1), gate_lp.unsqueeze(1))
 
     def _speed_dist(self, tok):
         params = torch.clamp(F.softplus(self.speed_head(tok)) + 1.5, min=1.5, max=12.0)
@@ -156,52 +239,35 @@ class GhostActor(nn.Module):
     def _gate_dist(self, tok):
         return torch.distributions.Bernoulli(logits=self.gate_head(tok).squeeze(-1).clamp(-8.0, 8.0))
 
-    def evaluate_actions(self, spatial, vector, mask, actions, speeds, directions=None, gates=None):
+    def evaluate_actions(self, spatial, vector, mask, cand_feat, cand_cell, cand_mask,
+                         cand_actions, novel_actions, speeds, directions=None, gates=None):
         """
-        Re-computes log-probs and entropy for *stored* action indices.
-        Used inside the PPO update loop (single forward pass).
-
-        Parameters
-        ----------
-        actions    : (B, K) long — previously sampled flattened indices
-        speeds     : (B, 1) float — previously sampled speed throttles
-        directions : (B, 1) float, optional — previously sampled steering residuals
-        gates      : (B, 1) float, optional — previously sampled hijack gate (0/1)
+        Re-computes log-probs and entropy for *stored* actions. One forward pass per PPO micro-batch.
 
         Returns
         -------
-        logprobs    : (B, K+3)      — per-head log-probs: K cell picks, speed, direction, gate
-        entropy     : (B,)          — summed entropy: K cell picks + speed + direction + gate
-        cell_ent    : (B,)          — summed entropy of the K cell picks only (exploration bonus target)
-        pool        : (B, 128)      — spatial pool token
-        vec         : (B, 128)      — vector embedding token
-        flat_logits : (B, H*W)      — reusable for BC loss (NOT detached)
-        speed_params: (B, 2)        — (alpha, beta) for BC loss
+        logprobs     : (B, K_cand + K_novel + 3) — per-head, so PPO can clip and measure KL head by head
+        entropy      : (B,)  — every head summed
+        cand_ent     : (B,)  — candidate picks only, the exploration-bonus target
+        cand_ent_norm: (B,)  — cand_ent normalised by its own maximum; stage-invariant, so one entropy
+                               target holds whether a ghost is choosing among 4 candidates or 19
+        novel_ent    : (B,)  — off-menu head only, kept alive by its own small entropy bonus
+        pool, vec    : critic tokens
+        cand_logits  : (B, M)    — candidate BC target lives on this
+        flat_logits  : (B, H*W)  — spatial BC target lives on this
+        speed_params : (B, 2)
         """
         feats, pool, vec = self.encode(spatial, vector)
-        logits = self.logits_from_features(feats, pool, mask)
+        c_logits, safe = self.candidate_logits(feats, pool, vec, cand_feat, cand_cell, cand_mask)
+        cand_lp, cand_ents = _eval_k(c_logits, ~safe, cand_actions)
+        s_logits = self.logits_from_features(feats, pool, mask)
         B = spatial.shape[0]
         base_invalid = ~mask.reshape(B, -1)
-        flat_clean = torch.nan_to_num(
-            logits.view(B, -1), nan=float('-inf'))
-        inf_mask_clean = torch.isinf(flat_clean) & (flat_clean < 0)
-        all_inf_clean = inf_mask_clean.all(dim=1, keepdim=True)
+        flat_clean = torch.nan_to_num(s_logits.view(B, -1), nan=float('-inf'))
+        all_inf_clean = (torch.isinf(flat_clean) & (flat_clean < 0)).all(dim=1, keepdim=True)
         fallback_clean = torch.where(base_invalid, torch.full_like(flat_clean, float('-inf')), torch.zeros_like(flat_clean))
         flat_clean = torch.where(all_inf_clean, fallback_clean, flat_clean)
-        flat = flat_clean.clone()
-        lp_list, ent_list = [], []
-        K = actions.shape[1]
-        for k in range(K):
-            inf_mask = torch.isinf(flat) & (flat < 0)
-            all_inf = inf_mask.all(dim=1, keepdim=True)
-            fallback = torch.where(base_invalid, torch.full_like(flat, float('-inf')), torch.zeros_like(flat))
-            flat = torch.where(all_inf, fallback, flat)
-            dist = torch.distributions.Categorical(logits=flat)
-            lp_list.append(dist.log_prob(actions[:, k]))
-            ent_list.append(dist.entropy())
-            mask_k = torch.zeros_like(flat, dtype=torch.bool)
-            mask_k.scatter_(1, actions[:, k].unsqueeze(1), True)
-            flat = torch.where(mask_k, float('-inf'), flat)
+        novel_lp, novel_ents = _eval_k(flat_clean, base_invalid, novel_actions)
         tok = torch.cat([pool, vec], dim=1)
         dist_speed = self._speed_dist(tok)
         speeds = torch.clamp(speeds.squeeze(-1), 1e-3, 1.0 - 1e-3)
@@ -222,12 +288,15 @@ class GhostActor(nn.Module):
         else:
             gate_lp = torch.zeros_like(speed_lp)
             gate_ent = torch.zeros_like(speed_ent)
-        #per-head log-probs (K cell picks, speed, direction, gate) so PPO can clip and measure KL head by head
-        logprobs = torch.cat([torch.stack(lp_list, 1), speed_lp.unsqueeze(1), dir_lp.unsqueeze(1), gate_lp.unsqueeze(1)], dim=1)
-        cell_ent = torch.stack(ent_list, 1).sum(1)
-        entropy  = cell_ent + speed_ent + dir_ent + gate_ent
+        logprobs = torch.cat([cand_lp, novel_lp, speed_lp.unsqueeze(1), dir_lp.unsqueeze(1), gate_lp.unsqueeze(1)], dim=1)
+        cand_ent = cand_ents.sum(1)
+        novel_ent = novel_ents.sum(1)
+        entropy = cand_ent + novel_ent + speed_ent + dir_ent + gate_ent
+        n_live = safe.sum(dim=1).to(cand_ent.dtype)
+        max_ent = sum(torch.log((n_live - k).clamp(min=1.0)) for k in range(cand_actions.shape[1]))
+        cand_ent_norm = cand_ent / max_ent.clamp(min=1e-3)
         speed_params = torch.stack([dist_speed.concentration1, dist_speed.concentration0], dim=1)
-        return logprobs, entropy, pool, vec, flat_clean, speed_params, cell_ent
+        return logprobs, entropy, cand_ent, cand_ent_norm, novel_ent, pool, vec, c_logits, flat_clean, speed_params
 
 class GhostCritic(nn.Module):
     #Independent CNN-based Critic: evaluates each ghost state

@@ -5,6 +5,17 @@ import numpy as np
 from reward import RewardShaper
 from allocator import Task, TaskType
 from cbba import CBBA_Agent, _task_key
+from obs import MAX_CANDIDATES
+
+def _novel_action(env, cells, score=1.0):
+    """Nominate raw cells through the actor's off-menu head, bypassing the candidate pointer. Mirrors the
+    (cand_picks, cand_scores, novel_pairs, novel_scores, speed, dir, gate) tuple that worker.step expects."""
+    rows, cols = int(env.world_height), int(env.world_width)
+    smap = np.zeros((rows, cols), dtype=np.float32)
+    for (r, c) in cells:
+        if 0 <= r < rows and 0 <= c < cols:
+            smap[r, c] = score
+    return ([], np.zeros(MAX_CANDIDATES, dtype=np.float32), list(cells), smap, 1.0, 0.5, 0.0)
 
 class DummyGhost:
     def __init__(self, gid, y, x, player_dir=(0, 0)):
@@ -138,7 +149,7 @@ def test_worker_swarm_catch_bonus():
     
     # Step 0 frames to evaluate kill logic
     # Perform dummy actions
-    actions = {0: ([(10, 10)], [1.0], 1.0), 1: ([(10, 10)], [1.0], 1.0)}
+    actions = {0: _novel_action(env, [(10, 10)]), 1: _novel_action(env, [(10, 10)])}
     obs, rewards, done, info = env.step(actions, want_bc=False)
     
     print(f"Pincer kill rewards: {rewards}, Done: {done}, Caught: {info.get('pacman_caught')}")

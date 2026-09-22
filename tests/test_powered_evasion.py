@@ -6,6 +6,17 @@ from cbba import CBBA_Agent, _task_key
 from ghost import Ghost
 from worker import Env
 from curriculum import STAGES
+from obs import MAX_CANDIDATES
+
+def _novel_action(env, cells, score=1.0):
+    """Nominate raw cells through the actor's off-menu head, bypassing the candidate pointer. Mirrors the
+    (cand_picks, cand_scores, novel_pairs, novel_scores, speed, dir, gate) tuple that worker.step expects."""
+    rows, cols = int(env.world_height), int(env.world_width)
+    smap = np.zeros((rows, cols), dtype=np.float32)
+    for (r, c) in cells:
+        if 0 <= r < rows and 0 <= c < cols:
+            smap[r, c] = score
+    return ([], np.zeros(MAX_CANDIDATES, dtype=np.float32), list(cells), smap, 1.0, 0.5, 0.0)
 
 class DummyWorld:
     def __init__(self, h=20, w=20):
@@ -203,7 +214,7 @@ def test_dead_callout_and_line_of_sight_witnessing():
     # Step the environment - Pacman collides with and eats Ghost 0
     R = int(stage.rows * stage.obs_resolution)
     C = int(stage.cols * stage.obs_resolution)
-    dummy_action = {gid: ([], np.zeros((R, C), dtype=np.float32), 1.0) for gid in env.ghosts}
+    dummy_action = {gid: _novel_action(env, []) for gid in env.ghosts}
     obs, rewards, done, info = env.step(dummy_action)
 
     # Ghost 0 is dead

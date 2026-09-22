@@ -20,7 +20,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from net    import GhostActor, GhostCritic, MovementPredictor, PREDICTOR_IN_DIM, PREDICTOR_HIDDEN_DIM
 from worker import Env
-from obs    import MAX_H, MAX_W, MAX_GHOSTS, SPATIAL_CH, GLOBAL_SPATIAL_CH, VEC_DIM, CRITIC_VEC_DIM
+from obs    import (MAX_H, MAX_W, MAX_GHOSTS, SPATIAL_CH, GLOBAL_SPATIAL_CH, VEC_DIM, CRITIC_VEC_DIM,
+                    MAX_CANDIDATES, CAND_FEAT_DIM, flatten_cand_cells)
 from curriculum import CurriculumScheduler, STAGES
 import traceback
 import threading
@@ -57,7 +58,7 @@ GAMMA           = 0.985
 GAE_LAMBDA      = 0.96
 CLIP_EPS        = 0.20
 ENT_COEF_INIT   = float(os.environ.get("ENT_COEF_INIT", "0.01"))
-ENT_TARGET      = float(os.environ.get("ENT_TARGET", "3.0"))
+ENT_TARGET      = float(os.environ.get("ENT_TARGET", "0.70"))
 ENT_COEF_BOUNDS = (0.001, 0.2)
 ENT_COEF_STEP   = 1.10
 VF_COEF         = 0.5
@@ -66,7 +67,11 @@ LR              = 1.2e-4
 LR_CRITIC       = 3.0e-4
 STAGE_BC_INIT   = [0.35, 0.15, 0.08, 0.04]
 BC_FLOOR        = 0.02
-K_NOMINATIONS   = 3
+SPATIAL_BC_W    = float(os.environ.get("SPATIAL_BC_W", "0.3"))
+NOVEL_ENT_W     = float(os.environ.get("NOVEL_ENT_W", "0.3"))
+K_CAND          = int(os.environ.get("K_CAND", "3"))   #nominations taken from the live candidate set
+K_NOVEL         = int(os.environ.get("K_NOVEL", "1"))  #off-menu waypoints: the route to strategies the allocator has no rule for
+N_ACTION_HEADS  = K_CAND + K_NOVEL + 3                 #+ speed, direction, hijack gate
 LOG_DIR         = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file__), "logs"))
 CKPT_DIR        = os.environ.get("CKPT_DIR", os.path.join(os.path.dirname(__file__), "checkpoints"))
 BC_HOLD_UPDATES   = int(os.environ.get("BC_HOLD_UPDATES", "60"))
@@ -529,9 +534,9 @@ def train():
     print("VecEnv initialized. Starting training...")
     t0 = time.time()
 
-    def run_ppo(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_act, b_spd, b_dir, b_gate, b_olp, b_adv, b_ret, lam_bc, ret_rms, ent_coef):
+    def run_ppo(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_cf, b_cc, b_cm, b_cbc, b_cact, b_nact, b_spd, b_dir, b_gate, b_olp, b_adv, b_ret, lam_bc, ret_rms, ent_coef):
         t_ppo_start = time.time()
-        metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "cell_entropy": 0, "approx_kl": 0, "clip_fraction": 0, "n_batches": 0}    
+        metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "cell_entropy": 0, "cand_ent_frac": 0, "bc_agree": 0, "approx_kl": 0, "clip_fraction": 0, "n_batches": 0}    
         N_total = b_sp.shape[0]
         uid_to_indices = defaultdict(list)
         b_gsp_ids_np = b_gsp_ids.cpu().numpy()
@@ -584,6 +589,8 @@ def train():
                     mb_bc_loss = 0.0
                     mb_ent = 0.0
                     mb_cell_ent = 0.0
+                    mb_cand_frac = 0.0
+                    mb_agree = 0.0
                     mb_approx_kl = 0.0
                     mb_clip_fraction = 0.0
                     try:
@@ -598,7 +605,12 @@ def train():
                             mb_vm  = b_vm[chunk_idx]
                             mb_ht  = b_ht[chunk_idx]
                             mb_hs  = b_hs[chunk_idx]
-                            mb_act = b_act[chunk_idx]
+                            mb_cf  = b_cf[chunk_idx]
+                            mb_cc  = b_cc[chunk_idx]
+                            mb_cm  = b_cm[chunk_idx]
+                            mb_cbc = b_cbc[chunk_idx]
+                            mb_cact = b_cact[chunk_idx]
+                            mb_nact = b_nact[chunk_idx]
                             mb_spd = b_spd[chunk_idx]
                             mb_dir = b_dir[chunk_idx]
                             mb_gate = b_gate[chunk_idx]
@@ -606,19 +618,26 @@ def train():
                             mb_adv = b_adv[chunk_idx]
                             mb_ret = b_ret[chunk_idx]
                             _hw = mb_sp.shape[-2] * mb_sp.shape[-1]
-                            if mb_act.max().item() >= _hw:
-                                print(f"  ⚠️  Action index OOB: max={mb_act.max().item()} >= H*W={_hw}, clamping")
-                                push_discord_warning(f"⚠️ Action OOB at update {update}: max_act={mb_act.max().item()}, H*W={_hw}, sp={tuple(mb_sp.shape)}")
-                                mb_act = mb_act.clamp(max=_hw - 1)
+                            if mb_nact.max().item() >= _hw:
+                                print(f"  ⚠️  Action index OOB: max={mb_nact.max().item()} >= H*W={_hw}, clamping")
+                                push_discord_warning(f"⚠️ Action OOB at update {update}: max_act={mb_nact.max().item()}, H*W={_hw}, sp={tuple(mb_sp.shape)}")
+                                mb_nact = mb_nact.clamp(max=_hw - 1)
+                            mb_cact = mb_cact.clamp(max=MAX_CANDIDATES - 1)
                             with torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
-                                new_lp, ent, pool, vec, flat_logits, speed_params, cell_ent = actor.evaluate_actions(mb_sp, mb_ve, mb_vm, mb_act, mb_spd, mb_dir, mb_gate)
+                                new_lp, ent, cell_ent, cand_ent_frac, novel_ent, pool, vec, cand_logits, flat_logits, speed_params = actor.evaluate_actions(
+                                    mb_sp, mb_ve, mb_vm, mb_cf, mb_cc, mb_cm, mb_cact, mb_nact, mb_spd, mb_dir, mb_gate)
                                 unique_ids, inv_idx = torch.unique(mb_gsp_ids, return_inverse=True)
                                 mb_gsp_unique = b_gsp_unique[unique_ids]
                                 mb_c_pool = critic.encode_spatial(mb_gsp_unique)
                                 v_pred = critic.forward_from_pool(mb_c_pool[inv_idx], mb_cve).squeeze(-1)
+                                with torch.no_grad():
+                                    _cw = mb_cbc * mb_cm.float()
+                                    _ok = _cw.sum(dim=1) > 1e-6
+                                    agree = ((cand_logits[_ok].argmax(1) == _cw[_ok].argmax(1)).float().mean()
+                                             if _ok.any() else torch.zeros((), device=DEVICE))
                                 log_ratio = torch.clamp(new_lp - mb_olp, -10.0, 10.0)
                                 head_w = torch.ones_like(log_ratio)
-                                head_w[:, K_NOMINATIONS + 1] = mb_gate.reshape(-1).float()
+                                head_w[:, K_CAND + K_NOVEL + 2] = mb_gate.reshape(-1).float()
                                 log_ratio = log_ratio * head_w
                                 ratio = torch.exp(log_ratio)
                                 with torch.no_grad():
@@ -646,12 +665,19 @@ def train():
                                         beta = speed_params[valid_bc, 1]
                                         dist_speed = torch.distributions.Beta(alpha, beta)
                                         bc_speed = -dist_speed.log_prob(target_speed).mean()
-                                        bc = (bc + bc_speed * 0.2) * bc_valid_frac
+                                        bc = (bc * SPATIAL_BC_W + bc_speed * 0.2) * bc_valid_frac
                                     else:
                                         bc = torch.tensor(0.0, device=DEVICE)
+                                    cbc_w   = mb_cbc * mb_cm.float()
+                                    cbc_sum = cbc_w.sum(dim=1)
+                                    valid_c = cbc_sum > 1e-6
+                                    if valid_c.any():
+                                        c_tgt = (cbc_w[valid_c] / cbc_sum[valid_c].unsqueeze(1)).detach()
+                                        c_lp  = F.log_softmax(cand_logits[valid_c].clamp(min=-1e4), dim=-1)
+                                        bc = bc + (-(c_tgt * c_lp).sum(dim=-1).mean()) * valid_c.float().mean()
                                 else:
                                     bc = torch.tensor(0.0, device=DEVICE)
-                                loss_actor = a_loss - ent_coef * cell_ent.mean() + lam_bc * bc
+                                loss_actor = a_loss - ent_coef * (cell_ent.mean() + NOVEL_ENT_W * novel_ent.mean()) + lam_bc * bc
                                 loss_critic = VF_COEF * v_loss
                             (loss_critic * weight).backward()
                             if critic_warmup_remaining <= 0:
@@ -661,6 +687,8 @@ def train():
                             mb_bc_loss += bc.item() * weight
                             mb_ent += ent.mean().item() * weight
                             mb_cell_ent += cell_ent.mean().item() * weight
+                            mb_cand_frac += cand_ent_frac.mean().item() * weight
+                            mb_agree += agree.item() * weight
                             mb_approx_kl += approx_kl.item() * weight
                             mb_clip_fraction += clip_fraction.item() * weight
                     except torch.cuda.OutOfMemoryError:
@@ -697,6 +725,8 @@ def train():
                 metrics["bc_loss"]    += mb_bc_loss
                 metrics["entropy"]    += mb_ent
                 metrics["cell_entropy"] += mb_cell_ent
+                metrics["cand_ent_frac"] += mb_cand_frac
+                metrics["bc_agree"] += mb_agree
                 metrics["approx_kl"]  += mb_approx_kl
                 metrics["clip_fraction"] += mb_clip_fraction
                 metrics["n_batches"]  += 1
@@ -743,7 +773,12 @@ def train():
         buf_mask      = [[] for _ in range(NUM_ENVS)]
         buf_htarget   = [[] for _ in range(NUM_ENVS)]
         buf_hspeed    = [[] for _ in range(NUM_ENVS)]
+        buf_cfeat     = [[] for _ in range(NUM_ENVS)]
+        buf_ccell     = [[] for _ in range(NUM_ENVS)]
+        buf_cmask     = [[] for _ in range(NUM_ENVS)]
+        buf_cbc       = [[] for _ in range(NUM_ENVS)]
         buf_actions   = [[] for _ in range(NUM_ENVS)]
+        buf_novel     = [[] for _ in range(NUM_ENVS)]
         buf_speeds    = [[] for _ in range(NUM_ENVS)]
         buf_directions= [[] for _ in range(NUM_ENVS)]
         buf_gates     = [[] for _ in range(NUM_ENVS)]
@@ -763,6 +798,7 @@ def train():
             step_actions = [{} for _ in range(NUM_ENVS)]
             #collect all alive ghosts across all environments
             batch_sp, batch_ve, batch_cve, batch_vm = [], [], [], []
+            batch_cf, batch_cc, batch_cm = [], [], []
             batch_gsp_unique = [] #one per active env
             batch_env_idx = []    #which env each ghost belongs to
             batch_gids = []       #ghost id within its env
@@ -770,7 +806,7 @@ def train():
             active_n_ghosts = []  #how many ghosts per active env
             for e in range(NUM_ENVS):
                 obs = vec_env.current_obs[e]
-                gids, sp, ve, vm, ht, hs, global_sp, grid_shape = obs
+                gids, sp, ve, vm, ht, hs, cf, cc, cm, cbc, global_sp, grid_shape = obs
                 n_g = len(gids)
                 env_n_ghosts.append(n_g)
                 if n_g == 0:
@@ -783,11 +819,16 @@ def train():
                     buf_mask[e].append(np.empty((0, MAX_H, MAX_W), dtype=bool))
                     buf_htarget[e].append(np.empty((0, MAX_H, MAX_W), dtype=np.float32))
                     buf_hspeed[e].append(np.empty((0, 1), dtype=np.float32))
-                    buf_actions[e].append(np.empty((0, K_NOMINATIONS), dtype=np.int64))
+                    buf_cfeat[e].append(np.empty((0, MAX_CANDIDATES, CAND_FEAT_DIM), dtype=np.float32))
+                    buf_ccell[e].append(np.empty((0, MAX_CANDIDATES), dtype=np.int64))
+                    buf_cmask[e].append(np.empty((0, MAX_CANDIDATES), dtype=bool))
+                    buf_cbc[e].append(np.empty((0, MAX_CANDIDATES), dtype=np.float32))
+                    buf_actions[e].append(np.empty((0, K_CAND), dtype=np.int64))
+                    buf_novel[e].append(np.empty((0, K_NOVEL), dtype=np.int64))
                     buf_speeds[e].append(np.empty((0, 1), dtype=np.float32))
                     buf_directions[e].append(np.empty((0, 1), dtype=np.float32))
                     buf_gates[e].append(np.empty((0, 1), dtype=np.float32))
-                    buf_logprobs[e].append(np.empty((0, K_NOMINATIONS + 3), dtype=np.float32))
+                    buf_logprobs[e].append(np.empty((0, N_ACTION_HEADS), dtype=np.float32))
                     continue
                 #Pad trimmed observations to current stage size for CNN
                 sp_padded = _pad_spatial(sp, target_h=stage.rows, target_w=stage.cols)
@@ -810,6 +851,9 @@ def train():
                 batch_ve.append(ve)
                 batch_cve.append(cve_batch)
                 batch_vm.append(vm_padded.astype(bool))
+                #cand cells were built at the trimmed width; padding keeps (row,col) but changes the stride
+                cc_flat = flatten_cand_cells(cc, stage.cols).astype(np.int64)
+                batch_cf.append(cf); batch_cc.append(cc_flat); batch_cm.append(cm.astype(bool))
                 batch_env_idx.extend([e] * n_g)
                 batch_gids.extend(gids)
                 #stprepadded obs for PPO buffer
@@ -820,6 +864,10 @@ def train():
                 buf_mask[e].append(vm_padded.astype(bool))
                 buf_htarget[e].append(ht_padded)
                 buf_hspeed[e].append(hs)
+                buf_cfeat[e].append(cf)
+                buf_ccell[e].append(cc_flat)
+                buf_cmask[e].append(cm.astype(bool))
+                buf_cbc[e].append(cbc)
                 buf_gids[e].append(gids)
             #run a single batched forward pass for all ghosts across all envs
             if batch_sp:
@@ -828,18 +876,28 @@ def train():
                 all_ve = np.concatenate(batch_ve, axis=0)
                 all_cve = np.concatenate(batch_cve, axis=0)
                 all_vm = np.concatenate(batch_vm, axis=0)
-                t_sp, t_gsp_unique, t_ve, t_cve, t_vm = rollout_transfer.transfer(all_sp, all_gsp_unique, all_ve, all_cve, all_vm)
+                all_cf = np.concatenate(batch_cf, axis=0)
+                all_cc = np.concatenate(batch_cc, axis=0)
+                all_cm = np.concatenate(batch_cm, axis=0)
+                t_sp, t_gsp_unique, t_ve, t_cve, t_vm, t_cf, t_cc, t_cm = rollout_transfer.transfer(
+                    all_sp, all_gsp_unique, all_ve, all_cve, all_vm, all_cf, all_cc, all_cm)
                 #chunk rollout inference — OOM-adaptive: halves chunk on crash, never recovers
                 global _eff_infer_chunk
                 n_total = t_sp.shape[0]
                 while True:
                     try:
                         idx_chunks, lp_chunks, sc_chunks, spd_chunks, spd_lp_chunks, dir_chunks, dir_lp_chunks, gate_chunks, gate_lp_chunks = [], [], [], [], [], [], [], [], []
+                        nidx_chunks, nlp_chunks, nsc_chunks = [], [], []
                         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
                             for ci in range(0, n_total, _eff_infer_chunk):
                                 ce = min(ci + _eff_infer_chunk, n_total)
-                                c_idx, c_lp, c_scores, _, _, c_speed, c_speed_lp, c_dir, c_dir_lp, c_gate, c_gate_lp = actor_rollout(
-                                    t_sp[ci:ce], t_ve[ci:ce], t_vm[ci:ce], K=K_NOMINATIONS)
+                                (c_idx, c_lp, c_scores, c_nidx, c_nlp, c_nsc, _, _,
+                                 c_speed, c_speed_lp, c_dir, c_dir_lp, c_gate, c_gate_lp) = actor_rollout(
+                                    t_sp[ci:ce], t_ve[ci:ce], t_vm[ci:ce], t_cf[ci:ce], t_cc[ci:ce], t_cm[ci:ce],
+                                    K_cand=K_CAND, K_novel=K_NOVEL)
+                                nidx_chunks.append(c_nidx)
+                                nlp_chunks.append(c_nlp)
+                                nsc_chunks.append(c_nsc)
                                 idx_chunks.append(c_idx)
                                 lp_chunks.append(c_lp)
                                 sc_chunks.append(c_scores)
@@ -864,6 +922,9 @@ def train():
                 idx_t = torch.cat(idx_chunks, dim=0).cpu().numpy()
                 lp_t  = torch.cat(lp_chunks, dim=0).float().cpu().numpy()
                 sc_t  = torch.cat(sc_chunks, dim=0).float().cpu().numpy()
+                nidx_t = torch.cat(nidx_chunks, dim=0).cpu().numpy()
+                nlp_t  = torch.cat(nlp_chunks, dim=0).float().cpu().numpy()
+                nsc_t  = torch.cat(nsc_chunks, dim=0).float().cpu().numpy()
                 spd_t = torch.cat(spd_chunks, dim=0).float().cpu().numpy()
                 spd_lp_t = torch.cat(spd_lp_chunks, dim=0).float().cpu().numpy()
                 dir_t = torch.cat(dir_chunks, dim=0).float().cpu().numpy()
@@ -880,6 +941,9 @@ def train():
                     gids = obs[0]
                     e_idx = idx_t[offset:offset + n_g]
                     e_sc  = sc_t[offset:offset + n_g]
+                    e_nidx = nidx_t[offset:offset + n_g]
+                    e_nlp  = nlp_t[offset:offset + n_g]
+                    e_nsc  = nsc_t[offset:offset + n_g]
                     e_lp  = lp_t[offset:offset + n_g]
                     e_spd = spd_t[offset:offset + n_g]
                     e_spd_lp = spd_lp_t[offset:offset + n_g]
@@ -890,18 +954,18 @@ def train():
                     e_val = val_all_np[offset:offset + n_g]
                     env_act = {}
                     for i, gid in enumerate(gids):
-                        pairs = [(int(x // stage.cols), int(x % stage.cols))
-                                 for x in e_idx[i]]
+                        novel_pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in e_nidx[i]]
                         spd_val = float(e_spd[i].item() if hasattr(e_spd[i], 'item') else e_spd[i])
                         dir_val = float(e_dir[i].item() if hasattr(e_dir[i], 'item') else e_dir[i])
                         gate_val = float(e_gate[i].item() if hasattr(e_gate[i], 'item') else e_gate[i])
-                        env_act[gid] = (pairs, e_sc[i], spd_val, dir_val, gate_val)
+                        env_act[gid] = ([int(x) for x in e_idx[i]], e_sc[i], novel_pairs, e_nsc[i], spd_val, dir_val, gate_val)
                     step_actions[e] = env_act
                     buf_actions[e].append(e_idx)
+                    buf_novel[e].append(e_nidx)
                     buf_speeds[e].append(e_spd)
                     buf_directions[e].append(e_dir)
                     buf_gates[e].append(e_gate)
-                    buf_logprobs[e].append(np.concatenate([e_lp, e_spd_lp.reshape(n_g, 1), e_dir_lp.reshape(n_g, 1), e_gate_lp.reshape(n_g, 1)], axis=1).astype(np.float32))
+                    buf_logprobs[e].append(np.concatenate([e_lp, e_nlp, e_spd_lp.reshape(n_g, 1), e_dir_lp.reshape(n_g, 1), e_gate_lp.reshape(n_g, 1)], axis=1).astype(np.float32))
                     v_dict = {gids[i]: float(e_val[i]) for i in range(n_g)}
                     buf_values[e].append(v_dict)
                     offset += n_g
@@ -983,7 +1047,7 @@ def train():
             if len(buf_rewards[e]) == 0:
                 continue
             obs = vec_env.current_obs[e]
-            gids, sp, ve, vm, ht, hs, global_sp, grid_shape = obs
+            gids, sp, ve, vm, ht, hs, cf, cc, cm, cbc, global_sp, grid_shape = obs
             if len(gids) > 0:
                 boot_n_ghosts.append(len(gids))
                 sp_padded = _pad_spatial(sp, target_h=stage.rows, target_w=stage.cols)
@@ -1033,6 +1097,7 @@ def train():
         all_sp, all_ve, all_vm, all_ht, all_hs = [], [], [], [], []
         all_cve, all_gsp_ids = [], []
         all_act, all_spd, all_dir, all_gate, all_lp, all_adv, all_ret = [], [], [], [], [], [], []
+        all_cf, all_cc, all_cm, all_cbc, all_nact = [], [], [], [], []
         for e in range(NUM_ENVS):
             T = len(buf_rewards[e])
             if T == 0:
@@ -1054,7 +1119,12 @@ def train():
                     all_vm.append(buf_mask[e][t][i])
                     all_ht.append(buf_htarget[e][t][i])
                     all_hs.append(buf_hspeed[e][t][i])
+                    all_cf.append(buf_cfeat[e][t][i])
+                    all_cc.append(buf_ccell[e][t][i])
+                    all_cm.append(buf_cmask[e][t][i])
+                    all_cbc.append(buf_cbc[e][t][i])
                     all_act.append(buf_actions[e][t][i])
+                    all_nact.append(buf_novel[e][t][i])
                     all_spd.append(buf_speeds[e][t][i])
                     all_dir.append(buf_directions[e][t][i])
                     all_gate.append(buf_gates[e][t][i])
@@ -1072,21 +1142,28 @@ def train():
         arr_vm  = np.array(all_vm, dtype=bool)
         arr_ht  = np.array(all_ht, dtype=np.float32)
         arr_hs  = np.array(all_hs, dtype=np.float32)
+        arr_cf  = np.array(all_cf, dtype=np.float32)
+        arr_cc  = np.array(all_cc, dtype=np.int64)
+        arr_cm  = np.array(all_cm, dtype=bool)
+        arr_cbc = np.array(all_cbc, dtype=np.float32)
         arr_act = np.array(all_act, dtype=np.int64)
+        arr_nact = np.array(all_nact, dtype=np.int64)
         arr_spd = np.array(all_spd, dtype=np.float32)
         arr_dir = np.array(all_dir, dtype=np.float32)
         arr_gate = np.array(all_gate, dtype=np.float32)
         arr_olp = np.array(all_lp, dtype=np.float32)
         arr_adv = np.array(all_adv, dtype=np.float32)
         arr_ret = np.array(all_ret, dtype=np.float32)
-        ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_dir, ds_gate, ds_olp, ds_adv, ds_ret = train_transfer.transfer(
-            arr_sp, arr_gsp_unique, arr_gsp_ids, arr_ve, arr_cve, arr_vm, arr_ht, arr_hs, arr_act, arr_spd, arr_dir, arr_gate, arr_olp, arr_adv, arr_ret)
+        (ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs,
+         ds_cf, ds_cc, ds_cm, ds_cbc, ds_act, ds_nact, ds_spd, ds_dir, ds_gate, ds_olp, ds_adv, ds_ret) = train_transfer.transfer(
+            arr_sp, arr_gsp_unique, arr_gsp_ids, arr_ve, arr_cve, arr_vm, arr_ht, arr_hs,
+            arr_cf, arr_cc, arr_cm, arr_cbc, arr_act, arr_nact, arr_spd, arr_dir, arr_gate, arr_olp, arr_adv, arr_ret)
         N_total = ds_sp.shape[0]
         #verify action indices are within spatial bounds
         _sp_hw = ds_sp.shape[-2] * ds_sp.shape[-1]
-        if int(ds_act.max().item()) >= _sp_hw:
-            print(f"  ⚠️  Action OOB in buffer: max={ds_act.max().item()} >= H*W={_sp_hw}")
-            push_discord_warning(f"⚠️ Buffer action OOB: max={ds_act.max().item()}, H*W={_sp_hw}")
+        if int(ds_nact.max().item()) >= _sp_hw:
+            print(f"  ⚠️  Action OOB in buffer: max={ds_nact.max().item()} >= H*W={_sp_hw}")
+            push_discord_warning(f"⚠️ Buffer action OOB: max={ds_nact.max().item()}, H*W={_sp_hw}")
         _gsp_max_id = int(ds_gsp_ids.max().item())
         _gsp_n = ds_gsp_unique.shape[0]
         if _gsp_max_id >= _gsp_n:
@@ -1114,8 +1191,10 @@ def train():
         actor_stepped = (critic_warmup_remaining <= 0) and (warm >= 1.0)
         if actor_stepped:
             bc_decay_step += 1
-        metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_act, ds_spd, ds_dir, ds_gate, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms, ent_coef)
-        measured_cell_ent = metrics["cell_entropy"] / max(1, metrics["n_batches"]) / K_NOMINATIONS
+        metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_cf, ds_cc, ds_cm, ds_cbc,
+                                  ds_act, ds_nact, ds_spd, ds_dir, ds_gate, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms, ent_coef)
+        #the controller regulates the CANDIDATE head, in units of its own maximum entropy
+        measured_cell_ent = metrics["cand_ent_frac"] / max(1, metrics["n_batches"])
         if actor_stepped:
             if measured_cell_ent < ENT_TARGET:
                 ent_coef = min(ENT_COEF_BOUNDS[1], ent_coef * ENT_COEF_STEP)
@@ -1143,6 +1222,8 @@ def train():
             "bc_loss":    round(metrics["bc_loss"] / nb, 5),
             "entropy":    round(metrics["entropy"] / nb, 5),
             "cell_entropy": round(metrics["cell_entropy"] / nb, 5),
+            "cand_ent_frac": round(metrics["cand_ent_frac"] / nb, 4),
+            "bc_agree": round(metrics["bc_agree"] / nb, 4),
             "ent_coef":   round(ent_coef, 5),
             "approx_kl":  round(metrics["approx_kl"] / nb, 5),
             "clip_frac":  round(metrics["clip_fraction"] / nb, 4),
@@ -1231,7 +1312,7 @@ def train():
                 print(f"│  Episodes: {episodes:<8}  Steps: {total_steps:<10}  LR: {cur_lr:.2e}")
                 print(f"│  BC Coef:   {lam_bc:.4f}    Policy Loss: {row['actor_loss']:>+.5f}")
                 print(f"│  Value Loss: {row['value_loss']:.5f}    LR scale: {kl_lr_scale:.2f} (KL ema: {kl_ema if kl_ema is None else round(kl_ema, 4)})")
-                print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f} (cells {row['cell_entropy']:.3f}, coef {ent_coef:.4f}; KL: {row['approx_kl']:.4f}, Clip: {row['clip_frac']:.1%})")
+                print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f} (cand {row['cand_ent_frac']:.2f} of max, agrees with heuristic {row['bc_agree']:.0%}, coef {ent_coef:.4f}; KL: {row['approx_kl']:.4f}, Clip: {row['clip_frac']:.1%})")
                 ret_str = f"{row['mean_return']:.3f}" if row['mean_return'] is not None else "—"
                 pac_str = f"{row['pacman_score']:.1f}" if row['pacman_score'] is not None else "—"
                 kill_str = f"{row['kill_rate']:.1%}" if row.get('kill_rate') is not None else "—"

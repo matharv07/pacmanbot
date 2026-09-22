@@ -14,7 +14,9 @@ from os import environ as _env
 from pacman import generate_map, Player, WALL, PELLET, POWER, EMPTY
 from ghost  import Ghost, GHOST_COLORS
 import pathfinder
-from obs import (build_spatial, build_global_spatial, build_vector, build_valid_mask, actions_to_tasks, MAX_H, MAX_W, MAX_GHOSTS, UNKNOWN, SPATIAL_CH, GLOBAL_SPATIAL_CH, VEC_DIM)
+from obs import (build_spatial, build_global_spatial, build_vector, build_valid_mask, build_candidates, select_candidates, flatten_cand_cells,
+                 actions_to_tasks, MAX_H, MAX_W, MAX_GHOSTS, UNKNOWN, SPATIAL_CH, GLOBAL_SPATIAL_CH, VEC_DIM,
+                 MAX_CANDIDATES, CAND_FEAT_DIM)
 from reward import RewardShaper
 from allocator import generate_tasks as heuristic_generate_tasks
 from beliefmap import extract_movement_features
@@ -147,10 +149,15 @@ class Env:
         vector           : (N, D) float32
         valid_masks      : (N, H, W) bool         — trimmed
         heuristic_targets: (N, H, W) float32      — trimmed
+        cand_feat        : (N, MAX_CANDIDATES, CAND_FEAT_DIM) float32
+        cand_cell        : (N, MAX_CANDIDATES) int64   — flattened r*cols+c at the TRIMMED width
+        cand_mask        : (N, MAX_CANDIDATES) bool
+        cand_bc          : (N, MAX_CANDIDATES) float32 — heuristic scores, the BC target over the set
         grid_shape       : (rows, cols) int tuple — for padding on GPU side
         """
         alive = [gid for gid, g in self.ghosts.items() if not g.dead]
         sp, ve, vm, ht, hs = [], [], [], [], []
+        cf, cc, cm, cbc = [], [], [], []
         R = int(self.world_height * self.obs_resolution)
         C = int(self.world_width * self.obs_resolution)
         global_sp = build_global_spatial(self, R, C, self.obs_resolution)
@@ -167,12 +174,18 @@ class Env:
             else:
                 ht.append(np.zeros((R, C), dtype=np.float32))
                 hs.append(np.array([1.0], dtype=np.float32))
+            f_c, c_c, m_c, b_c = build_candidates(g, R, C, self.obs_resolution, self._cached_hdists.get(gid))
+            cf.append(f_c); cc.append(c_c); cm.append(m_c); cbc.append(b_c)
         if not alive:
             z = lambda s: np.zeros(s, dtype=np.float32)
             return ([], z((0, SPATIAL_CH, R, C)), z((0, VEC_DIM)),
                     np.zeros((0, R, C), dtype=bool),
-                    z((0, R, C)), z((0, 1)), z((GLOBAL_SPATIAL_CH, R, C)), (R, C))
-        return (alive, np.stack(sp), np.stack(ve), np.stack(vm), np.stack(ht), np.stack(hs), global_sp, (R, C))
+                    z((0, R, C)), z((0, 1)),
+                    z((0, MAX_CANDIDATES, CAND_FEAT_DIM)), np.zeros((0, MAX_CANDIDATES, 2), dtype=np.int64),
+                    np.zeros((0, MAX_CANDIDATES), dtype=bool), z((0, MAX_CANDIDATES)),
+                    z((GLOBAL_SPATIAL_CH, R, C)), (R, C))
+        return (alive, np.stack(sp), np.stack(ve), np.stack(vm), np.stack(ht), np.stack(hs),
+                np.stack(cf), np.stack(cc), np.stack(cm), np.stack(cbc), global_sp, (R, C))
 
     def _refresh_bc_targets(self):
         R = int(self.world_height * self.obs_resolution)
@@ -185,13 +198,17 @@ class Env:
             if g.dead:
                 continue
             h_tasks, _h_dists = heuristic_generate_tasks(g, self.frame)
+            #frozen here and read unchanged by observe() and step(): this ordering IS the action space
+            h_tasks = select_candidates(h_tasks, seed=self.frame * MAX_GHOSTS + gid)
             self._cached_htasks[gid] = h_tasks
             self._cached_hdists[gid] = _h_dists
             g._rl_candidates = h_tasks
             target = np.zeros((R, C), dtype=np.float32)
             if h_tasks:
-                self._cached_hspeed[gid] = mult_to_throttle(h_tasks[0].target_speed)
-                for t in h_tasks[:3]:
+                #_rl_candidates is shuffled, so the BC targets have to re-sort by score to find the best
+                h_top = sorted(h_tasks, key=lambda z: -float(z.score))[:3]
+                self._cached_hspeed[gid] = mult_to_throttle(h_top[0].target_speed)
+                for t in h_top:
                     r_t, c_t = int(t.target_pos[0] * self.obs_resolution), int(t.target_pos[1] * self.obs_resolution)
                     if 0 <= r_t < R and 0 <= c_t < C:
                         target[r_t, c_t] = t.score
@@ -218,15 +235,22 @@ class Env:
         for gid in alive:
             g = self.ghosts[gid]
             if gid in action_dict:      #merge RL tasks with CBBA
+                #(cand_picks, cand_scores, novel_pairs, novel_scores, speed, direction, gate)
                 act_data = action_dict[gid]
-                indices, scores_map, speed = act_data[0], act_data[1], act_data[2]
-                g.current_rl_dir = act_data[3] if len(act_data) > 3 else None
-                g.rl_hijack      = bool(act_data[4]) if len(act_data) > 4 else False
+                cand_picks, novel_pairs, speed = act_data[0], act_data[2], act_data[4]
+                g.current_rl_dir = act_data[5] if len(act_data) > 5 else None
+                g.rl_hijack      = bool(act_data[6]) if len(act_data) > 6 else False
                 g.rl_mode = True
                 #the [0,1] throttle is a fraction of the ghost speed cap, never a free-fall to zero
                 g.current_speed_mult = speed_to_mult(speed)
                 self.recent_nom[gid] *= NOM_DECAY
-                for r, c in indices:
+                cands = getattr(g, '_rl_candidates', None) or []
+                marks = list(novel_pairs)
+                for slot in cand_picks:
+                    if 0 <= int(slot) < len(cands):
+                        t = cands[int(slot)]
+                        marks.append((int(t.target_pos[0] * self.obs_resolution), int(t.target_pos[1] * self.obs_resolution)))
+                for r, c in marks:
                     if 0 <= r < R and 0 <= c < C:
                         self.recent_nom[gid][r, c] = 1.0
         if self.frame % DECISION_INTERVAL == 0:
@@ -237,10 +261,9 @@ class Env:
                     continue
                 g = self.ghosts[gid]
                 act_data = action_dict[gid]
-                indices = act_data[0]
-                scores_map = act_data[1]
-                speed = speed_to_mult(act_data[2])
-                tasks = actions_to_tasks(g, scores_map, indices, self.frame, self.obs_resolution, target_speed=speed)
+                speed = speed_to_mult(act_data[4])
+                tasks = actions_to_tasks(g, act_data[1], act_data[0], self.frame, self.obs_resolution,
+                                         target_speed=speed, novel_scores=act_data[3], novel_indices=act_data[2])
                 cand_tasks = tasks
                 cur_active = g.cbba_agent.get_active_task()
                 if cur_active is not None and (self.frame - cur_active.created_frame < 24):

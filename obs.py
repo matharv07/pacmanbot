@@ -6,8 +6,9 @@ and converts the RL actor's sampled waypoints back into CBBA Task objects.
 """
 
 import math
+import random as _random
 import numpy as np
-from allocator import Task, TaskType, ORIGIN_RL_ENDORSE, ORIGIN_RL_NOVEL
+from allocator import Task, TaskType, ORIGIN_RL_ENDORSE, ORIGIN_RL_NOVEL, _lookup_dist
 import os as _os
 
 WALL    = 1
@@ -24,7 +25,8 @@ CRITIC_VEC_DIM = MAX_GHOSTS * VEC_DIM + MAX_GHOSTS
 RL_SCORE_BASE   = float(_os.environ.get("RL_SCORE_BASE", "0.2"))
 RL_SCORE_SPAN   = float(_os.environ.get("RL_SCORE_SPAN", "5.0"))
 RL_ENDORSE_GAIN = float(_os.environ.get("RL_ENDORSE_GAIN", "2.0"))
-RL_SNAP_RADIUS  = float(_os.environ.get("RL_SNAP_RADIUS", "3.0"))
+MAX_CANDIDATES  = int(_os.environ.get("MAX_CANDIDATES", "24"))
+CAND_FEAT_DIM   = 16
 
 """
 Channel Map:
@@ -278,43 +280,137 @@ def build_valid_mask(ghost, rows: int, cols: int, obs_resolution: float = 1.0, s
                     mask[r, c] = False
     return mask
 
-def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int, obs_resolution: float = 1.0, target_speed: float = 1.0) -> list:
-    if not isinstance(scores_map, np.ndarray):
-        scores_map = np.array(scores_map, dtype=np.float32)
-    if scores_map.ndim < 2:
-        rows = int(getattr(ghost.world, 'height', 10) * obs_resolution)
-        cols = int(getattr(ghost.world, 'width', 10) * obs_resolution)
-        new_map = np.zeros((rows, cols), dtype=np.float32)
-        for idx_i, (r, c) in enumerate(indices):
-            if 0 <= r < rows and 0 <= c < cols:
-                val = float(scores_map[idx_i]) if idx_i < len(scores_map) else 1.0
-                new_map[r, c] = val
-        scores_map = new_map
-    rows, cols = scores_map.shape
+def select_candidates(tasks: list, seed: int = 0) -> list:
+    if not tasks:
+        return []
+    ordered = sorted(tasks, key=lambda t: -float(t.score))[:MAX_CANDIDATES]
+    _random.Random(seed).shuffle(ordered)
+    return ordered
+
+def flatten_cand_cells(cells, width: int):
+    return cells[..., 0] * int(width) + cells[..., 1]
+
+def build_candidates(ghost, rows: int, cols: int, obs_resolution: float = 1.0, dists: dict = None):
+    """Per-candidate features for the actor's pointer head.
+
+    Returns
+    -------
+    feats  : (MAX_CANDIDATES, CAND_FEAT_DIM) float32
+    cells  : (MAX_CANDIDATES, 2) int64 — (row, col) of each target. Kept unflattened because observations are
+             later zero-padded to the stage grid, which changes the row stride but not (row, col).
+    mask   : (MAX_CANDIDATES,) bool   — True where a real candidate sits
+    bc_tgt : (MAX_CANDIDATES,) float32 — the heuristic's own score, the BC target over this set
+    """
+    feats  = np.zeros((MAX_CANDIDATES, CAND_FEAT_DIM), dtype=np.float32)
+    cells  = np.zeros((MAX_CANDIDATES, 2), dtype=np.int64)
+    mask   = np.zeros((MAX_CANDIDATES,), dtype=bool)
+    bc_tgt = np.zeros((MAX_CANDIDATES,), dtype=np.float32)
+    cands = (getattr(ghost, '_rl_candidates', None) or [])[:MAX_CANDIDATES]
+    if not cands:
+        return feats, cells, mask, bc_tgt
+    h = float(getattr(ghost.world, 'height', rows)) or float(rows)
+    w = float(getattr(ghost.world, 'width', cols)) or float(cols)
+    bm_top = []
+    if getattr(ghost, 'belief_map', None) is not None and hasattr(ghost.belief_map, 'top_cells'):
+        bm_top = ghost.belief_map.top_cells(n=5)
+    peer_targets = []
+    if hasattr(ghost, 'cbba_agent'):
+        for gid in range(MAX_GHOSTS):
+            if gid == ghost.gid:
+                continue
+            pt = ghost.cbba_agent.get_known_task_for(gid)
+            if pt is not None and pt.target_pos is not None:
+                peer_targets.append((float(pt.target_pos[0]), float(pt.target_pos[1])))
+    own_path = set()
+    if hasattr(ghost, 'cbba_agent'):
+        try:
+            own_path = set(ghost.cbba_agent.path)
+        except Exception:
+            own_path = set()
+    n = len(cands)
+    rank_of = {id(t): r for r, t in enumerate(sorted(cands, key=lambda z: -float(z.score)))}
+    for i, t in enumerate(cands):
+        ty, tx = float(t.target_pos[0]), float(t.target_pos[1])
+        r_t = min(max(int(ty * obs_resolution), 0), rows - 1)
+        c_t = min(max(int(tx * obs_resolution), 0), cols - 1)
+        cells[i, 0], cells[i, 1] = r_t, c_t
+        mask[i]  = True
+        f = feats[i]
+        tt = int(t.task_type)
+        if 0 <= tt < 6:
+            f[tt] = 1.0
+        f[6]  = min(max(float(t.score), -5.0), 5.0) / 5.0
+        f[7]  = min(max(ghost.frame - int(t.created_frame), 0), 200) / 200.0
+        f[8]  = float(getattr(t, 'target_speed', 1.0))
+        f[9]  = (ty - ghost.y) / h
+        f[10] = (tx - ghost.x) / w
+        d_path = None
+        if dists:
+            info = _lookup_dist(dists, (ty, tx))
+            if info and info[0] != math.inf:
+                d_path = float(info[0])
+        if d_path is None:
+            d_path = abs(ty - ghost.y) + abs(tx - ghost.x)
+        f[11] = min(d_path, 40.0) / 40.0
+        f[12] = 1.0 if _task_key_local(t) in own_path else 0.0
+        if bm_top:
+            d_b = min(abs(ty - b[0]) + abs(tx - b[1]) for b in bm_top)
+            f[13] = math.exp(-d_b / 3.0)
+        if peer_targets:
+            d_p = min(abs(ty - p[0]) + abs(tx - p[1]) for p in peer_targets)
+            f[14] = math.exp(-d_p / 3.0)
+        f[15] = rank_of[id(t)] / float(max(1, n - 1))
+        bc_tgt[i] = max(0.0, float(t.score))
+    return feats, cells, mask, bc_tgt
+
+def _task_key_local(task) -> tuple:
+    #mirrors cbba._task_key without importing cbba (obs is imported by cbba's callers)
+    return (int(task.task_type), (round(float(task.target_pos[0]), 1), round(float(task.target_pos[1]), 1)))
+
+def actions_to_tasks(ghost, cand_scores, cand_picks, frame: int, obs_resolution: float = 1.0,
+                     target_speed: float = 1.0, novel_scores=None, novel_indices=None) -> list:
+    """Turn the actor's decisions into CBBA nominations.
+
+    cand_picks index directly into ghost._rl_candidates, so an endorsement is exact: there is no spatial
+    pick to snap onto a candidate and therefore no near-miss that silently becomes a novel waypoint.
+    novel_indices remains the escape hatch for targets no allocator rule proposed.
+    """
     tasks = []
+    cands = getattr(ghost, '_rl_candidates', None) or []
+    cand_scores = np.asarray(cand_scores, dtype=np.float32).reshape(-1) if cand_scores is not None else np.zeros(0, np.float32)
+    seen = set()
+    for slot in (cand_picks or []):
+        slot = int(slot)
+        if slot < 0 or slot >= len(cands) or slot in seen:
+            continue
+        seen.add(slot)
+        near = cands[slot]
+        conf = float(cand_scores[slot]) if slot < len(cand_scores) else 0.0
+        conf = min(1.0, max(0.0, conf))
+        floor = RL_SCORE_BASE + RL_SCORE_SPAN * conf
+        tasks.append(Task(task_type=near.task_type, target_pos=near.target_pos, score=max(float(near.score) * (1.0 + RL_ENDORSE_GAIN * conf), floor),
+                          created_frame=frame, owner=ghost.gid, assigned_to=near.assigned_to, target_speed=target_speed, origin=ORIGIN_RL_ENDORSE))
+    if novel_indices is None or novel_scores is None:
+        return tasks
+    novel_scores = np.asarray(novel_scores, dtype=np.float32)
+    if novel_scores.ndim < 2:
+        return tasks
+    rows, cols = novel_scores.shape
     target = _pacman_target(ghost)
     bm_top = []
-    if hasattr(ghost, 'belief_map') and ghost.belief_map is not None and hasattr(ghost.belief_map, 'top_cells'):
+    if getattr(ghost, 'belief_map', None) is not None and hasattr(ghost.belief_map, 'top_cells'):
         bm_top = ghost.belief_map.top_cells(n=5)
-    cands = getattr(ghost, '_rl_candidates', None) or []
-    for r, c in indices:
+    for r, c in novel_indices:
+        r, c = int(r), int(c)
         if r < 0 or r >= rows or c < 0 or c >= cols:
             continue
         world_y = (float(r) + 0.5) / obs_resolution
         world_x = (float(c) + 0.5) / obs_resolution
         if not ghost.world.is_passable(world_x, world_y, radius=0.35):
             continue
-        rel = min(1.0, max(0.0, float(scores_map[r, c])))
+        rel = min(1.0, max(0.0, float(novel_scores[r, c])))
         conf = rel * rel
         score = RL_SCORE_BASE + RL_SCORE_SPAN * conf
-        near, near_d = None, RL_SNAP_RADIUS
-        for t in cands:
-            d_c = abs(t.target_pos[0] - world_y) + abs(t.target_pos[1] - world_x)
-            if d_c <= near_d:
-                near, near_d = t, d_c
-        if near is not None:
-            tasks.append(Task(task_type=near.task_type, target_pos=near.target_pos, score=max(float(near.score) * (1.0 + RL_ENDORSE_GAIN * conf), score), created_frame=frame, owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed, origin=ORIGIN_RL_ENDORSE))
-            continue
         is_power = any(abs(world_y - p[1]) < 0.5 and abs(world_x - p[0]) < 0.5 for p in ghost.known_power_pellets)
         near_belief = any((abs(world_y - bc[0]) + abs(world_x - bc[1])) <= 3.0 for bc in bm_top)
         if is_power:
@@ -323,7 +419,8 @@ def actions_to_tasks(ghost, scores_map: np.ndarray, indices: list, frame: int, o
             tt = TaskType.HUNT
         else:
             tt = TaskType.DYNAMIC
-        tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame, owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed, origin=ORIGIN_RL_NOVEL))
+        tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame,
+                          owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed, origin=ORIGIN_RL_NOVEL))
     return tasks
 
 def build_global_spatial(env, rows: int, cols: int, obs_resolution: float = 1.0) -> np.ndarray:
@@ -338,7 +435,6 @@ def build_global_spatial(env, rows: int, cols: int, obs_resolution: float = 1.0)
         r, c = int(fy * obs_resolution), int(fx * obs_resolution)
         if 0 <= r < rows and 0 <= c < cols:
             channel[r, c] = 1.0
-            
     for p in env.world.pellets:
         _place_single_pixel(out[1], p[0], p[1])
     for p in env.world.power_pellets:

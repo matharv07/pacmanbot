@@ -18,8 +18,11 @@ os.environ.setdefault('PYGAME_HIDE_SUPPORT_PROMPT', 'hide')
 os.environ.setdefault('SDL_VIDEODRIVER', 'dummy')
 
 DECISION_INTERVAL  = 6
-K_NOMINATIONS      = 3
+K_CAND             = 3
+K_NOVEL            = 1
 MAX_EPISODE_FRAMES = 3000
+
+from obs import flatten_cand_cells
 
 def _pad_spatial(arr, target_h, target_w):
     h, w = arr.shape[-2], arr.shape[-1]
@@ -40,7 +43,7 @@ def _run_episode(actor, env, stage):
     while True:
         if obs is None:
             break
-        gids, sp, ve, vm, ht, hs, global_sp, grid_shape = obs
+        gids, sp, ve, vm, ht, hs, cf, cc, cm, cbc, global_sp, grid_shape = obs
         if not gids:
             break
         sp_p = _pad_spatial(sp.astype(np.float32), stage.rows, stage.cols)
@@ -48,17 +51,24 @@ def _run_episode(actor, env, stage):
         t_sp = torch.from_numpy(sp_p)
         t_ve = torch.from_numpy(ve.astype(np.float32))
         t_vm = torch.from_numpy(vm_p)
+        t_cf = torch.from_numpy(cf.astype(np.float32))
+        t_cc = torch.from_numpy(flatten_cand_cells(cc, stage.cols).astype(np.int64))
+        t_cm = torch.from_numpy(cm.astype(bool))
         with torch.inference_mode():
-            idx, lp, scores, _pool, _vec, speed, _speed_lp, direction, _dir_lp, gate, _gate_lp = actor(t_sp, t_ve, t_vm, K=K_NOMINATIONS)
+            (idx, lp, scores, nidx, _nlp, nsc, _pool, _vec,
+             speed, _speed_lp, direction, _dir_lp, gate, _gate_lp) = actor(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm, K_cand=K_CAND, K_novel=K_NOVEL)
         idx_np    = idx.cpu().numpy()
+        nidx_np   = nidx.cpu().numpy()
+        nsc_np    = nsc.float().cpu().numpy()
         scores_np = scores.float().cpu().numpy()
         speed_np  = speed.float().cpu().numpy()
         dir_np    = direction.float().cpu().numpy()
         gate_np   = gate.float().cpu().numpy()
         action_dict = {}
         for i, gid in enumerate(gids):
-            pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in idx_np[i]]
-            action_dict[gid] = (pairs, scores_np[i], float(speed_np[i].item()), float(dir_np[i].item()), float(gate_np[i].item()))
+            novel_pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in nidx_np[i]]
+            action_dict[gid] = ([int(x) for x in idx_np[i]], scores_np[i], novel_pairs, nsc_np[i],
+                                float(speed_np[i].item()), float(dir_np[i].item()), float(gate_np[i].item()))
         obs, _rewards, done, info = env.step(action_dict, want_bc=False)
         if done:
             surviving = sum(1 for g in env.ghosts.values() if not g.dead)

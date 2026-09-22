@@ -27,6 +27,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from curriculum import STAGES
 from allocator import TaskType, ORIGIN_HEURISTIC, ORIGIN_RL_ENDORSE, ORIGIN_RL_NOVEL
+from obs import flatten_cand_cells
 
 DECISION_INTERVAL = 6
 K = 3
@@ -60,6 +61,21 @@ def _bm_top_mass_on_cells(g, rc_list, H, W, topn=10):
         if 0 <= r < H and 0 <= c < W: mass += float(rc_list[r * W + c])
     return mass
 
+def _nominated_cells(ghost, act):
+    """World-space targets this ghost actually nominated: the candidates it pointed at, plus any off-menu
+    cell. Index 0 of the action is now a list of candidate SLOTS, not (row, col) pairs."""
+    if not act:
+        return []
+    cands = getattr(ghost, '_rl_candidates', None) or []
+    out = []
+    for slot in act[0]:
+        if 0 <= int(slot) < len(cands):
+            t = cands[int(slot)]
+            out.append((float(t.target_pos[0]), float(t.target_pos[1])))
+    for (r, c) in act[2]:
+        out.append((float(r) + 0.5, float(c) + 0.5))
+    return out
+
 def _run_game(mode, actor, env, stage, seed, log):
     np.random.seed(seed); torch.manual_seed(seed)
     import random as _r; _r.seed(seed)
@@ -77,7 +93,7 @@ def _run_game(mode, actor, env, stage, seed, log):
     n_dec = 0
     prev_powered = False; power_start_frame = -1; phase_dist = {}; learned_at = {}
     while obs is not None:
-        gids, sp, ve, vm, ht, hs, gsp, grid_shape = obs
+        gids, sp, ve, vm, ht, hs, cf, cc, cm, cbc, gsp, grid_shape = obs
         if not gids: break
         action = {}
         probs_per_ghost = {}
@@ -85,20 +101,38 @@ def _run_game(mode, actor, env, stage, seed, log):
             t_sp = torch.from_numpy(_pad(sp.astype(np.float32), H, W))
             t_vm = torch.from_numpy(_pad(vm.astype(np.float32), H, W).astype(bool))
             t_ve = torch.from_numpy(ve.astype(np.float32))
+            t_cf = torch.from_numpy(cf.astype(np.float32))
+            t_cc = torch.from_numpy(flatten_cand_cells(cc, W).astype(np.int64))
+            t_cm = torch.from_numpy(cm.astype(bool))
             with torch.inference_mode():
-                idx, lp, scores, _p, _v, speed, _slp, direction, _dlp, gate, _glp = actor(t_sp, t_ve, t_vm, K=K)
+                (idx, lp, scores, nidx, _nlp, nsc, _p, _v,
+                 speed, _slp, direction, _dlp, gate, _glp) = actor(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm, K_cand=K, K_novel=1)
                 feats, pool, vec = actor.encode(t_sp, t_ve)
                 raw_logits = actor.logits_from_features(feats, pool, t_vm).view(len(gids), -1)
+                cand_logits, safe = actor.candidate_logits(feats, pool, vec, t_cf, t_cc, t_cm)
             idx_np = idx.numpy(); sc = scores.float().numpy(); spd = speed.float().numpy(); dr = direction.float().numpy(); gt = gate.float().numpy()
+            nidx_np = nidx.numpy(); nsc_np = nsc.float().numpy()
+            cl_np = cand_logits.float().numpy(); safe_np = safe.numpy()
             for i, gid in enumerate(gids):
-                pairs = [(int(x // W), int(x % W)) for x in idx_np[i]]
+                novel_pairs = [(int(x // W), int(x % W)) for x in nidx_np[i]]
+                picks = [int(x) for x in idx_np[i]]
                 if mode == 'floor':
-                    pairs = []          #ablation: heuristic floor decides the auction on its own
-                action[gid] = (pairs, sc[i], float(spd[i].item()), float(dr[i].item()), float(gt[i].item()))
+                    picks, novel_pairs = [], []   #ablation: heuristic floor decides the auction on its own
+                action[gid] = (picks, sc[i], novel_pairs, nsc_np[i], float(spd[i].item()), float(dr[i].item()), float(gt[i].item()))
+                #how committed the pointer head is, in units of its own maximum
+                n_live = int(cm[i].sum())
+                log['n_cands'].append(n_live)
+                if n_live >= 2:
+                    cfl = cl_np[i][safe_np[i]]
+                    cp = np.exp(cfl - cfl.max()); cp /= cp.sum()
+                    ce = float(-(cp[cp > 0] * np.log(cp[cp > 0])).sum())
+                    log['cand_entropy'].append(ce / math.log(n_live))
+                    log['cand_top'].append(float(cp.max()))
                 fl = raw_logits[i].double().numpy()
                 fin = fl[np.isfinite(fl)]
                 log['logit_mean'].append(float(fin.mean())); log['logit_std'].append(float(fin.std()))
-                log['score_sat'].append(float(np.mean(sc[i].reshape(-1)[np.isfinite(fl)] >= 0.999)))
+                #sc is now per-CANDIDATE; the saturation check belongs to the spatial (off-menu) head
+                log['score_sat'].append(float(np.mean(nsc_np[i].reshape(-1)[np.isfinite(fl)] >= 0.999)))
                 m = fin.max(); p = np.where(np.isfinite(fl), np.exp(fl - m), 0.0); p /= p.sum()
                 probs_per_ghost[gid] = p
                 ent = float(-(p[p > 0] * np.log(p[p > 0])).sum())
@@ -107,11 +141,15 @@ def _run_game(mode, actor, env, stage, seed, log):
         elif mode == 'random':
             for i, gid in enumerate(gids):
                 valid = np.flatnonzero(vm[i].reshape(-1))
-                pick = np.random.choice(valid, size=min(K, len(valid)), replace=False)
-                pairs = [(int(x // vm.shape[-1]), int(x % vm.shape[-1])) for x in pick]
+                pick = np.random.choice(valid, size=min(1, len(valid)), replace=False)
+                novel_pairs = [(int(x // vm.shape[-1]), int(x % vm.shape[-1])) for x in pick]
                 smap = np.zeros((H, W), dtype=np.float32)
-                for (r, c) in pairs: smap[r, c] = np.random.uniform(0.3, 1.0)
-                action[gid] = (pairs, smap, 1.0, 0.5, 0.0)
+                for (r, c) in novel_pairs: smap[r, c] = np.random.uniform(0.3, 1.0)
+                live = np.flatnonzero(cm[i])
+                picks = list(np.random.choice(live, size=min(K, len(live)), replace=False)) if len(live) else []
+                cs = np.zeros(cm.shape[1], dtype=np.float32)
+                for sl in picks: cs[sl] = np.random.uniform(0.3, 1.0)
+                action[gid] = ([int(x) for x in picks], cs, novel_pairs, smap, 1.0, 0.5, 0.0)
         #--- per-ghost behaviour snapshot for THIS decision (state the action was chosen in) ---
         n_dec += 1
         pac = env.player; true_pac = (pac.y, pac.x)
@@ -148,10 +186,11 @@ def _run_game(mode, actor, env, stage, seed, log):
                 log['bm_peak_err'].append(math.hypot(peak[0] - true_pac[0], peak[1] - true_pac[1]))
                 if not knows:
                     log['bm_peak_err_unseen'].append(math.hypot(peak[0] - true_pac[0], peak[1] - true_pac[1]))
-                    if gid in action and action[gid][0]:
-                        dn = min(math.hypot((r + 0.5) - peak[0], (c + 0.5) - peak[1]) for (r, c) in action[gid][0])
+                    nom_cells = _nominated_cells(g, action.get(gid))
+                    if nom_cells:
+                        dn = min(math.hypot(y - peak[0], x - peak[1]) for (y, x) in nom_cells)
                         log['nom_to_peak'].append(dn)
-                        dg = np.mean([math.hypot((r + 0.5) - g.y, (c + 0.5) - g.x) for (r, c) in action[gid][0]])
+                        dg = np.mean([math.hypot(y - g.y, x - g.x) for (y, x) in nom_cells])
                         log['nom_to_self'].append(float(dg))
                     if task is not None:
                         log['task_to_peak'].append(math.hypot(task.target_pos[0] - peak[0], task.target_pos[1] - peak[1]))
@@ -236,6 +275,7 @@ def _run_game(mode, actor, env, stage, seed, log):
 
 def _new_log():
     return {'cell_entropy': [], 'eff_cells': [], 'logit_mean': [], 'logit_std': [], 'score_sat': [], 'throttle': [], 'gate': [], 'speed': [], 'fallback': [], 'no_task': [],
+            'n_cands': [], 'cand_entropy': [], 'cand_top': [],
             'task_type': collections.Counter(), 'disp30': [], 'loiter': [], 'bm_peak_err': [], 'bm_peak_err_unseen': [],
             'nom_to_peak': [], 'nom_to_self': [], 'task_to_peak': [], 'task_to_self': [], 'policy_mass_top10bm': [], 'bm_empty': 0,
             'denial_opps': 0, 'denial_taken': 0, 'denial_dist': [], 'dist_at_activation': [], 'aware_latency': [], 'connectivity': [],
@@ -330,6 +370,10 @@ def report(mode, games, log):
     if log['cell_entropy']:
         print(f"policy cell entropy: mean {_m(log['cell_entropy']):.2f} nats -> effective cells {_m(log['eff_cells']):.0f} | throttle mean {_m(log['throttle']):.2f} | hijack gate rate {_m(log['gate']):.2f}")
         print(f"raw logits: mean {_m(log['logit_mean']):.1f} (std within map {_m(log['logit_std']):.2f}) -> sigmoid CBBA scores saturated at 1.0 for {_m(log['score_sat']):.0%} of open cells")
+    if log['n_cands']:
+        print(f"POINTER HEAD  {_m(log['n_cands']):.1f} live candidates/decision"
+              f" | entropy {_m(log['cand_entropy']):.2f} of max (1.00 = undecided, 0.00 = fully committed)"
+              f" | top-candidate prob {_m(log['cand_top']):.2f}")
     ONAMES = {-1: 'no task', ORIGIN_HEURISTIC: 'heuristic', ORIGIN_RL_ENDORSE: 'RL-endorsed', ORIGIN_RL_NOVEL: 'RL-novel'}
     o_tot = sum(log['origin'].values()) or 1
     print("--- RL attribution (who won the executed task) ---")
