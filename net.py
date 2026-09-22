@@ -204,6 +204,7 @@ class GhostActor(nn.Module):
         novel_scores: (B, H, W)
         pool, vec   : (B, 128) each      — critic tokens
         speed / direction / gate and their log-probs, each (B, 1)
+        cand_logits : (B, M)             — masked candidate logits (15th element), for the COMA baseline
         """
         feats, pool, vec = self.encode(spatial, vector)
         c_logits, safe = self.candidate_logits(feats, pool, vec, cand_feat, cand_cell, cand_mask)
@@ -226,7 +227,7 @@ class GhostActor(nn.Module):
         gate_lp = dist_gate.log_prob(gate)
         return (cand_idx, cand_lp, cand_scores, novel_idx, novel_lp, novel_scores, pool, vec,
                 speed.unsqueeze(1), speed_lp.unsqueeze(1), direction.unsqueeze(1), dir_lp.unsqueeze(1),
-                gate.unsqueeze(1), gate_lp.unsqueeze(1))
+                gate.unsqueeze(1), gate_lp.unsqueeze(1), c_logits)
 
     def _speed_dist(self, tok):
         params = torch.clamp(F.softplus(self.speed_head(tok)) + 1.5, min=1.5, max=12.0)
@@ -298,8 +299,18 @@ class GhostActor(nn.Module):
         speed_params = torch.stack([dist_speed.concentration1, dist_speed.concentration0], dim=1)
         return logprobs, entropy, cand_ent, cand_ent_norm, novel_ent, pool, vec, c_logits, flat_clean, speed_params
 
+CAND_Q_DIM = 32
+
 class GhostCritic(nn.Module):
-    #Independent CNN-based Critic: evaluates each ghost state
+    """Centralised action-value critic Q_i(s, c): joint state (omniscient map + every ghost's vector) plus
+    the features of the candidate ghost i chose. With a candidate set of at most MAX_CANDIDATES this makes
+    the COMA counterfactual baseline  b_i = sum_c pi_i(c|s) Q_i(s,c)  cheap: the spatial stem and the vector
+    MLP run once, only the small head repeats per candidate.
+
+    Runs 13-17 used V(s) of the joint state, so a ghost's advantage was 'team outcome minus team value':
+    noise with respect to which candidate that ghost picked. 779 stage-3 updates moved the pointer head
+    27.7 L2 without changing its sharpness or the kill rate — a random walk. Q(s,c) - b(s) isolates the
+    marginal value of the pick itself."""
     def __init__(self, vec_dim: int = CRITIC_VEC_DIM):
         super().__init__()
         self.stem = nn.Sequential(
@@ -310,8 +321,11 @@ class GhostCritic(nn.Module):
             nn.Linear(vec_dim, 512), nn.LayerNorm(512), nn.GELU(),
             nn.Linear(512, 256), nn.LayerNorm(256), nn.GELU(),
             nn.Linear(256, 128), nn.LayerNorm(128), nn.GELU())
+        self.cand_mlp = nn.Sequential(
+            nn.Linear(CAND_FEAT_DIM, 64), nn.LayerNorm(64), nn.GELU(),
+            nn.Linear(64, CAND_Q_DIM), nn.LayerNorm(CAND_Q_DIM), nn.GELU())
         self.head = nn.Sequential(
-            nn.Linear(128 + 128, 128), nn.GELU(),
+            nn.Linear(128 + 128 + CAND_Q_DIM, 128), nn.GELU(),
             nn.Linear(128, 64), nn.GELU(),
             nn.Linear(64, 1))
 
@@ -319,14 +333,61 @@ class GhostCritic(nn.Module):
         x = self.stem(spatial)
         return F.adaptive_avg_pool2d(x, 1).flatten(1)
 
-    def forward_from_pool(self, pool, vector):
+    def forward_from_pool(self, pool, vector, cand_feat=None):
+        """Q for ONE candidate per row. cand_feat (B, CAND_FEAT_DIM); None gives the no-candidate value."""
         vec = self.vec_mlp(vector)
-        tokens = torch.cat([pool, vec], dim=-1)
-        return self.head(tokens)
+        if cand_feat is None:
+            cand_feat = torch.zeros(pool.shape[0], CAND_FEAT_DIM, device=pool.device, dtype=pool.dtype)
+        c = self.cand_mlp(cand_feat.to(pool.dtype))
+        return self.head(torch.cat([pool, vec, c], dim=-1))
 
-    def forward(self, spatial, vector):
+    def q_all(self, pool, vector, cand_feat, cand_mask):
+        """Q for EVERY candidate. pool (B,128), vector (B,V), cand_feat (B,M,F), cand_mask (B,M) bool.
+        Returns (B, M) with -inf-free zeros on padded slots (mask them yourself)."""
+        B, M, _ = cand_feat.shape
+        vec = self.vec_mlp(vector)
+        c = self.cand_mlp(cand_feat.reshape(B * M, -1).to(pool.dtype)).reshape(B, M, -1)
+        sv = torch.cat([pool, vec], dim=-1).unsqueeze(1).expand(B, M, -1)
+        q = self.head(torch.cat([sv, c], dim=-1)).squeeze(-1)
+        return torch.nan_to_num(q, nan=0.0) * cand_mask.to(q.dtype)
+
+    def forward(self, spatial, vector, cand_feat=None):
         pool = self.encode_spatial(spatial)
-        return self.forward_from_pool(pool, vector)
+        return self.forward_from_pool(pool, vector, cand_feat)
+
+def gate_for_eval(critic, gsp_padded, cve, t_cf, t_cm, c_logits, pick0, margin: float = float(__import__("os").environ.get("GATE_MARGIN", "0.05"))):
+    """Execute-gate for the evaluation paths (probe, test.py, live game), sharing the trainer's rule.
+
+    gsp_padded : (GLOBAL_SPATIAL_CH, H, W) numpy   the omniscient map for this env-step
+    cve        : (N, CRITIC_VEC_DIM) numpy         from obs.build_cve
+    t_cf, t_cm : (N, M, F) / (N, M) tensors        candidate features and live-mask
+    c_logits   : (N, M) tensor                     the actor's masked candidate logits (15th output)
+    pick0      : (N,) long tensor                  the actor's first pick
+    Returns (use_pick bool numpy (N,), counterfactual advantage numpy (N,)).
+    """
+    dev = next(critic.parameters()).device
+    with torch.inference_mode():
+        g = torch.as_tensor(gsp_padded, dtype=torch.float32, device=dev).unsqueeze(0)
+        pool = critic.encode_spatial(g).expand(t_cf.shape[0], -1)
+        q_all = critic.q_all(pool, torch.as_tensor(cve, dtype=torch.float32, device=dev),
+                             t_cf.to(dev), t_cm.to(dev))
+        _b, adv, gate = counterfactual_gate(q_all, c_logits.to(dev), t_cm.to(dev), pick0.to(dev), margin)
+    return gate.cpu().numpy(), adv.float().cpu().numpy()
+
+def counterfactual_gate(q_all, cand_logits, cand_mask, pick_idx, margin: float = 0.0):
+    """COMA quantities for a batch of ghosts.
+
+    q_all (B,M) critic values per candidate, cand_logits (B,M) actor logits (-inf on padding),
+    cand_mask (B,M) live slots, pick_idx (B,) the actor's first pick.
+    Returns baseline b (B,), counterfactual advantage of the pick (B,), and the execute-gate (B,) bool:
+    the pick is executed only when the critic says it beats the policy's own average over the menu.
+    """
+    probs = torch.softmax(torch.nan_to_num(cand_logits, nan=float('-inf')), dim=1) * cand_mask.to(q_all.dtype)
+    probs = probs / probs.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    b = (probs * q_all).sum(dim=1)
+    q_pick = q_all.gather(1, pick_idx.clamp(0, q_all.shape[1] - 1).unsqueeze(1)).squeeze(1)
+    adv = q_pick - b
+    return b, adv, adv > margin
 
 PREDICTOR_IN_DIM = 19
 PREDICTOR_HIDDEN_DIM = 32

@@ -367,6 +367,31 @@ def _task_key_local(task) -> tuple:
     #mirrors cbba._task_key without importing cbba (obs is imported by cbba's callers)
     return (int(task.task_type), (round(float(task.target_pos[0]), 1), round(float(task.target_pos[1]), 1)))
 
+AUTH_SCORE = float(_os.environ.get("AUTH_SCORE", "100.0"))   #a confident pick must win its OWN auction outright
+
+def authoritative_task(ghost, pick_idx: int, frame: int, target_speed: float = 1.0):
+    """The actor's chosen candidate, made authoritative for THIS ghost."""
+    cands = getattr(ghost, '_rl_candidates', None) or []
+    if pick_idx is None or pick_idx < 0 or pick_idx >= min(len(cands), MAX_CANDIDATES):
+        return None
+    src = cands[int(pick_idx)]
+    return Task(task_type=src.task_type, target_pos=src.target_pos, score=AUTH_SCORE, created_frame=frame,
+                owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed, origin=ORIGIN_RL_ENDORSE)
+
+def build_cve(gids, ve, max_ghosts: int = MAX_GHOSTS, vec_dim: int = VEC_DIM):
+    """Critic vector: every alive ghost's vector in gid order, plus a one-hot of which ghost this row is for.
+    (N, MAX_GHOSTS*VEC_DIM + MAX_GHOSTS). Shared by the trainer and every evaluation path."""
+    n = len(gids)
+    joint = np.zeros((max_ghosts, vec_dim), dtype=np.float32)
+    for i, gid in enumerate(gids):
+        joint[gid] = ve[i]
+    flat = joint.reshape(-1)
+    out = np.zeros((n, max_ghosts * vec_dim + max_ghosts), dtype=np.float32)
+    out[:, :max_ghosts * vec_dim] = flat
+    for i, gid in enumerate(gids):
+        out[i, max_ghosts * vec_dim + gid] = 1.0
+    return out
+
 def actions_to_tasks(ghost, cand_scores, cand_picks, frame: int, obs_resolution: float = 1.0,
                      target_speed: float = 1.0, novel_scores=None, novel_indices=None) -> list:
     """Turn the actor's decisions into CBBA nominations.

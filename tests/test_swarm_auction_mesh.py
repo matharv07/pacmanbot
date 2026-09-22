@@ -218,44 +218,43 @@ def test_env_mesh_rewards_and_common_pool():
 
 
 def test_cross_ghost_task_pooling_and_bidding():
-    """Verify that ghosts pool nominated tasks and bid on the ones closest to themselves."""
+    """The pointer pick is AUTHORITATIVE for its own ghost and is NOT pooled to peers.
+
+    Runs 13-17 shared every RL nomination across the swarm through a confidence-scaled auction, and the
+    chain 'my pick -> maybe wins vs 6 peers -> maybe not overridden -> reward' was noise to PPO. Now:
+      * a ghost handed use_pick=True with a live slot executes exactly that candidate,
+      * a peer handed use_pick=False never inherits it (it runs the heuristic floor),
+      * an out-of-range slot silently falls back to the heuristic instead of crashing.
+    """
+    import numpy as np
+    from cbba import _task_key
+    from obs import MAX_CANDIDATES
     stage = next(s for s in STAGES if s.rows >= 21)  # Stage: 21x27
     env = Env(env_id=0, num_ghosts=2, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     env.reset()
+    R, C = stage.rows, stage.cols
+    g0, g1 = env.ghosts[0], env.ghosts[1]
+    assert getattr(g0, '_rl_candidates', None), "reset must populate the heuristic candidate set"
+    pick_key = _task_key(g0._rl_candidates[0])
 
-    # Dynamically pick two passable cells that are 5..8 units apart (within mesh radio range 12.0)
-    open_cells = [(r, c) for r in range(stage.rows) for c in range(stage.cols) if env.world.is_passable(float(c) + 0.5, float(r) + 0.5, radius=0.35)]
-    r0, c0 = open_cells[10]
-    r1, c1 = next((r, c) for r, c in open_cells if 5 <= abs(r - r0) + abs(c - c0) <= 8)
+    def act(slot, use):
+        return ([slot], np.zeros(MAX_CANDIDATES, np.float32), [], np.zeros((R, C), np.float32), 1.0, 0.5, 0.0, use)
 
-    env.ghosts[0].y = float(r0) + 0.5
-    env.ghosts[0].x = float(c0) + 0.5
-    env.ghosts[1].y = float(r1) + 0.5
-    env.ghosts[1].x = float(c1) + 0.5
+    env.step({0: act(0, True), 1: act(0, False)}, want_bc=False)
+    #the auction outcome lives in the consensus table; get_active_task() may already have moved on if the
+    #target was within reach of six frames of movement (explore candidates are scored nearest-first)
+    from obs import AUTH_SCORE
+    from allocator import ORIGIN_RL_ENDORSE
+    assert g0.cbba_agent.z.get(pick_key) == 0, "ghost 0 must have won its own pick in its auction"
+    t_auth = g0.cbba_agent._task_map.get(pick_key)
+    assert t_auth is not None and t_auth.score == AUTH_SCORE and t_auth.origin == ORIGIN_RL_ENDORSE, \
+        "the executed entry must be the authoritative copy, not the heuristic's own scoring of the same target"
+    assert g1.cbba_agent.z.get(pick_key) != 1 and pick_key not in g1.cbba_agent.bundle, \
+        "a peer must not inherit another ghost's authoritative pick"
 
-    # Place Pacman far away
-    env.player.y = 18.0
-    env.player.x = 20.0
-
-    # Both ghosts nominate both waypoints into the common pool
-    actions = {0: _novel_action(env, [(r0, c0), (r1, c1)], 5.0), 1: _novel_action(env, [(r0, c0), (r1, c1)], 5.0)}
-    obs, rewards, done, info = env.step(actions, want_bc=False)
-
-    # Within mesh radio range, consensus resolves:
-    # Ghost 0 wins task near itself, Ghost 1 wins task near itself
-    t0_pos = (float(r0) + 0.5, float(c0) + 0.5)
-    t1_pos = (float(r1) + 0.5, float(c1) + 0.5)
-
-    winner_for_t0 = None
-    winner_for_t1 = None
-    for (t_type, pos), winner in env.ghosts[0].cbba_agent.z.items():
-        if math.hypot(pos[0] - t0_pos[0], pos[1] - t0_pos[1]) < 0.2:
-            winner_for_t0 = winner
-        if math.hypot(pos[0] - t1_pos[0], pos[1] - t1_pos[1]) < 0.2:
-            winner_for_t1 = winner
-
-    assert winner_for_t0 == 0
-    assert winner_for_t1 == 1
+    #out-of-range slot: heuristic fallback, no exception, and the auction still ran
+    env.step({0: act(MAX_CANDIDATES + 5, True), 1: act(0, False)}, want_bc=False)
+    assert g0.cbba_agent._last_auction >= env.frame - 6
 
 def test_belief_grounded_heuristic_tasks():
     """Verify that heuristic tasks and BC targets follow the belief map modes when Pacman is lost."""

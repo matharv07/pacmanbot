@@ -40,6 +40,8 @@ DIRS  = [UP, DOWN, LEFT, RIGHT]
 
 import os as _os
 RADIUS            = float(_os.environ.get("GHOST_RADIO", "12"))
+GHOST_SPEED       = float(_os.environ.get("GHOST_SPEED", "0.50"))
+SPEED_RATIO       = 1.0 / max(1e-6, GHOST_SPEED)   #how many ghost-cells Pacman covers per ghost-cell
 RAY_COUNT         = 90
 MAX_RAY_DIST      = float(_os.environ.get("GHOST_LIDAR", "10"))
 UNKNOWN           = -1
@@ -78,7 +80,7 @@ class Ghost:
         self.x, self.y = float(pos[1]), float(pos[0])
         self.prev_x, self.prev_y = self.x, self.y
         self.vx, self.vy = 0.0, 0.0
-        self.max_speed = 0.50
+        self.max_speed = GHOST_SPEED
         self.target_cell = pos
         self.color = color
         self.dead = False
@@ -251,7 +253,7 @@ class Ghost:
             if threat is not None:
                 d_me = math.hypot(threat[0] - self.y, threat[1] - self.x)
                 d_pac_pellet = math.hypot(threat[0] - pac_y, threat[1] - pac_x)
-                if d_me * 2.0 < d_pac_pellet:          #we arrive first at the 2:1 speed ratio
+                if d_me * SPEED_RATIO < d_pac_pellet:   #we arrive first at the real speed ratio
                     dx, dy = threat[1] - self.x, threat[0] - self.y
                     d = math.hypot(dx, dy)
                     if d > 0.01:

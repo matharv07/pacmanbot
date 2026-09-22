@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from net    import GhostActor, GhostCritic, MovementPredictor, PREDICTOR_IN_DIM, PREDICTOR_HIDDEN_DIM
+from net    import counterfactual_gate, GhostActor, GhostCritic, MovementPredictor, PREDICTOR_IN_DIM, PREDICTOR_HIDDEN_DIM
 from worker import Env
 from obs    import (MAX_H, MAX_W, MAX_GHOSTS, SPATIAL_CH, GLOBAL_SPATIAL_CH, VEC_DIM, CRITIC_VEC_DIM,
                     MAX_CANDIDATES, CAND_FEAT_DIM, flatten_cand_cells)
@@ -58,17 +58,29 @@ GAMMA           = 0.985
 GAE_LAMBDA      = 0.96
 CLIP_EPS        = 0.20
 ENT_COEF_INIT   = float(os.environ.get("ENT_COEF_INIT", "0.01"))
-ENT_TARGET      = float(os.environ.get("ENT_TARGET", "0.70"))
+ENT_TARGET      = float(os.environ.get("ENT_TARGET", "0.70"))        #start of the per-stage schedule
+ENT_TARGET_END  = float(os.environ.get("ENT_TARGET_END", "0.25"))    #the head is ALLOWED to commit once signal exists
+ENT_DECAY_UPDATES = int(os.environ.get("ENT_DECAY_UPDATES", "300"))
+#--- COMA: the pick is authoritative for its ghost and is executed only when the critic says it beats
+#--- the policy's own average over the menu. PICK_EXPLORE keeps some on-policy executed samples flowing.
+PICK_EXPLORE    = float(os.environ.get("PICK_EXPLORE", "0.10"))
+GATE_MARGIN     = float(os.environ.get("GATE_MARGIN", "0.05"))       #in normalised-return units (returns have unit
+#variance). A freshly initialised critic emits Q that barely varies across candidates (measured |adv| ~0.002), so a
+#zero margin made the gate a coin flip: 57% of an UNTRAINED actor's random picks were executed at authoritative
+#priority, costing 17 kill points and +1 ghost/game. With a margin, a critic that has learned nothing keeps its
+#hands off and exploration is exactly PICK_EXPLORE; picks are executed once the critic sees a MATERIAL edge.
+COMA_MIX        = float(os.environ.get("COMA_MIX", "1.0"))           #1.0 = pure Q(s,pick)-b advantage, 0.0 = GAE
 ENT_COEF_BOUNDS = (0.001, 0.2)
 ENT_COEF_STEP   = 1.10
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 1.2e-4
 LR_CRITIC       = 3.0e-4
-STAGE_BC_INIT   = [0.35, 0.15, 0.08, 0.04]
+STAGE_BC_INIT   = [0.05, 0.05, 0.05, 0.05]   #a small constant regulariser: BC in stages 0-2 used to pre-sharpen
+#the pointer head onto the heuristic's top pick, which then read as 'confidence' and bought a 1.75x auction edge
 BC_FLOOR        = 0.02
-SPATIAL_BC_W    = float(os.environ.get("SPATIAL_BC_W", "0.3"))
-NOVEL_ENT_W     = float(os.environ.get("NOVEL_ENT_W", "0.3"))
+SPATIAL_BC_W    = float(os.environ.get("SPATIAL_BC_W", "0.0"))   #novel cells are no longer executed
+NOVEL_ENT_W     = float(os.environ.get("NOVEL_ENT_W", "0.0"))
 K_CAND          = int(os.environ.get("K_CAND", "3"))   #nominations taken from the live candidate set
 K_NOVEL         = int(os.environ.get("K_NOVEL", "1"))  #off-menu waypoints: the route to strategies the allocator has no rule for
 N_ACTION_HEADS  = K_CAND + K_NOVEL + 3                 #+ speed, direction, hijack gate
@@ -405,13 +417,18 @@ def compute_gae(buf_rewards_e, buf_values_e, buf_dones_e, last_val_dict_e, gamma
     return adv_dict_list, ret_dict_list
 
 
-def _critic_value(critic, spatial_unique, vector, env_n_ghosts):
-    if sum(env_n_ghosts) == 0:
-        return torch.zeros(0, device=DEVICE)
+def _critic_pool_expand(critic, spatial_unique, env_n_ghosts):
+    """One spatial encode per env-step, repeated to one row per alive ghost."""
     pool = critic.encode_spatial(spatial_unique)
     repeats = torch.tensor(env_n_ghosts, device=DEVICE, dtype=torch.long)
-    pool_expanded = torch.repeat_interleave(pool, repeats, dim=0)
-    return critic.forward_from_pool(pool_expanded, vector).squeeze(-1)
+    return torch.repeat_interleave(pool, repeats, dim=0)
+
+def _coma(critic, pool_exp, cve, cf, cm, c_logits, pick0, margin):
+    """Q for every candidate, the policy-weighted baseline b, the pick's counterfactual advantage, and the
+    execute gate. All in the critic's normalised return units."""
+    q_all = critic.q_all(pool_exp, cve, cf, cm)
+    b, adv, gate = counterfactual_gate(q_all, c_logits, cm, pick0, margin)
+    return q_all, b, adv, gate
 
 def train():
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -534,9 +551,9 @@ def train():
     print("VecEnv initialized. Starting training...")
     t0 = time.time()
 
-    def run_ppo(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_cf, b_cc, b_cm, b_cbc, b_cact, b_nact, b_spd, b_dir, b_gate, b_olp, b_adv, b_ret, lam_bc, ret_rms, ent_coef):
+    def run_ppo(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_cf, b_cc, b_cm, b_cbc, b_cact, b_nact, b_spd, b_dir, b_gate, b_olp, b_adv, b_ret, b_advcf, b_exec, b_use, lam_bc, ret_rms, ent_coef):
         t_ppo_start = time.time()
-        metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "cell_entropy": 0, "cand_ent_frac": 0, "bc_agree": 0, "approx_kl": 0, "clip_fraction": 0, "n_batches": 0}    
+        metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "cell_entropy": 0, "cand_ent_frac": 0, "bc_agree": 0, "approx_kl": 0, "clip_fraction": 0, "pick_exec": 0, "n_batches": 0}    
         N_total = b_sp.shape[0]
         uid_to_indices = defaultdict(list)
         b_gsp_ids_np = b_gsp_ids.cpu().numpy()
@@ -591,6 +608,7 @@ def train():
                     mb_cell_ent = 0.0
                     mb_cand_frac = 0.0
                     mb_agree = 0.0
+                    mb_use_rate = 0.0
                     mb_approx_kl = 0.0
                     mb_clip_fraction = 0.0
                     try:
@@ -617,6 +635,8 @@ def train():
                             mb_olp = b_olp[chunk_idx]
                             mb_adv = b_adv[chunk_idx]
                             mb_ret = b_ret[chunk_idx]
+                            mb_exec = b_exec[chunk_idx].reshape(-1)
+                            mb_use  = b_use[chunk_idx].reshape(-1)
                             _hw = mb_sp.shape[-2] * mb_sp.shape[-1]
                             if mb_nact.max().item() >= _hw:
                                 print(f"  ⚠️  Action index OOB: max={mb_nact.max().item()} >= H*W={_hw}, clamping")
@@ -629,19 +649,32 @@ def train():
                                 unique_ids, inv_idx = torch.unique(mb_gsp_ids, return_inverse=True)
                                 mb_gsp_unique = b_gsp_unique[unique_ids]
                                 mb_c_pool = critic.encode_spatial(mb_gsp_unique)
-                                v_pred = critic.forward_from_pool(mb_c_pool[inv_idx], mb_cve).squeeze(-1)
+                                q_all = critic.q_all(mb_c_pool[inv_idx], mb_cve, mb_cf, mb_cm)
+                                with torch.no_grad():
+                                    _pr = torch.softmax(torch.nan_to_num(cand_logits.float(), nan=float('-inf')), dim=1) * mb_cm.float()
+                                    _pr = _pr / _pr.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                                b_pred = (_pr.to(q_all.dtype) * q_all).sum(dim=1)
+                                _has_exec = mb_exec >= 0
+                                q_exec = q_all.gather(1, mb_exec.clamp(min=0).unsqueeze(1)).squeeze(1)
+                                #Q learns from whatever was executed: the pick when it was used, the heuristic's
+                                #choice otherwise; rows with no task regress the baseline
+                                v_pred = torch.where(_has_exec, q_exec, b_pred)
                                 with torch.no_grad():
                                     _cw = mb_cbc * mb_cm.float()
                                     _ok = _cw.sum(dim=1) > 1e-6
                                     agree = ((cand_logits[_ok].argmax(1) == _cw[_ok].argmax(1)).float().mean()
                                              if _ok.any() else torch.zeros((), device=DEVICE))
                                 log_ratio = torch.clamp(new_lp - mb_olp, -10.0, 10.0)
-                                head_w = torch.ones_like(log_ratio)
-                                head_w[:, K_CAND + K_NOVEL + 2] = mb_gate.reshape(-1).float()
+                                #heads that carry gradient: the FIRST candidate pick (only on rows where it was
+                                #actually executed) and speed. Extra picks, novel cells, direction and the hijack
+                                #gate are not executed any more, so their ratios must not move the policy.
+                                head_w = torch.zeros_like(log_ratio)
+                                head_w[:, 0] = mb_use.float()
+                                head_w[:, K_CAND + K_NOVEL] = 1.0
                                 log_ratio = log_ratio * head_w
                                 ratio = torch.exp(log_ratio)
                                 with torch.no_grad():
-                                    approx_kl = (0.5 * log_ratio.pow(2)).sum(dim=1).mean() / log_ratio.shape[1]
+                                    approx_kl = (0.5 * log_ratio.pow(2)).sum() / head_w.sum().clamp(min=1.0)
                                     clip_fraction = ((torch.abs(ratio - 1.0) > CLIP_EPS).float() * head_w).sum() / head_w.sum().clamp(min=1.0)
                                 adv_h = mb_adv.unsqueeze(1)
                                 s1 = ratio * adv_h
@@ -689,6 +722,7 @@ def train():
                             mb_cell_ent += cell_ent.mean().item() * weight
                             mb_cand_frac += cand_ent_frac.mean().item() * weight
                             mb_agree += agree.item() * weight
+                            mb_use_rate += mb_use.float().mean().item() * weight
                             mb_approx_kl += approx_kl.item() * weight
                             mb_clip_fraction += clip_fraction.item() * weight
                     except torch.cuda.OutOfMemoryError:
@@ -727,6 +761,7 @@ def train():
                 metrics["cell_entropy"] += mb_cell_ent
                 metrics["cand_ent_frac"] += mb_cand_frac
                 metrics["bc_agree"] += mb_agree
+                metrics["pick_exec"] += mb_use_rate
                 metrics["approx_kl"]  += mb_approx_kl
                 metrics["clip_fraction"] += mb_clip_fraction
                 metrics["n_batches"]  += 1
@@ -779,6 +814,9 @@ def train():
         buf_cbc       = [[] for _ in range(NUM_ENVS)]
         buf_actions   = [[] for _ in range(NUM_ENVS)]
         buf_novel     = [[] for _ in range(NUM_ENVS)]
+        buf_usepick   = [[] for _ in range(NUM_ENVS)]
+        buf_advcf     = [[] for _ in range(NUM_ENVS)]
+        buf_exec      = [[] for _ in range(NUM_ENVS)]
         buf_speeds    = [[] for _ in range(NUM_ENVS)]
         buf_directions= [[] for _ in range(NUM_ENVS)]
         buf_gates     = [[] for _ in range(NUM_ENVS)]
@@ -829,6 +867,8 @@ def train():
                     buf_directions[e].append(np.empty((0, 1), dtype=np.float32))
                     buf_gates[e].append(np.empty((0, 1), dtype=np.float32))
                     buf_logprobs[e].append(np.empty((0, N_ACTION_HEADS), dtype=np.float32))
+                    buf_usepick[e].append(np.empty((0, 1), dtype=np.float32))
+                    buf_advcf[e].append(np.empty((0, 1), dtype=np.float32))
                     continue
                 #Pad trimmed observations to current stage size for CNN
                 sp_padded = _pad_spatial(sp, target_h=stage.rows, target_w=stage.cols)
@@ -887,17 +927,18 @@ def train():
                 while True:
                     try:
                         idx_chunks, lp_chunks, sc_chunks, spd_chunks, spd_lp_chunks, dir_chunks, dir_lp_chunks, gate_chunks, gate_lp_chunks = [], [], [], [], [], [], [], [], []
-                        nidx_chunks, nlp_chunks, nsc_chunks = [], [], []
+                        nidx_chunks, nlp_chunks, nsc_chunks, clog_chunks = [], [], [], []
                         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
                             for ci in range(0, n_total, _eff_infer_chunk):
                                 ce = min(ci + _eff_infer_chunk, n_total)
                                 (c_idx, c_lp, c_scores, c_nidx, c_nlp, c_nsc, _, _,
-                                 c_speed, c_speed_lp, c_dir, c_dir_lp, c_gate, c_gate_lp) = actor_rollout(
+                                 c_speed, c_speed_lp, c_dir, c_dir_lp, c_gate, c_gate_lp, c_clog) = actor_rollout(
                                     t_sp[ci:ce], t_ve[ci:ce], t_vm[ci:ce], t_cf[ci:ce], t_cc[ci:ce], t_cm[ci:ce],
                                     K_cand=K_CAND, K_novel=K_NOVEL)
                                 nidx_chunks.append(c_nidx)
                                 nlp_chunks.append(c_nlp)
                                 nsc_chunks.append(c_nsc)
+                                clog_chunks.append(c_clog)
                                 idx_chunks.append(c_idx)
                                 lp_chunks.append(c_lp)
                                 sc_chunks.append(c_scores)
@@ -907,8 +948,11 @@ def train():
                                 dir_lp_chunks.append(c_dir_lp)
                                 gate_chunks.append(c_gate)
                                 gate_lp_chunks.append(c_gate_lp)
-                            val_all = _critic_value(critic_rollout, t_gsp_unique, t_cve, active_n_ghosts)
-                            val_all = ret_rms(val_all, unnorm=True)
+                            pool_exp = _critic_pool_expand(critic_rollout, t_gsp_unique, active_n_ghosts)
+                            c_logits_all = torch.cat(clog_chunks, dim=0)
+                            pick0_all = torch.cat(idx_chunks, dim=0)[:, 0]
+                            _q_all, b_all, advcf_all, gate_all = _coma(critic_rollout, pool_exp, t_cve, t_cf, t_cm, c_logits_all, pick0_all, GATE_MARGIN)
+                            val_all = ret_rms(b_all, unnorm=True)   #the baseline IS V^pi(s), stored as the GAE value
                         break  #success
                     except torch.cuda.OutOfMemoryError:
                         torch.cuda.empty_cache()
@@ -932,6 +976,11 @@ def train():
                 gate_t = torch.cat(gate_chunks, dim=0).float().cpu().numpy()
                 gate_lp_t = torch.cat(gate_lp_chunks, dim=0).float().cpu().numpy()
                 val_all_np = val_all.float().cpu().numpy()
+                advcf_np = advcf_all.float().cpu().numpy()
+                exec_allowed = (critic_warmup_remaining <= 0) and (warm >= 1.0)
+                use_np = np.zeros(n_total, dtype=bool)
+                if exec_allowed:
+                    use_np = gate_all.cpu().numpy() | (np.random.rand(n_total) < PICK_EXPLORE)
                 offset = 0
                 for e in range(NUM_ENVS):
                     n_g = env_n_ghosts[e]
@@ -952,13 +1001,15 @@ def train():
                     e_gate = gate_t[offset:offset + n_g]
                     e_gate_lp = gate_lp_t[offset:offset + n_g]
                     e_val = val_all_np[offset:offset + n_g]
+                    e_use = use_np[offset:offset + n_g]
+                    e_advcf = advcf_np[offset:offset + n_g]
                     env_act = {}
                     for i, gid in enumerate(gids):
                         novel_pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in e_nidx[i]]
                         spd_val = float(e_spd[i].item() if hasattr(e_spd[i], 'item') else e_spd[i])
                         dir_val = float(e_dir[i].item() if hasattr(e_dir[i], 'item') else e_dir[i])
                         gate_val = float(e_gate[i].item() if hasattr(e_gate[i], 'item') else e_gate[i])
-                        env_act[gid] = ([int(x) for x in e_idx[i]], e_sc[i], novel_pairs, e_nsc[i], spd_val, dir_val, gate_val)
+                        env_act[gid] = ([int(x) for x in e_idx[i]], e_sc[i], novel_pairs, e_nsc[i], spd_val, dir_val, gate_val, bool(e_use[i]))
                     step_actions[e] = env_act
                     buf_actions[e].append(e_idx)
                     buf_novel[e].append(e_nidx)
@@ -968,6 +1019,8 @@ def train():
                     buf_logprobs[e].append(np.concatenate([e_lp, e_nlp, e_spd_lp.reshape(n_g, 1), e_dir_lp.reshape(n_g, 1), e_gate_lp.reshape(n_g, 1)], axis=1).astype(np.float32))
                     v_dict = {gids[i]: float(e_val[i]) for i in range(n_g)}
                     buf_values[e].append(v_dict)
+                    buf_usepick[e].append(e_use.astype(np.float32).reshape(n_g, 1))
+                    buf_advcf[e].append(e_advcf.astype(np.float32).reshape(n_g, 1))
                     offset += n_g
             obs_list, rew_list, done_list, info_list = vec_env.step(step_actions, bc_active)
             for e in range(NUM_ENVS):
@@ -978,6 +1031,9 @@ def train():
                         completed_pred_seqs.append(env_pred_trajs[e][:8])
                         env_pred_trajs[e] = env_pred_trajs[e][8:]
                     env_pred_trajs[e].clear()
+                ex = info_list[e].get("exec_cand", {}) if isinstance(info_list[e], dict) else {}
+                gids_step = buf_gids[e][-1] if buf_gids[e] else []
+                buf_exec[e].append(np.array([[int(ex.get(g, -1))] for g in gids_step], dtype=np.int64).reshape(len(gids_step), 1))
                 r = rew_list[e]
                 mean_r = sum(r.values()) / max(1, len(r)) if r else 0.0
                 current_returns[e] += mean_r
@@ -1042,6 +1098,7 @@ def train():
                 except Exception as e:
                     print(f"Warning: Predictor single-step update failed: {e}")
         boot_sp, boot_gsp_unique, boot_ve, boot_cve, boot_vm = [], [], [], [], []
+        boot_cf, boot_cc, boot_cm = [], [], []
         boot_env_idx, boot_gids_list, boot_n_ghosts = [], [], []
         for e in range(NUM_ENVS):
             if len(buf_rewards[e]) == 0:
@@ -1066,6 +1123,7 @@ def train():
                 boot_ve.append(ve)
                 boot_cve.append(cve_batch)
                 boot_vm.append(vm_padded)
+                boot_cf.append(cf); boot_cc.append(flatten_cand_cells(cc, stage.cols).astype(np.int64)); boot_cm.append(cm.astype(bool))
                 boot_gids_list.append(gids)
         all_last_v = [{} for _ in range(NUM_ENVS)]
         if boot_sp:
@@ -1074,10 +1132,15 @@ def train():
             cat_ve = np.concatenate(boot_ve, axis=0)
             cat_cve = np.concatenate(boot_cve, axis=0)
             cat_vm = np.concatenate(boot_vm, axis=0)
-            t_sp, t_gsp_unique, t_ve, t_cve, t_vm = rollout_transfer.transfer(cat_sp, cat_gsp_unique, cat_ve, cat_cve, cat_vm)
+            cat_cf = np.concatenate(boot_cf, axis=0); cat_cc = np.concatenate(boot_cc, axis=0); cat_cm = np.concatenate(boot_cm, axis=0)
+            t_sp, t_gsp_unique, t_ve, t_cve, t_vm, t_cf, t_cc, t_cm = rollout_transfer.transfer(cat_sp, cat_gsp_unique, cat_ve, cat_cve, cat_vm, cat_cf, cat_cc, cat_cm)
             with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
-                #only the critic value is needed for bootstrap — actor call here was wasteful
-                val = _critic_value(critic_rollout, t_gsp_unique, t_cve, boot_n_ghosts)
+                #bootstrap value = COMA baseline b = sum_c pi(c|s) Q(s,c); needs the actor's candidate logits
+                _f, _p, _v = actor_rollout.encode(t_sp, t_ve)
+                _cl, _safe = actor_rollout.candidate_logits(_f, _p, _v, t_cf, t_cc, t_cm)
+                pool_exp = _critic_pool_expand(critic_rollout, t_gsp_unique, boot_n_ghosts)
+                _q = critic_rollout.q_all(pool_exp, t_cve, t_cf, t_cm)
+                val, _, _ = counterfactual_gate(_q, _cl, t_cm, torch.zeros(_q.shape[0], dtype=torch.long, device=_q.device))
                 val = ret_rms(val, unnorm=True)
             v_np = val.float().cpu().numpy()
             offset = 0
@@ -1098,6 +1161,7 @@ def train():
         all_cve, all_gsp_ids = [], []
         all_act, all_spd, all_dir, all_gate, all_lp, all_adv, all_ret = [], [], [], [], [], [], []
         all_cf, all_cc, all_cm, all_cbc, all_nact = [], [], [], [], []
+        all_advcf, all_exec, all_use = [], [], []
         for e in range(NUM_ENVS):
             T = len(buf_rewards[e])
             if T == 0:
@@ -1131,6 +1195,9 @@ def train():
                     all_lp.append(buf_logprobs[e][t][i])
                     all_adv.append(adv_dict_list[t].get(gid, 0.0))
                     all_ret.append(ret_dict_list[t].get(gid, 0.0))
+                    all_advcf.append(buf_advcf[e][t][i])
+                    all_exec.append(buf_exec[e][t][i] if t < len(buf_exec[e]) and i < len(buf_exec[e][t]) else np.array([-1], dtype=np.int64))
+                    all_use.append(buf_usepick[e][t][i])
         if not all_sp:
             continue
         #build dataset
@@ -1154,10 +1221,15 @@ def train():
         arr_olp = np.array(all_lp, dtype=np.float32)
         arr_adv = np.array(all_adv, dtype=np.float32)
         arr_ret = np.array(all_ret, dtype=np.float32)
+        arr_advcf = np.array(all_advcf, dtype=np.float32).reshape(-1)
+        arr_exec  = np.array(all_exec, dtype=np.int64).reshape(-1)
+        arr_use   = np.array(all_use, dtype=np.float32).reshape(-1)
         (ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs,
-         ds_cf, ds_cc, ds_cm, ds_cbc, ds_act, ds_nact, ds_spd, ds_dir, ds_gate, ds_olp, ds_adv, ds_ret) = train_transfer.transfer(
+         ds_cf, ds_cc, ds_cm, ds_cbc, ds_act, ds_nact, ds_spd, ds_dir, ds_gate, ds_olp, ds_adv, ds_ret,
+         ds_advcf, ds_exec, ds_use) = train_transfer.transfer(
             arr_sp, arr_gsp_unique, arr_gsp_ids, arr_ve, arr_cve, arr_vm, arr_ht, arr_hs,
-            arr_cf, arr_cc, arr_cm, arr_cbc, arr_act, arr_nact, arr_spd, arr_dir, arr_gate, arr_olp, arr_adv, arr_ret)
+            arr_cf, arr_cc, arr_cm, arr_cbc, arr_act, arr_nact, arr_spd, arr_dir, arr_gate, arr_olp, arr_adv, arr_ret,
+            arr_advcf, arr_exec, arr_use)
         N_total = ds_sp.shape[0]
         #verify action indices are within spatial bounds
         _sp_hw = ds_sp.shape[-2] * ds_sp.shape[-1]
@@ -1170,7 +1242,9 @@ def train():
             print(f"  ⚠️  GSP ID OOB: max_id={_gsp_max_id} >= unique_n={_gsp_n}")
         indices = np.arange(N_total)
         #normalize advantages GLOBALLY across the entire batch, not per-minibatch
-        ds_adv = (ds_adv - ds_adv.mean()) / (ds_adv.std() + 1e-8)
+        gae_n = (ds_adv - ds_adv.mean()) / (ds_adv.std() + 1e-8)
+        cf_n  = (ds_advcf - ds_advcf.mean()) / (ds_advcf.std() + 1e-8)
+        ds_adv = COMA_MIX * cf_n + (1.0 - COMA_MIX) * gae_n
         t_rollout = time.time() - t_start_rollout
         mean_ret = round(float(np.mean(ep_returns)), 3) if ep_returns else None
         mean_pac = round(float(np.mean(ep_pacman_scores)), 1) if ep_pacman_scores else None
@@ -1192,11 +1266,12 @@ def train():
         if actor_stepped:
             bc_decay_step += 1
         metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs, ds_cf, ds_cc, ds_cm, ds_cbc,
-                                  ds_act, ds_nact, ds_spd, ds_dir, ds_gate, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms, ent_coef)
+                                  ds_act, ds_nact, ds_spd, ds_dir, ds_gate, ds_olp, ds_adv, ds_ret, ds_advcf, ds_exec, ds_use, lam_bc, ret_rms, ent_coef)
         #the controller regulates the CANDIDATE head, in units of its own maximum entropy
         measured_cell_ent = metrics["cand_ent_frac"] / max(1, metrics["n_batches"])
         if actor_stepped:
-            if measured_cell_ent < ENT_TARGET:
+            ent_target = ENT_TARGET - (ENT_TARGET - ENT_TARGET_END) * min(1.0, updates_in_stage / max(1, ENT_DECAY_UPDATES))
+            if measured_cell_ent < ent_target:
                 ent_coef = min(ENT_COEF_BOUNDS[1], ent_coef * ENT_COEF_STEP)
             else:
                 ent_coef = max(ENT_COEF_BOUNDS[0], ent_coef / ENT_COEF_STEP)
@@ -1224,6 +1299,8 @@ def train():
             "cell_entropy": round(metrics["cell_entropy"] / nb, 5),
             "cand_ent_frac": round(metrics["cand_ent_frac"] / nb, 4),
             "bc_agree": round(metrics["bc_agree"] / nb, 4),
+            "pick_exec": round(metrics["pick_exec"] / nb, 4),
+            "ent_target": round(ENT_TARGET - (ENT_TARGET - ENT_TARGET_END) * min(1.0, updates_in_stage / max(1, ENT_DECAY_UPDATES)), 3),
             "ent_coef":   round(ent_coef, 5),
             "approx_kl":  round(metrics["approx_kl"] / nb, 5),
             "clip_frac":  round(metrics["clip_fraction"] / nb, 4),

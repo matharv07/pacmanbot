@@ -31,7 +31,7 @@ def test_single_env_rollout_and_step():
     t_cm = torch.from_numpy(cm)
     with torch.no_grad():
         (idx, lp, scores, nidx, nlp, nsc, pool, vec,
-         speed, speed_lp, direction, dir_lp, gate, gate_lp) = actor(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm)
+         speed, speed_lp, direction, dir_lp, gate, gate_lp, cand_logits) = actor(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm)
     action_dict = {}
     for i, gid in enumerate(gids):
         novel_pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in nidx[i].numpy()]

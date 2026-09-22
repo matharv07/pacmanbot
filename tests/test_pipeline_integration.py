@@ -77,7 +77,16 @@ def test_actor_critic_shapes_and_logprobs():
     cc = torch.randint(0, H * W, (2, MAX_CANDIDATES))
     cm = torch.zeros(2, MAX_CANDIDATES, dtype=torch.bool); cm[0, :9] = True
     (idx, lp, scores, nidx, nlp, nsc, pool, vec,
-     speed, speed_lp, direction, dir_lp, gate, gate_lp) = actor(sp, ve, vm, cf, cc, cm, K_cand=3, K_novel=1)
+     speed, speed_lp, direction, dir_lp, gate, gate_lp, cand_logits) = actor(sp, ve, vm, cf, cc, cm, K_cand=3, K_novel=1)
+    assert cand_logits.shape == (2, MAX_CANDIDATES), f"cand_logits shape mismatch: {cand_logits.shape}"
+    assert torch.isfinite(cand_logits[0, :9]).all(), "live candidate logits must be finite"
+    assert torch.isinf(cand_logits[0, 9:]).all(), "padded candidate logits must be masked to -inf"
+    #Q-critic: one value per candidate, COMA baseline and gate are finite and the gate is boolean
+    from net import counterfactual_gate
+    q_all = critic.q_all(critic.encode_spatial(torch.randn(2, 12, H, W)), torch.randn(2, critic.vec_mlp[0].in_features), cf, cm)
+    assert q_all.shape == (2, MAX_CANDIDATES)
+    b, adv, use = counterfactual_gate(q_all, cand_logits, cm, idx[:, 0])
+    assert b.shape == (2,) and adv.shape == (2,) and use.dtype == torch.bool and torch.isfinite(b).all() and torch.isfinite(adv).all()
     assert idx.shape == (2, 3), f"idx shape mismatch: {idx.shape}"
     assert lp.shape == (2, 3), f"lp shape mismatch: {lp.shape}"
     assert nidx.shape == (2, 1) and nsc.shape == (2, H, W)

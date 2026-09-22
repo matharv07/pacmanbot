@@ -3,8 +3,9 @@ import math
 import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra as _sp_dijkstra
+import os as _os
 
-FLEE_SPEED_RATIO = 2.0
+FLEE_SPEED_RATIO = 1.0 / max(1e-6, float(_os.environ.get("GHOST_SPEED", "0.50")))
 def _euclidean(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 

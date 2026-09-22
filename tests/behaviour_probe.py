@@ -76,7 +76,7 @@ def _nominated_cells(ghost, act):
         out.append((float(r) + 0.5, float(c) + 0.5))
     return out
 
-def _run_game(mode, actor, env, stage, seed, log):
+def _run_game(mode, actor, env, stage, seed, log, critic=None):
     np.random.seed(seed); torch.manual_seed(seed)
     import random as _r; _r.seed(seed)
     obs = env.reset()
@@ -106,10 +106,18 @@ def _run_game(mode, actor, env, stage, seed, log):
             t_cm = torch.from_numpy(cm.astype(bool))
             with torch.inference_mode():
                 (idx, lp, scores, nidx, _nlp, nsc, _p, _v,
-                 speed, _slp, direction, _dlp, gate, _glp) = actor(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm, K_cand=K, K_novel=1)
+                 speed, _slp, direction, _dlp, gate, _glp, c_clog) = actor(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm, K_cand=K, K_novel=1)
                 feats, pool, vec = actor.encode(t_sp, t_ve)
                 raw_logits = actor.logits_from_features(feats, pool, t_vm).view(len(gids), -1)
                 cand_logits, safe = actor.candidate_logits(feats, pool, vec, t_cf, t_cc, t_cm)
+            use_np = np.zeros(len(gids), dtype=bool); adv_np = np.zeros(len(gids), dtype=np.float32)
+            if critic is not None and mode == 'rl':
+                from net import gate_for_eval
+                from obs import build_cve
+                gsp_p = _pad(gsp.astype(np.float32), H, W)
+                use_np, adv_np = gate_for_eval(critic, gsp_p, build_cve(gids, ve), t_cf, t_cm, c_clog, idx[:, 0])
+            for _u, _a in zip(use_np, adv_np):
+                log['pick_used'].append(float(_u)); log['pick_adv'].append(float(_a))
             idx_np = idx.numpy(); sc = scores.float().numpy(); spd = speed.float().numpy(); dr = direction.float().numpy(); gt = gate.float().numpy()
             nidx_np = nidx.numpy(); nsc_np = nsc.float().numpy()
             cl_np = cand_logits.float().numpy(); safe_np = safe.numpy()
@@ -118,7 +126,7 @@ def _run_game(mode, actor, env, stage, seed, log):
                 picks = [int(x) for x in idx_np[i]]
                 if mode == 'floor':
                     picks, novel_pairs = [], []   #ablation: heuristic floor decides the auction on its own
-                action[gid] = (picks, sc[i], novel_pairs, nsc_np[i], float(spd[i].item()), float(dr[i].item()), float(gt[i].item()))
+                action[gid] = (picks, sc[i], novel_pairs, nsc_np[i], float(spd[i].item()), float(dr[i].item()), float(gt[i].item()), bool(use_np[i]))
                 #how committed the pointer head is, in units of its own maximum
                 n_live = int(cm[i].sum())
                 log['n_cands'].append(n_live)
@@ -278,7 +286,7 @@ def _new_log():
             'n_cands': [], 'cand_entropy': [], 'cand_top': [],
             'task_type': collections.Counter(), 'disp30': [], 'loiter': [], 'bm_peak_err': [], 'bm_peak_err_unseen': [],
             'nom_to_peak': [], 'nom_to_self': [], 'task_to_peak': [], 'task_to_self': [], 'policy_mass_top10bm': [], 'bm_empty': 0,
-            'denial_opps': 0, 'denial_taken': 0, 'denial_dist': [], 'dist_at_activation': [], 'aware_latency': [], 'connectivity': [],
+            'denial_opps': 0, 'denial_taken': 0, 'denial_dist': [], 'dist_at_activation': [], 'aware_latency': [], 'connectivity': [], 'pick_used': [], 'pick_adv': [],
             'origin': collections.Counter(), 'origin_score': collections.defaultdict(list), 'closing': collections.defaultdict(list), 'knows_pac': [], 'los_dist': [], 'powered_aware': []}
 
 def _worker(mode, ckpt, stage_idx, seeds, radio=None, lidar=None):
@@ -292,15 +300,22 @@ def _worker(mode, ckpt, stage_idx, seeds, radio=None, lidar=None):
     from worker import Env
     from net import GhostActor
     stage = STAGES[stage_idx]
-    actor = None
+    actor = None; critic = None
     if mode in ('rl', 'floor'):
+        from net import GhostCritic
         if os.path.basename(str(ckpt)) == 'fresh':
             torch.manual_seed(0)
-            actor = GhostActor()
+            actor = GhostActor(); critic = GhostCritic()
         else:
             ck = torch.load(ckpt, map_location='cpu', weights_only=False)
             actor = GhostActor(); actor.load_state_dict(ck['actor'])
+            if 'critic' in ck:
+                try:
+                    critic = GhostCritic(); critic.load_state_dict(ck['critic'])
+                except Exception:
+                    critic = None   #old checkpoint: no Q-critic -> picks never executed (heuristic floor)
         actor.eval()
+        if critic is not None: critic.eval()
     elif mode == 'floor':
         if os.path.exists(ckpt):
             try:
@@ -313,7 +328,7 @@ def _worker(mode, ckpt, stage_idx, seeds, radio=None, lidar=None):
     env = Env(env_id=seeds[0], num_ghosts=stage.n_ghosts, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=1.0, n_power=stage.n_power)
     log = _new_log(); games = []
     for s in seeds:
-        games.append(_run_game(mode, actor, env, stage, s, log))
+        games.append(_run_game(mode, actor, env, stage, s, log, critic))
     return games, log
 
 def _merge(dst, src):
@@ -376,6 +391,10 @@ def report(mode, games, log):
               f" | top-candidate prob {_m(log['cand_top']):.2f}")
     ONAMES = {-1: 'no task', ORIGIN_HEURISTIC: 'heuristic', ORIGIN_RL_ENDORSE: 'RL-endorsed', ORIGIN_RL_NOVEL: 'RL-novel'}
     o_tot = sum(log['origin'].values()) or 1
+    if log['pick_used']:
+        pa = np.array(log['pick_adv']); pu = np.array(log['pick_used'])
+        print(f"EXECUTE GATE  pick executed on {pu.mean():.0%} of decisions | counterfactual adv of the pick: mean {pa.mean():+.3f}, "
+              f"when executed {pa[pu > 0.5].mean() if (pu > 0.5).any() else float('nan'):+.3f}, when deferred {pa[pu < 0.5].mean() if (pu < 0.5).any() else float('nan'):+.3f} (normalised-return units)")
     print("--- RL attribution (who won the executed task) ---")
     for k in sorted(log['origin']):
         sc = log['origin_score'].get(k, [])

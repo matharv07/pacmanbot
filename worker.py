@@ -14,7 +14,7 @@ from os import environ as _env
 from pacman import generate_map, Player, WALL, PELLET, POWER, EMPTY
 from ghost  import Ghost, GHOST_COLORS
 import pathfinder
-from obs import (build_spatial, build_global_spatial, build_vector, build_valid_mask, build_candidates, select_candidates, flatten_cand_cells,
+from obs import (authoritative_task, MAX_CANDIDATES, build_spatial, build_global_spatial, build_vector, build_valid_mask, build_candidates, select_candidates, flatten_cand_cells,
                  actions_to_tasks, MAX_H, MAX_W, MAX_GHOSTS, UNKNOWN, SPATIAL_CH, GLOBAL_SPATIAL_CH, VEC_DIM,
                  MAX_CANDIDATES, CAND_FEAT_DIM)
 from reward import RewardShaper
@@ -234,12 +234,11 @@ class Env:
         C = int(self.world_width * self.obs_resolution)
         for gid in alive:
             g = self.ghosts[gid]
-            if gid in action_dict:      #merge RL tasks with CBBA
-                #(cand_picks, cand_scores, novel_pairs, novel_scores, speed, direction, gate)
+            if gid in action_dict:
                 act_data = action_dict[gid]
                 cand_picks, novel_pairs, speed = act_data[0], act_data[2], act_data[4]
-                g.current_rl_dir = act_data[5] if len(act_data) > 5 else None
-                g.rl_hijack      = bool(act_data[6]) if len(act_data) > 6 else False
+                g.current_rl_dir = None
+                g.rl_hijack      = False
                 g.rl_mode = True
                 #the [0,1] throttle is a fraction of the ghost speed cap, never a free-fall to zero
                 g.current_speed_mult = speed_to_mult(speed)
@@ -253,45 +252,37 @@ class Env:
                 for r, c in marks:
                     if 0 <= r < R and 0 <= c < C:
                         self.recent_nom[gid][r, c] = 1.0
+        self._last_exec_cand = {}
+        self._last_used_pick = {}
         if self.frame % DECISION_INTERVAL == 0:
             from cbba import _task_key
-            pooled_tasks = {}
             for gid in alive:
                 if gid not in action_dict:
                     continue
                 g = self.ghosts[gid]
                 act_data = action_dict[gid]
                 speed = speed_to_mult(act_data[4])
-                tasks = actions_to_tasks(g, act_data[1], act_data[0], self.frame, self.obs_resolution,
-                                         target_speed=speed, novel_scores=act_data[3], novel_indices=act_data[2])
-                cand_tasks = tasks
-                cur_active = g.cbba_agent.get_active_task()
-                if cur_active is not None and (self.frame - cur_active.created_frame < 24):
-                    d_cur = math.hypot(cur_active.target_pos[0] - g.y, cur_active.target_pos[1] - g.x)
-                    if d_cur > 0.6 and cur_active not in cand_tasks:
-                        cand_tasks.append(cur_active)
-                for t in cand_tasks:
-                    k = _task_key(t)
-                    if k in pooled_tasks and pooled_tasks[k].owner != t.owner:
-                        #nominated by more than one ghost: nobody gets the own-waypoint bid edge, distance decides
-                        t.assigned_to = -1
-                        pooled_tasks[k].assigned_to = -1
-                    if k not in pooled_tasks or t.score > pooled_tasks[k].score:
-                        pooled_tasks[k] = t
-            all_pooled_tasks = list(pooled_tasks.values())
-            all_targets = [t.target_pos for t in all_pooled_tasks]
-            for gid in alive:
-                if gid not in action_dict:
-                    continue
-                g = self.ghosts[gid]
+                use_pick = bool(act_data[7]) if len(act_data) > 7 else False
                 own_h = list(self._cached_htasks.get(gid, []))
-                if not all_pooled_tasks and not own_h:
+                auth = None
+                if use_pick and act_data[0] is not None and len(act_data[0]) > 0:
+                    auth = authoritative_task(g, int(act_data[0][0]), self.frame, target_speed=speed)
+                if auth is None and not own_h:
                     continue
                 g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
                 h_dists = dict(self._cached_hdists.get(gid, {}))
-                if all_targets:
-                    h_dists.update(g.plan_dists(all_targets))
-                g.cbba_agent._phase1(g, all_pooled_tasks + own_h, h_dists)
+                g.cbba_agent._phase1(g, ([auth] if auth is not None else []) + own_h, h_dists)
+                self._last_used_pick[gid] = auth is not None
+                active = g.cbba_agent.get_active_task()
+                slot = -1
+                if active is not None:
+                    ak = _task_key(active)
+                    cands = (getattr(g, '_rl_candidates', None) or [])[:MAX_CANDIDATES]
+                    for ci, t in enumerate(cands):
+                        if _task_key(t) == ak:
+                            slot = ci
+                            break
+                self._last_exec_cand[gid] = slot
         rewards = {gid: 0.0 for gid in alive}
         done = False
         pred_samples = []
@@ -464,4 +455,5 @@ class Env:
             obs = self.observe()
         pacman_caught = bool(getattr(self.player, "dead", False))
         return obs, rewards, done, {"pacman_score": getattr(self.player, "score", 0), "pacman_caught": pacman_caught, "frames": self.frame, 
-                                    "ghosts_dead": sum(1 for g in self.ghosts.values() if g.dead), "pred_samples": pred_samples}
+                                    "ghosts_dead": sum(1 for g in self.ghosts.values() if g.dead), "pred_samples": pred_samples,
+                                    "exec_cand": dict(getattr(self, '_last_exec_cand', {})), "used_pick": dict(getattr(self, '_last_used_pick', {}))}

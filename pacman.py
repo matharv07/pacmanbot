@@ -97,11 +97,12 @@ TOGGLE_WIDTH, TOGGLE_HEIGHT = 160, 32
 TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH * 2 - 20, ROWS * CELL + 8, TOGGLE_WIDTH, TOGGLE_HEIGHT)
 RL_TOGGLE_RECT = pygame.Rect(WIDTH - TOGGLE_WIDTH - 10, ROWS * CELL + 8, TOGGLE_WIDTH, TOGGLE_HEIGHT)
 RL_ACTOR = None
+RL_CRITIC = None
 RL_PREDICTOR_WEIGHTS = None
 RL_DEVICE = None
 
 def load_rl_model():
-    global RL_ACTOR, RL_PREDICTOR_WEIGHTS, RL_DEVICE, RL_MODE
+    global RL_ACTOR, RL_CRITIC, RL_PREDICTOR_WEIGHTS, RL_DEVICE, RL_MODE
     if RL_ACTOR is not None:
         return True
     print("Loading RL Model...")
@@ -139,6 +140,14 @@ def load_rl_model():
                         new_actor_sd[k][:min_out, :min_in] = v[:min_out, :min_in]
             RL_ACTOR.load_state_dict(new_actor_sd)
         RL_ACTOR.eval()
+        RL_CRITIC = None
+        if "critic" in checkpoint:
+            try:
+                from net import GhostCritic
+                RL_CRITIC = GhostCritic().to(RL_DEVICE); RL_CRITIC.load_state_dict(checkpoint["critic"]); RL_CRITIC.eval()
+            except Exception as e:
+                print(f"Critic not loaded ({e}); RL picks will defer to the heuristic.")
+                RL_CRITIC = None
         RL_PREDICTOR_WEIGHTS = checkpoint.get("predictor", None)
         try:
             from obs import SPATIAL_CH, VEC_DIM, MAX_CANDIDATES, CAND_FEAT_DIM
@@ -837,7 +846,8 @@ class Game:
                 load_rl_model()
             if RL_ACTOR is not None:
                 from obs import (build_spatial, build_vector, build_valid_mask, build_candidates, select_candidates,
-                                 flatten_cand_cells, actions_to_tasks, MAX_H, MAX_W)
+                                 flatten_cand_cells, authoritative_task, build_cve, build_global_spatial, MAX_H, MAX_W)
+                from net import gate_for_eval
                 alive = [gid for gid, g in self.ghosts.items() if not g.dead]
                 R = min(MAX_H, len(self.grid))
                 C = min(MAX_W, len(self.grid[0]))
@@ -874,7 +884,14 @@ class Game:
                     t_cm = torch.tensor(np.stack(cm), device=RL_DEVICE, dtype=torch.bool)
                     with torch.inference_mode():
                         (idx, _, scores, nidx, _, nsc, _, _,
-                         speed, _, direction, _, gate, _) = RL_ACTOR(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm)
+                         speed, _, direction, _, gate, _, c_clog) = RL_ACTOR(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm)
+                    use_np = np.zeros(len(alive), dtype=bool)
+                    if RL_CRITIC is not None:
+                        try:
+                            gsp = build_global_spatial(self, R, C, 1.0)
+                            use_np, _adv = gate_for_eval(RL_CRITIC, gsp, build_cve(alive, np.stack(ve)), t_cf, t_cm, c_clog, idx[:, 0])
+                        except Exception as e:
+                            print(f"gate failed ({e}); deferring to heuristic this decision")
                     idx_np = idx.cpu().numpy()
                     sc_np  = scores.cpu().numpy()
                     nidx_np = nidx.cpu().numpy()
@@ -882,56 +899,32 @@ class Game:
                     spd_np = speed.cpu().numpy()
                     dir_np = direction.cpu().numpy()
                     gate_np = gate.cpu().numpy()
-                    from cbba import _task_key
-                    pooled_tasks = {}
+                    from net import speed_to_mult
                     for i, gid in enumerate(alive):
                         g = self.ghosts[gid]
-                        novel_pairs = [(int(x // C), int(x % C)) for x in nidx_np[i]]
-                        from net import speed_to_mult
                         g.current_speed_mult = speed_to_mult(float(spd_np[i][0]))
-                        g.current_rl_dir = float(dir_np[i][0])
-                        g.rl_hijack = bool(gate_np[i][0])
+                        g.current_rl_dir = None      #micro-steering hijack retired
+                        g.rl_hijack = False
                         g.rl_mode = True
                         self.recent_nom[gid] *= 0.8
-                        marks = list(novel_pairs)
-                        for slot in idx_np[i]:
+                        for slot in idx_np[i][:1]:
                             if 0 <= int(slot) < len(h_cands[gid]):
                                 t_s = h_cands[gid][int(slot)]
-                                marks.append((int(t_s.target_pos[0]), int(t_s.target_pos[1])))
-                        for r, c in marks:
-                            if 0 <= r < R and 0 <= c < C:
-                                self.recent_nom[gid][r, c] = 1.0
-                        tasks = actions_to_tasks(g, sc_np[i], [int(x) for x in idx_np[i]], self.frame_counter,
-                                                 obs_resolution=1.0, target_speed=g.current_speed_mult,
-                                                 novel_scores=nsc_np[i], novel_indices=novel_pairs)
-                        cand_tasks = list(tasks)
-                        cur_active = g.cbba_agent.get_active_task()
-                        if cur_active is not None and (self.frame_counter - cur_active.created_frame < 24):
-                            d_cur = math.hypot(cur_active.target_pos[0] - g.y, cur_active.target_pos[1] - g.x)
-                            if d_cur > 0.6 and cur_active not in cand_tasks:
-                                cand_tasks.append(cur_active)
-                        for t in cand_tasks:
-                            k = _task_key(t)
-                            if k in pooled_tasks and pooled_tasks[k].owner != t.owner:
-                                #nominated by more than one ghost: nobody gets the own-waypoint bid edge, distance decides
-                                t.assigned_to = -1
-                                pooled_tasks[k].assigned_to = -1
-                            if k not in pooled_tasks or t.score > pooled_tasks[k].score:
-                                pooled_tasks[k] = t
-                    all_pooled_tasks = list(pooled_tasks.values())
-                    all_targets = [t.target_pos for t in all_pooled_tasks]
+                                r_m, c_m = int(t_s.target_pos[0]), int(t_s.target_pos[1])
+                                if 0 <= r_m < R and 0 <= c_m < C:
+                                    self.recent_nom[gid][r_m, c_m] = 1.0
 
-                    def _run_phase1(gid):
+                    def _run_phase1(i_gid):
+                        i, gid = i_gid
                         g = self.ghosts[gid]
                         own_h = list(h_cands.get(gid, []))
-                        if not all_pooled_tasks and not own_h:
+                        auth = authoritative_task(g, int(idx_np[i][0]), self.frame_counter, target_speed=g.current_speed_mult) if use_np[i] else None
+                        if auth is None and not own_h:
                             return
                         g.cbba_agent._last_auction = self.frame_counter + 6
                         dists = dict(h_dists_all.get(gid, {}))
-                        if all_targets:
-                            dists.update(g.plan_dists(all_targets))
-                        g.cbba_agent._phase1(g, all_pooled_tasks + own_h, dists)
-                    list(self.executor.map(_run_phase1, alive))
+                        g.cbba_agent._phase1(g, ([auth] if auth is not None else []) + own_h, dists)
+                    list(self.executor.map(_run_phase1, list(enumerate(alive))))
         self.player.update(self.ghosts)
         powered = self.player.powered
         for ghost in self.ghosts.values():

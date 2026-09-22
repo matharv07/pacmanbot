@@ -22,7 +22,8 @@ K_CAND             = 3
 K_NOVEL            = 1
 MAX_EPISODE_FRAMES = 3000
 
-from obs import flatten_cand_cells
+from obs import flatten_cand_cells, build_cve
+from net import GhostCritic, gate_for_eval
 
 def _pad_spatial(arr, target_h, target_w):
     h, w = arr.shape[-2], arr.shape[-1]
@@ -38,7 +39,7 @@ def _pad_spatial(arr, target_h, target_w):
         out[0, :, w:] = 1.0
     return out
 
-def _run_episode(actor, env, stage):
+def _run_episode(actor, env, stage, critic=None):
     obs = env.reset()
     while True:
         if obs is None:
@@ -56,7 +57,11 @@ def _run_episode(actor, env, stage):
         t_cm = torch.from_numpy(cm.astype(bool))
         with torch.inference_mode():
             (idx, lp, scores, nidx, _nlp, nsc, _pool, _vec,
-             speed, _speed_lp, direction, _dir_lp, gate, _gate_lp) = actor(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm, K_cand=K_CAND, K_novel=K_NOVEL)
+             speed, _speed_lp, direction, _dir_lp, gate, _gate_lp, c_clog) = actor(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm, K_cand=K_CAND, K_novel=K_NOVEL)
+        use_np = np.zeros(len(gids), dtype=bool)
+        if critic is not None:
+            gsp_p = _pad_spatial(global_sp.astype(np.float32), stage.rows, stage.cols)
+            use_np, _adv = gate_for_eval(critic, gsp_p, build_cve(gids, ve), t_cf, t_cm, c_clog, idx[:, 0])
         idx_np    = idx.cpu().numpy()
         nidx_np   = nidx.cpu().numpy()
         nsc_np    = nsc.float().cpu().numpy()
@@ -68,7 +73,7 @@ def _run_episode(actor, env, stage):
         for i, gid in enumerate(gids):
             novel_pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in nidx_np[i]]
             action_dict[gid] = ([int(x) for x in idx_np[i]], scores_np[i], novel_pairs, nsc_np[i],
-                                float(speed_np[i].item()), float(dir_np[i].item()), float(gate_np[i].item()))
+                                float(speed_np[i].item()), float(dir_np[i].item()), float(gate_np[i].item()), bool(use_np[i]))
         obs, _rewards, done, info = env.step(action_dict, want_bc=False)
         if done:
             surviving = sum(1 for g in env.ghosts.values() if not g.dead)
@@ -116,11 +121,17 @@ def _worker_chunk(ckpt_path: str, n_games: int, stage_override=None, seed_offset
                     new_actor_sd[k][:min_out, :min_in] = v[:min_out, :min_in]
         actor.load_state_dict(new_actor_sd)
     actor.eval()
+    critic = None
+    if 'critic' in ckpt:
+        try:
+            critic = GhostCritic().cpu(); critic.load_state_dict(ckpt['critic']); critic.eval()
+        except Exception as e:
+            print(f"  (critic not loaded, RL picks disabled: {e})"); critic = None
     env = Env(env_id=seed_offset, num_ghosts=stage.n_ghosts, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     results = []
     for i in range(n_games):
         np.random.seed(seed_offset * 1000 + i)
-        r = _run_episode(actor, env, stage)
+        r = _run_episode(actor, env, stage, critic)
         results.append(r)
     return ckpt_path, eff_stage_idx, stage, results
 
