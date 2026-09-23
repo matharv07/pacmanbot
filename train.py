@@ -1355,6 +1355,9 @@ def train():
             vec_env.sync_predictor(predictor.state_dict())
             torch.cuda.empty_cache()
             current_returns = [0.0] * NUM_ENVS
+            roll_ttk.clear()
+            roll_loss.clear()
+            roll_pac.clear()
             bc_decay_step = 0
             kl_ema = None
             kl_lr_scale = 1.0   #run 13 carried the 0.2 floor from stage 3 into stage 4 for the rest of the run
