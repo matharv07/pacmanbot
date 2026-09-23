@@ -27,6 +27,7 @@ os.environ['SDL_VIDEODRIVER'] = "dummy"
 _pac.AUTO_MODE = True
 
 DECISION_INTERVAL = 6      #frames between RL decisions (= CBBA AUCTION_EVERY)
+STAGGER_AUCTION = int(os.environ.get("STAGGER_AUCTION", "1"))   #1: run each ghost's auction at (frame+gid)%6 like heuristic mode
 NOM_DECAY = 0.8            #exponential decay on recent-nomination map
 
 _DEFAULT_ROWS = 33
@@ -60,6 +61,7 @@ class Env:
         self._cached_ht: dict[int, np.ndarray] = {}   #heuristic BC targets for the CURRENT observation
         self._cached_hspeed: dict[int, float] = {}
         self._cached_htasks: dict[int, list] = {}     #heuristic candidate tasks for the CURRENT observation
+        self._cached_full_htasks: dict[int, list] = {}#full heuristic tasks for CBBA auction
         self._cached_hdists: dict[int, dict] = {}     #and the belief-space distances computed for them
         self.max_frames = int(world_height * world_width * 2) + 1000
         self._pending_pred = None
@@ -193,16 +195,18 @@ class Env:
         self._cached_ht = {}
         self._cached_hspeed = {}
         self._cached_htasks = {}
+        self._cached_full_htasks = {}
         self._cached_hdists = {}
         for gid, g in self.ghosts.items():
             if g.dead:
                 continue
             h_tasks, _h_dists = heuristic_generate_tasks(g, self.frame)
+            self._cached_full_htasks[gid] = list(h_tasks)
             #frozen here and read unchanged by observe() and step(): this ordering IS the action space
-            h_tasks = select_candidates(h_tasks, seed=self.frame * MAX_GHOSTS + gid)
-            self._cached_htasks[gid] = h_tasks
+            h_cands = select_candidates(h_tasks, seed=self.frame * MAX_GHOSTS + gid)
+            self._cached_htasks[gid] = h_cands
             self._cached_hdists[gid] = _h_dists
-            g._rl_candidates = h_tasks
+            g._rl_candidates = h_cands
             target = np.zeros((R, C), dtype=np.float32)
             if h_tasks:
                 #_rl_candidates is shuffled, so the BC targets have to re-sort by score to find the best
@@ -224,6 +228,24 @@ class Env:
             else:
                 self._cached_hspeed[gid] = mult_to_throttle(1.0)
             self._cached_ht[gid] = target
+
+    def _run_auction_for(self, gid, tasks, h_dists):
+        """Run this ghost's CBBA bundle build on `tasks` and record which candidate slot it is now executing
+        (-1 = none / off-menu). The executed slot is the critic's Q-target action."""
+        from cbba import _task_key
+        g = self.ghosts[gid]
+        g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
+        g.cbba_agent._phase1(g, tasks, h_dists)
+        active = g.cbba_agent.get_active_task()
+        slot = -1
+        if active is not None:
+            ak = _task_key(active)
+            cands = (getattr(g, '_rl_candidates', None) or [])[:MAX_CANDIDATES]
+            for ci, t in enumerate(cands):
+                if _task_key(t) == ak:
+                    slot = ci
+                    break
+        self._last_exec_cand[gid] = slot
 
     def step(self, action_dict: dict, want_bc: bool = False):
         """The heuristic candidate set is rebuilt for every returned observation regardless of want_bc: it is
@@ -254,8 +276,8 @@ class Env:
                         self.recent_nom[gid][r, c] = 1.0
         self._last_exec_cand = {}
         self._last_used_pick = {}
+        self._pending_auction = {}
         if self.frame % DECISION_INTERVAL == 0:
-            from cbba import _task_key
             for gid in alive:
                 if gid not in action_dict:
                     continue
@@ -263,31 +285,30 @@ class Env:
                 act_data = action_dict[gid]
                 speed = speed_to_mult(act_data[4])
                 use_pick = bool(act_data[7]) if len(act_data) > 7 else False
-                own_h = list(self._cached_htasks.get(gid, []))
+                own_h = list(self._cached_full_htasks.get(gid, self._cached_htasks.get(gid, [])))
                 auth = None
                 if use_pick and act_data[0] is not None and len(act_data[0]) > 0:
                     auth = authoritative_task(g, int(act_data[0][0]), self.frame, target_speed=speed)
                 if auth is None and not own_h:
                     continue
-                g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
-                h_dists = dict(self._cached_hdists.get(gid, {}))
-                g.cbba_agent._phase1(g, ([auth] if auth is not None else []) + own_h, h_dists)
                 self._last_used_pick[gid] = auth is not None
-                active = g.cbba_agent.get_active_task()
-                slot = -1
-                if active is not None:
-                    ak = _task_key(active)
-                    cands = (getattr(g, '_rl_candidates', None) or [])[:MAX_CANDIDATES]
-                    for ci, t in enumerate(cands):
-                        if _task_key(t) == ak:
-                            slot = ci
-                            break
-                self._last_exec_cand[gid] = slot
+                tasks = ([auth] if auth is not None else []) + own_h
+                h_dists = dict(self._cached_hdists.get(gid, {}))
+                if STAGGER_AUCTION:
+                    self._pending_auction[gid] = (tasks, h_dists)
+                else:
+                    self._run_auction_for(gid, tasks, h_dists)
         rewards = {gid: 0.0 for gid in alive}
         done = False
         pred_samples = []
         for _ in range(DECISION_INTERVAL):
             self.frame += 1
+            if self._pending_auction:
+                for gid in list(self._pending_auction.keys()):
+                    if (self.frame + gid) % DECISION_INTERVAL == 0:
+                        tasks, h_dists = self._pending_auction.pop(gid)
+                        if not self.ghosts[gid].dead:
+                            self._run_auction_for(gid, tasks, h_dists)
             score_before = getattr(self.player, 'score', 0)
             powered_before = getattr(self.player, 'powered', False)
             self.player.update(self.ghosts)

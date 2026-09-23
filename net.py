@@ -355,7 +355,7 @@ class GhostCritic(nn.Module):
         pool = self.encode_spatial(spatial)
         return self.forward_from_pool(pool, vector, cand_feat)
 
-def gate_for_eval(critic, gsp_padded, cve, t_cf, t_cm, c_logits, pick0, margin: float = float(__import__("os").environ.get("GATE_MARGIN", "0.05"))):
+def gate_for_eval(critic, gsp_padded, cve, t_cf, t_cm, c_logits, pick0, margin: float = float(__import__("os").environ.get("GATE_MARGIN", "0.02")), cbc=None):
     """Execute-gate for the evaluation paths (probe, test.py, live game), sharing the trainer's rule.
 
     gsp_padded : (GLOBAL_SPATIAL_CH, H, W) numpy   the omniscient map for this env-step
@@ -363,7 +363,8 @@ def gate_for_eval(critic, gsp_padded, cve, t_cf, t_cm, c_logits, pick0, margin: 
     t_cf, t_cm : (N, M, F) / (N, M) tensors        candidate features and live-mask
     c_logits   : (N, M) tensor                     the actor's masked candidate logits (15th output)
     pick0      : (N,) long tensor                  the actor's first pick
-    Returns (use_pick bool numpy (N,), counterfactual advantage numpy (N,)).
+    cbc        : (N, M) numpy, optional          the heuristic's own candidate scores; enables the vs-heuristic gate
+    Returns (use_pick bool numpy (N,), edge numpy (N,)) where edge = Q(pick) - Q(heuristic's choice) when cbc is given.
     """
     dev = next(critic.parameters()).device
     with torch.inference_mode():
@@ -371,23 +372,36 @@ def gate_for_eval(critic, gsp_padded, cve, t_cf, t_cm, c_logits, pick0, margin: 
         pool = critic.encode_spatial(g).expand(t_cf.shape[0], -1)
         q_all = critic.q_all(pool, torch.as_tensor(cve, dtype=torch.float32, device=dev),
                              t_cf.to(dev), t_cm.to(dev))
-        _b, adv, gate = counterfactual_gate(q_all, c_logits.to(dev), t_cm.to(dev), pick0.to(dev), margin)
-    return gate.cpu().numpy(), adv.float().cpu().numpy()
+        cm_d = t_cm.to(dev); p0 = pick0.to(dev)
+        ref = heuristic_ref_idx(cbc, cm_d, p0) if cbc is not None else None
+        _b, adv, gate = counterfactual_gate(q_all, c_logits.to(dev), cm_d, p0, margin, ref)
+        if ref is not None:
+            M = q_all.shape[1]
+            edge = q_all.gather(1, p0.clamp(0, M - 1).unsqueeze(1)).squeeze(1) - q_all.gather(1, ref.clamp(0, M - 1).unsqueeze(1)).squeeze(1)
+        else:
+            edge = adv
+    return gate.cpu().numpy(), edge.float().cpu().numpy()
 
-def counterfactual_gate(q_all, cand_logits, cand_mask, pick_idx, margin: float = 0.0):
-    """COMA quantities for a batch of ghosts.
+def heuristic_ref_idx(cbc, cand_mask, fallback_idx):
+    """Index of the candidate the HEURISTIC would execute: the argmax of its own scores (the BC target)
+    over live slots. Rows with no positive heuristic score fall back to `fallback_idx` (edge becomes 0)."""
+    c = torch.as_tensor(cbc, dtype=torch.float32, device=cand_mask.device)
+    masked = torch.where(cand_mask, c, torch.full_like(c, float('-inf')))
+    ref = masked.argmax(dim=1)
+    has = torch.isfinite(masked.max(dim=1).values) & (masked.max(dim=1).values > 0)
+    return torch.where(has, ref, fallback_idx.to(ref.dtype))
 
-    q_all (B,M) critic values per candidate, cand_logits (B,M) actor logits (-inf on padding),
-    cand_mask (B,M) live slots, pick_idx (B,) the actor's first pick.
-    Returns baseline b (B,), counterfactual advantage of the pick (B,), and the execute-gate (B,) bool:
-    the pick is executed only when the critic says it beats the policy's own average over the menu.
-    """
+def counterfactual_gate(q_all, cand_logits, cand_mask, pick_idx, margin: float = 0.0, ref_idx=None):
     probs = torch.softmax(torch.nan_to_num(cand_logits, nan=float('-inf')), dim=1) * cand_mask.to(q_all.dtype)
     probs = probs / probs.sum(dim=1, keepdim=True).clamp(min=1e-8)
     b = (probs * q_all).sum(dim=1)
-    q_pick = q_all.gather(1, pick_idx.clamp(0, q_all.shape[1] - 1).unsqueeze(1)).squeeze(1)
+    M = q_all.shape[1]
+    q_pick = q_all.gather(1, pick_idx.clamp(0, M - 1).unsqueeze(1)).squeeze(1)
     adv = q_pick - b
-    return b, adv, adv > margin
+    if ref_idx is None:
+        return b, adv, adv > margin
+    q_ref = q_all.gather(1, ref_idx.clamp(0, M - 1).unsqueeze(1)).squeeze(1)
+    return b, adv, (q_pick - q_ref) > margin
 
 PREDICTOR_IN_DIM = 19
 PREDICTOR_HIDDEN_DIM = 32

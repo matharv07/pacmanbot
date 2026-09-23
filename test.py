@@ -61,7 +61,7 @@ def _run_episode(actor, env, stage, critic=None):
         use_np = np.zeros(len(gids), dtype=bool)
         if critic is not None:
             gsp_p = _pad_spatial(global_sp.astype(np.float32), stage.rows, stage.cols)
-            use_np, _adv = gate_for_eval(critic, gsp_p, build_cve(gids, ve), t_cf, t_cm, c_clog, idx[:, 0])
+            use_np, _adv = gate_for_eval(critic, gsp_p, build_cve(gids, ve), t_cf, t_cm, c_clog, idx[:, 0], cbc=cbc)
         idx_np    = idx.cpu().numpy()
         nidx_np   = nidx.cpu().numpy()
         nsc_np    = nsc.float().cpu().numpy()

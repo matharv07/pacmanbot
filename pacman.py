@@ -761,6 +761,7 @@ class Game:
         self.message_timer = 0
         self.debug_ghost_id = 0
         self.frame_counter = 0
+        self._pending_auction = {}
         from obs import MAX_H, MAX_W
         self.recent_nom = { i: np.zeros((MAX_H, MAX_W), dtype=np.float32) for i in range(len(self.ghosts)) }
         self._bg_surface = None
@@ -852,29 +853,30 @@ class Game:
                 R = min(MAX_H, len(self.grid))
                 C = min(MAX_W, len(self.grid[0]))
                 from allocator import generate_tasks as _heuristic_tasks
-                sp, ve, vm, cf, cc, cm = [], [], [], [], [], []
-                h_cands, h_dists_all = {}, {}
+                sp, ve, vm, cf, cc, cm, cbcs = [], [], [], [], [], [], []
+                h_cands, h_all_cands, h_dists_all = {}, {}, {}
 
                 def _build_obs_task(gid):
                     g = self.ghosts[gid]
-                    cands, dists = _heuristic_tasks(g, self.frame_counter)
+                    all_tasks, dists = _heuristic_tasks(g, self.frame_counter)
                     #frozen ordering: the actor addresses these by index
-                    cands = select_candidates(cands, seed=self.frame_counter * 7 + gid)
+                    cands = select_candidates(all_tasks, seed=self.frame_counter * 7 + gid)
                     g._rl_candidates = cands
                     s = build_spatial(g, self.recent_nom[gid], R, C, obs_resolution=1.0)
                     v = build_vector(g)
                     m = build_valid_mask(g, R, C, obs_resolution=1.0, spatial_walls=s[0])
-                    f_c, c_c, m_c, _ = build_candidates(g, R, C, 1.0, dists)
-                    return gid, cands, dists, s, v, m, f_c, c_c, m_c
+                    f_c, c_c, m_c, b_c = build_candidates(g, R, C, 1.0, dists)
+                    return gid, cands, all_tasks, dists, s, v, m, f_c, c_c, m_c, b_c
 
                 results = list(self.executor.map(_build_obs_task, alive))
-                for gid, cands, dists, s, v, m, f_c, c_c, m_c in results:
+                for gid, cands, all_tasks, dists, s, v, m, f_c, c_c, m_c, b_c in results:
                     h_cands[gid] = cands
+                    h_all_cands[gid] = all_tasks
                     h_dists_all[gid] = dists
                     sp.append(s)
                     ve.append(v)
                     vm.append(m)
-                    cf.append(f_c); cc.append(flatten_cand_cells(c_c, C)); cm.append(m_c)
+                    cf.append(f_c); cc.append(flatten_cand_cells(c_c, C)); cm.append(m_c); cbcs.append(b_c)
                 if alive:
                     t_sp = torch.tensor(np.stack(sp), device=RL_DEVICE, dtype=torch.float32)
                     t_ve = torch.tensor(np.stack(ve), device=RL_DEVICE, dtype=torch.float32)
@@ -889,7 +891,7 @@ class Game:
                     if RL_CRITIC is not None:
                         try:
                             gsp = build_global_spatial(self, R, C, 1.0)
-                            use_np, _adv = gate_for_eval(RL_CRITIC, gsp, build_cve(alive, np.stack(ve)), t_cf, t_cm, c_clog, idx[:, 0])
+                            use_np, _adv = gate_for_eval(RL_CRITIC, gsp, build_cve(alive, np.stack(ve)), t_cf, t_cm, c_clog, idx[:, 0], cbc=np.stack(cbcs))
                         except Exception as e:
                             print(f"gate failed ({e}); deferring to heuristic this decision")
                     idx_np = idx.cpu().numpy()
@@ -914,17 +916,24 @@ class Game:
                                 if 0 <= r_m < R and 0 <= c_m < C:
                                     self.recent_nom[gid][r_m, c_m] = 1.0
 
-                    def _run_phase1(i_gid):
-                        i, gid = i_gid
+                    self._pending_auction = {}
+                    for i, gid in enumerate(alive):
                         g = self.ghosts[gid]
-                        own_h = list(h_cands.get(gid, []))
+                        own_h = list(h_all_cands.get(gid, h_cands.get(gid, [])))
                         auth = authoritative_task(g, int(idx_np[i][0]), self.frame_counter, target_speed=g.current_speed_mult) if use_np[i] else None
                         if auth is None and not own_h:
-                            return
-                        g.cbba_agent._last_auction = self.frame_counter + 6
+                            continue
+                        tasks = ([auth] if auth is not None else []) + own_h
                         dists = dict(h_dists_all.get(gid, {}))
-                        g.cbba_agent._phase1(g, ([auth] if auth is not None else []) + own_h, dists)
-                    list(self.executor.map(_run_phase1, list(enumerate(alive))))
+                        self._pending_auction[gid] = (tasks, dists)
+        if getattr(self, '_pending_auction', None):
+            for gid in list(self._pending_auction.keys()):
+                if (self.frame_counter + gid) % 6 == 0:
+                    tasks, dists = self._pending_auction.pop(gid)
+                    if not self.ghosts[gid].dead:
+                        g = self.ghosts[gid]
+                        g.cbba_agent._last_auction = self.frame_counter + 6
+                        g.cbba_agent._phase1(g, tasks, dists)
         self.player.update(self.ghosts)
         powered = self.player.powered
         for ghost in self.ghosts.values():

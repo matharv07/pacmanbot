@@ -6,4 +6,3 @@ discord_webhook.txt
 *.pyc
 profile.txt
 .pytest_cache/logs/
-.claude/

@@ -115,7 +115,7 @@ def _run_game(mode, actor, env, stage, seed, log, critic=None):
                 from net import gate_for_eval
                 from obs import build_cve
                 gsp_p = _pad(gsp.astype(np.float32), H, W)
-                use_np, adv_np = gate_for_eval(critic, gsp_p, build_cve(gids, ve), t_cf, t_cm, c_clog, idx[:, 0])
+                use_np, adv_np = gate_for_eval(critic, gsp_p, build_cve(gids, ve), t_cf, t_cm, c_clog, idx[:, 0], cbc=cbc)
             for _u, _a in zip(use_np, adv_np):
                 log['pick_used'].append(float(_u)); log['pick_adv'].append(float(_a))
             idx_np = idx.numpy(); sc = scores.float().numpy(); spd = speed.float().numpy(); dr = direction.float().numpy(); gt = gate.float().numpy()
@@ -393,7 +393,7 @@ def report(mode, games, log):
     o_tot = sum(log['origin'].values()) or 1
     if log['pick_used']:
         pa = np.array(log['pick_adv']); pu = np.array(log['pick_used'])
-        print(f"EXECUTE GATE  pick executed on {pu.mean():.0%} of decisions | counterfactual adv of the pick: mean {pa.mean():+.3f}, "
+        print(f"EXECUTE GATE  pick executed on {pu.mean():.0%} of decisions | edge vs heuristic choice Q(pick)-Q(heur): mean {pa.mean():+.3f}, "
               f"when executed {pa[pu > 0.5].mean() if (pu > 0.5).any() else float('nan'):+.3f}, when deferred {pa[pu < 0.5].mean() if (pu < 0.5).any() else float('nan'):+.3f} (normalised-return units)")
     print("--- RL attribution (who won the executed task) ---")
     for k in sorted(log['origin']):
