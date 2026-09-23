@@ -140,25 +140,14 @@ def load_rl_model():
                         new_actor_sd[k][:min_out, :min_in] = v[:min_out, :min_in]
             RL_ACTOR.load_state_dict(new_actor_sd)
         RL_ACTOR.eval()
-        RL_CRITIC = None
-        if "critic" in checkpoint:
-            try:
-                from net import GhostCritic
-                RL_CRITIC = GhostCritic().to(RL_DEVICE); RL_CRITIC.load_state_dict(checkpoint["critic"]); RL_CRITIC.eval()
-            except Exception as e:
-                print(f"Critic not loaded ({e}); RL picks will defer to the heuristic.")
-                RL_CRITIC = None
         RL_PREDICTOR_WEIGHTS = checkpoint.get("predictor", None)
         try:
-            from obs import SPATIAL_CH, VEC_DIM, MAX_CANDIDATES, CAND_FEAT_DIM
+            from obs import SPATIAL_CH, VEC_DIM
             dummy_sp = torch.zeros((1, SPATIAL_CH, ROWS, COLS), device=RL_DEVICE, dtype=torch.float32)
             dummy_ve = torch.zeros((1, VEC_DIM), device=RL_DEVICE, dtype=torch.float32)
             dummy_vm = torch.ones((1, ROWS, COLS), device=RL_DEVICE, dtype=torch.bool)
-            dummy_cf = torch.zeros((1, MAX_CANDIDATES, CAND_FEAT_DIM), device=RL_DEVICE, dtype=torch.float32)
-            dummy_cc = torch.zeros((1, MAX_CANDIDATES), device=RL_DEVICE, dtype=torch.long)
-            dummy_cm = torch.ones((1, MAX_CANDIDATES), device=RL_DEVICE, dtype=torch.bool)
             with torch.inference_mode():
-                RL_ACTOR(dummy_sp, dummy_ve, dummy_vm, dummy_cf, dummy_cc, dummy_cm)
+                RL_ACTOR(dummy_sp, dummy_ve, dummy_vm, K=3)
             if torch.cuda.is_available() and RL_DEVICE.type == 'cuda':
                 torch.cuda.synchronize()
         except Exception:
@@ -846,91 +835,70 @@ class Game:
             if RL_ACTOR is None:
                 load_rl_model()
             if RL_ACTOR is not None:
-                from obs import (build_spatial, build_vector, build_valid_mask, build_candidates, select_candidates,
-                                 flatten_cand_cells, authoritative_task, build_cve, build_global_spatial, MAX_H, MAX_W)
-                from net import gate_for_eval
+                from obs import (build_spatial, build_vector, build_valid_mask, actions_to_tasks, MAX_H, MAX_W)
+                from net import speed_idx_to_mult
                 alive = [gid for gid, g in self.ghosts.items() if not g.dead]
                 R = min(MAX_H, len(self.grid))
                 C = min(MAX_W, len(self.grid[0]))
                 from allocator import generate_tasks as _heuristic_tasks
-                sp, ve, vm, cf, cc, cm, cbcs = [], [], [], [], [], [], []
-                h_cands, h_all_cands, h_dists_all = {}, {}, {}
+                sp, ve, vm = [], [], []
+                h_all_cands, h_dists_all = {}, {}
 
                 def _build_obs_task(gid):
                     g = self.ghosts[gid]
                     all_tasks, dists = _heuristic_tasks(g, self.frame_counter)
-                    #frozen ordering: the actor addresses these by index
-                    cands = select_candidates(all_tasks, seed=self.frame_counter * 7 + gid)
-                    g._rl_candidates = cands
                     s = build_spatial(g, self.recent_nom[gid], R, C, obs_resolution=1.0)
                     v = build_vector(g)
                     m = build_valid_mask(g, R, C, obs_resolution=1.0, spatial_walls=s[0])
-                    f_c, c_c, m_c, b_c = build_candidates(g, R, C, 1.0, dists)
-                    return gid, cands, all_tasks, dists, s, v, m, f_c, c_c, m_c, b_c
+                    return gid, all_tasks, dists, s, v, m
 
                 results = list(self.executor.map(_build_obs_task, alive))
-                for gid, cands, all_tasks, dists, s, v, m, f_c, c_c, m_c, b_c in results:
-                    h_cands[gid] = cands
+                for gid, all_tasks, dists, s, v, m in results:
                     h_all_cands[gid] = all_tasks
                     h_dists_all[gid] = dists
                     sp.append(s)
                     ve.append(v)
                     vm.append(m)
-                    cf.append(f_c); cc.append(flatten_cand_cells(c_c, C)); cm.append(m_c); cbcs.append(b_c)
                 if alive:
                     t_sp = torch.tensor(np.stack(sp), device=RL_DEVICE, dtype=torch.float32)
                     t_ve = torch.tensor(np.stack(ve), device=RL_DEVICE, dtype=torch.float32)
                     t_vm = torch.tensor(np.stack(vm), device=RL_DEVICE, dtype=torch.bool)
-                    t_cf = torch.tensor(np.stack(cf), device=RL_DEVICE, dtype=torch.float32)
-                    t_cc = torch.tensor(np.stack(cc), device=RL_DEVICE, dtype=torch.long)
-                    t_cm = torch.tensor(np.stack(cm), device=RL_DEVICE, dtype=torch.bool)
                     with torch.inference_mode():
-                        (idx, _, scores, nidx, _, nsc, _, _,
-                         speed, _, direction, _, gate, _, c_clog) = RL_ACTOR(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm)
-                    use_np = np.zeros(len(alive), dtype=bool)
-                    if RL_CRITIC is not None:
-                        try:
-                            gsp = build_global_spatial(self, R, C, 1.0)
-                            use_np, _adv = gate_for_eval(RL_CRITIC, gsp, build_cve(alive, np.stack(ve)), t_cf, t_cm, c_clog, idx[:, 0], cbc=np.stack(cbcs))
-                        except Exception as e:
-                            print(f"gate failed ({e}); deferring to heuristic this decision")
-                    idx_np = idx.cpu().numpy()
+                        out_act = RL_ACTOR(t_sp, t_ve, t_vm, K=3)
+                        sel_idx, sel_lp, scores, pool, vec, speed_idx, speed_lp, speed_logits = out_act
+                    idx_np = sel_idx.cpu().numpy()
                     sc_np  = scores.cpu().numpy()
-                    nidx_np = nidx.cpu().numpy()
-                    nsc_np  = nsc.cpu().numpy()
-                    spd_np = speed.cpu().numpy()
-                    dir_np = direction.cpu().numpy()
-                    gate_np = gate.cpu().numpy()
-                    from net import speed_to_mult
+                    spd_np = speed_idx.cpu().numpy()
                     for i, gid in enumerate(alive):
                         g = self.ghosts[gid]
-                        g.current_speed_mult = speed_to_mult(float(spd_np[i][0]))
-                        g.current_rl_dir = None      #micro-steering hijack retired
+                        g.current_speed_mult = speed_idx_to_mult(spd_np[i])
+                        g.current_rl_dir = None
                         g.rl_hijack = False
                         g.rl_mode = True
+                        indices = [(int(x // C), int(x % C)) for x in idx_np[i]]
                         self.recent_nom[gid] *= 0.8
-                        for slot in idx_np[i][:1]:
-                            if 0 <= int(slot) < len(h_cands[gid]):
-                                t_s = h_cands[gid][int(slot)]
-                                r_m, c_m = int(t_s.target_pos[0]), int(t_s.target_pos[1])
-                                if 0 <= r_m < R and 0 <= c_m < C:
-                                    self.recent_nom[gid][r_m, c_m] = 1.0
-
+                        for r_m, c_m in indices:
+                            if 0 <= r_m < R and 0 <= c_m < C:
+                                self.recent_nom[gid][r_m, c_m] = 1.0
                     self._pending_auction = {}
                     for i, gid in enumerate(alive):
                         g = self.ghosts[gid]
-                        own_h = list(h_all_cands.get(gid, h_cands.get(gid, [])))
-                        auth = authoritative_task(g, int(idx_np[i][0]), self.frame_counter, target_speed=g.current_speed_mult) if use_np[i] else None
-                        if auth is None and not own_h:
-                            continue
-                        tasks = ([auth] if auth is not None else []) + own_h
+                        indices = [(int(x // C), int(x % C)) for x in idx_np[i]]
+                        rl_tasks = actions_to_tasks(g, sc_np[i], indices, self.frame_counter, target_speed=g.current_speed_mult)
+                        own_h = list(h_all_cands.get(gid, []))
+                        all_t = rl_tasks + own_h
                         dists = dict(h_dists_all.get(gid, {}))
-                        self._pending_auction[gid] = (tasks, dists)
+                        if rl_tasks:
+                            rl_targets = [t.target_pos for t in rl_tasks]
+                            from pathfinder import dijkstra_multi
+                            d_rl = dijkstra_multi(g.world, (g.y, g.x), rl_targets)
+                            dists.update(d_rl)
+                        self._pending_auction[gid] = (all_t, dists)
         if getattr(self, '_pending_auction', None):
             for gid in list(self._pending_auction.keys()):
                 if (self.frame_counter + gid) % 6 == 0:
                     tasks, dists = self._pending_auction.pop(gid)
-                    if not self.ghosts[gid].dead:
+                    if gid in self.ghosts and not self.ghosts[gid].dead:
                         g = self.ghosts[gid]
                         g.cbba_agent._last_auction = self.frame_counter + 6
                         g.cbba_agent._phase1(g, tasks, dists)

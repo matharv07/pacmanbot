@@ -64,10 +64,6 @@ class CurriculumScheduler:
         self._updates_in_stage += 1
 
     def should_advance(self) -> bool:
-        """Advance on kill rate alone. Return is dominated by shaping and unavoidable penalties
-        (power pellets -2 each, wipes -15, timeouts -10): run 12 held 0.667 kill for 1850 updates
-        with a 40-update mean return between -4.5 and -2.1, so the old `avg_ret >= 0` clause in
-        every gate made stage 0 unwinnable regardless of hunting skill."""
         if self.is_final:
             return False
         #strictly enforce min_updates before allowing ANY stage advancement

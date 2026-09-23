@@ -56,24 +56,15 @@ def _run_episode(actor, env, stage, critic=None):
         t_cc = torch.from_numpy(flatten_cand_cells(cc, stage.cols).astype(np.int64))
         t_cm = torch.from_numpy(cm.astype(bool))
         with torch.inference_mode():
-            (idx, lp, scores, nidx, _nlp, nsc, _pool, _vec,
-             speed, _speed_lp, direction, _dir_lp, gate, _gate_lp, c_clog) = actor(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm, K_cand=K_CAND, K_novel=K_NOVEL)
-        use_np = np.zeros(len(gids), dtype=bool)
-        if critic is not None:
-            gsp_p = _pad_spatial(global_sp.astype(np.float32), stage.rows, stage.cols)
-            use_np, _adv = gate_for_eval(critic, gsp_p, build_cve(gids, ve), t_cf, t_cm, c_clog, idx[:, 0], cbc=cbc)
+            out_act = actor(t_sp, t_ve, t_vm, K=K_CAND)
+            idx, lp, scores, _pool, _vec, speed_idx, speed_lp, _ = out_act
         idx_np    = idx.cpu().numpy()
-        nidx_np   = nidx.cpu().numpy()
-        nsc_np    = nsc.float().cpu().numpy()
         scores_np = scores.float().cpu().numpy()
-        speed_np  = speed.float().cpu().numpy()
-        dir_np    = direction.float().cpu().numpy()
-        gate_np   = gate.float().cpu().numpy()
+        spd_np    = speed_idx.cpu().numpy()
         action_dict = {}
         for i, gid in enumerate(gids):
-            novel_pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in nidx_np[i]]
-            action_dict[gid] = ([int(x) for x in idx_np[i]], scores_np[i], novel_pairs, nsc_np[i],
-                                float(speed_np[i].item()), float(dir_np[i].item()), float(gate_np[i].item()), bool(use_np[i]))
+            indices = [(int(x // stage.cols), int(x % stage.cols)) for x in idx_np[i]]
+            action_dict[gid] = (indices, scores_np[i], spd_np[i])
         obs, _rewards, done, info = env.step(action_dict, want_bc=False)
         if done:
             surviving = sum(1 for g in env.ghosts.values() if not g.dead)

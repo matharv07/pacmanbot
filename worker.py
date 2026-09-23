@@ -258,22 +258,35 @@ class Env:
             g = self.ghosts[gid]
             if gid in action_dict:
                 act_data = action_dict[gid]
-                cand_picks, novel_pairs, speed = act_data[0], act_data[2], act_data[4]
-                g.current_rl_dir = None
-                g.rl_hijack      = False
-                g.rl_mode = True
-                #the [0,1] throttle is a fraction of the ghost speed cap, never a free-fall to zero
-                g.current_speed_mult = speed_to_mult(speed)
-                self.recent_nom[gid] *= NOM_DECAY
-                cands = getattr(g, '_rl_candidates', None) or []
-                marks = list(novel_pairs)
-                for slot in cand_picks:
-                    if 0 <= int(slot) < len(cands):
-                        t = cands[int(slot)]
-                        marks.append((int(t.target_pos[0] * self.obs_resolution), int(t.target_pos[1] * self.obs_resolution)))
-                for r, c in marks:
-                    if 0 <= r < R and 0 <= c < C:
-                        self.recent_nom[gid][r, c] = 1.0
+                if len(act_data) >= 3 and isinstance(act_data[1], np.ndarray):
+                    indices, scores_map, speed_val = act_data[0], act_data[1], act_data[2]
+                    from net import speed_idx_to_mult
+                    g.current_speed_mult = speed_idx_to_mult(speed_val)
+                    g.rl_mode = True
+                    self.recent_nom[gid] *= NOM_DECAY
+                    for item in indices:
+                        if isinstance(item, (tuple, list)) and len(item) >= 2:
+                            r, c = int(item[0]), int(item[1])
+                        else:
+                            r, c = int(item) // C, int(item) % C
+                        if 0 <= r < R and 0 <= c < C:
+                            self.recent_nom[gid][r, c] = 1.0
+                elif len(act_data) >= 5:
+                    cand_picks, novel_pairs, speed = act_data[0], act_data[2], act_data[4]
+                    g.current_rl_dir = None
+                    g.rl_hijack      = False
+                    g.rl_mode = True
+                    g.current_speed_mult = speed_to_mult(speed)
+                    self.recent_nom[gid] *= NOM_DECAY
+                    cands = getattr(g, '_rl_candidates', None) or []
+                    marks = list(novel_pairs)
+                    for slot in cand_picks:
+                        if 0 <= int(slot) < len(cands):
+                            t = cands[int(slot)]
+                            marks.append((int(t.target_pos[0] * self.obs_resolution), int(t.target_pos[1] * self.obs_resolution)))
+                    for r, c in marks:
+                        if 0 <= r < R and 0 <= c < C:
+                            self.recent_nom[gid][r, c] = 1.0
         self._last_exec_cand = {}
         self._last_used_pick = {}
         self._pending_auction = {}
@@ -283,21 +296,42 @@ class Env:
                     continue
                 g = self.ghosts[gid]
                 act_data = action_dict[gid]
-                speed = speed_to_mult(act_data[4])
-                use_pick = bool(act_data[7]) if len(act_data) > 7 else False
-                own_h = list(self._cached_full_htasks.get(gid, self._cached_htasks.get(gid, [])))
-                auth = None
-                if use_pick and act_data[0] is not None and len(act_data[0]) > 0:
-                    auth = authoritative_task(g, int(act_data[0][0]), self.frame, target_speed=speed)
-                if auth is None and not own_h:
-                    continue
-                self._last_used_pick[gid] = auth is not None
-                tasks = ([auth] if auth is not None else []) + own_h
-                h_dists = dict(self._cached_hdists.get(gid, {}))
-                if STAGGER_AUCTION:
-                    self._pending_auction[gid] = (tasks, h_dists)
+                if len(act_data) >= 3 and isinstance(act_data[1], np.ndarray):
+                    indices, scores_map, speed_val = act_data[0], act_data[1], act_data[2]
+                    from net import speed_idx_to_mult
+                    speed = speed_idx_to_mult(speed_val)
+                    g.current_speed_mult = speed
+                    from obs import actions_to_tasks
+                    tasks = actions_to_tasks(g, scores_map, indices, self.frame, target_speed=speed)
+                    own_h = list(self._cached_full_htasks.get(gid, self._cached_htasks.get(gid, [])))
+                    all_tasks = tasks + own_h
+                    h_dists = dict(self._cached_hdists.get(gid, {}))
+                    if tasks:
+                        rl_targets = [t.target_pos for t in tasks]
+                        from pathfinder import dijkstra_multi
+                        d_rl = dijkstra_multi(g.world, (g.y, g.x), rl_targets)
+                        h_dists.update(d_rl)
+                    if STAGGER_AUCTION:
+                        self._pending_auction[gid] = (all_tasks, h_dists)
+                    else:
+                        self._run_auction_for(gid, all_tasks, h_dists)
                 else:
-                    self._run_auction_for(gid, tasks, h_dists)
+                    speed = speed_to_mult(act_data[4]) if len(act_data) > 4 else 1.0
+                    use_pick = bool(act_data[7]) if len(act_data) > 7 else False
+                    own_h = list(self._cached_full_htasks.get(gid, self._cached_htasks.get(gid, [])))
+                    auth = None
+                    if use_pick and act_data[0] is not None and len(act_data[0]) > 0:
+                        from obs import authoritative_task
+                        auth = authoritative_task(g, int(act_data[0][0]), self.frame, target_speed=speed)
+                    if auth is None and not own_h:
+                        continue
+                    self._last_used_pick[gid] = auth is not None
+                    tasks = ([auth] if auth is not None else []) + own_h
+                    h_dists = dict(self._cached_hdists.get(gid, {}))
+                    if STAGGER_AUCTION:
+                        self._pending_auction[gid] = (tasks, h_dists)
+                    else:
+                        self._run_auction_for(gid, tasks, h_dists)
         rewards = {gid: 0.0 for gid in alive}
         done = False
         pred_samples = []
@@ -307,7 +341,7 @@ class Env:
                 for gid in list(self._pending_auction.keys()):
                     if (self.frame + gid) % DECISION_INTERVAL == 0:
                         tasks, h_dists = self._pending_auction.pop(gid)
-                        if not self.ghosts[gid].dead:
+                        if gid in self.ghosts and not self.ghosts[gid].dead:
                             self._run_auction_for(gid, tasks, h_dists)
             score_before = getattr(self.player, 'score', 0)
             powered_before = getattr(self.player, 'powered', False)

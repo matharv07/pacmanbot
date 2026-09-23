@@ -10,8 +10,31 @@ LT              = 3
 LAMBDA          = 0.96   #time decay factor
 
 def _task_key(task: Task) -> tuple:
-    pos = (round(float(task.target_pos[0]), 1), round(float(task.target_pos[1]), 1))
+    pos = (int(round(float(task.target_pos[0]))), int(round(float(task.target_pos[1]))))
     return (int(task.task_type), pos)
+
+def _deduplicate_tasks(tasks: list, threshold: float = 1.8) -> list:
+    """Merge similar tasks within spatial threshold to prevent multiple ghosts crowding the same junction."""
+    if not tasks:
+        return []
+    deduped = []
+    for t in tasks:
+        merged = False
+        ty, tx = float(t.target_pos[0]), float(t.target_pos[1])
+        for existing in deduped:
+            ey, ex = float(existing.target_pos[0]), float(existing.target_pos[1])
+            dist = math.hypot(ty - ey, tx - ex)
+            if dist < threshold:
+                if float(t.score) > float(existing.score):
+                    existing.score = float(t.score)
+                    existing.target_pos = t.target_pos
+                    existing.task_type = t.task_type
+                    existing.target_speed = getattr(t, 'target_speed', existing.target_speed)
+                merged = True
+                break
+        if not merged:
+            deduped.append(t)
+    return deduped
 
 class CBBA_Agent:
     def __init__(self, gid: int, lt: int = LT, lamda: float = LAMBDA):
@@ -72,14 +95,23 @@ class CBBA_Agent:
                     changed = True
                     self._last_auction = -1  #trigger auction re-evaluation to adopt orphaned task immediately
         if getattr(ghost, 'pacman_powered', False):
-            hunt_keys = [k for k in list(self.bundle) if k[0] == TaskType.HUNT]
-            if hunt_keys:
-                for hk in hunt_keys:
-                    self.bundle.remove(hk)
-                    if hk in self.path:
-                        self.path.remove(hk)
-                    self.y[hk] = 0.0
-                    self.z[hk] = None
+            pac_pos = getattr(ghost, 'known_pacman', None) or getattr(ghost, 'last_lost_pacman', None)
+            drop_keys = []
+            for k in list(self.bundle):
+                if k[0] == TaskType.HUNT:
+                    drop_keys.append(k)
+                elif pac_pos is not None and len(k) >= 2 and isinstance(k[1], (tuple, list)):
+                    d_pac = math.hypot(float(k[1][0]) - float(pac_pos[0]), float(k[1][1]) - float(pac_pos[1]))
+                    if d_pac < 10.0:
+                        drop_keys.append(k)
+            if drop_keys:
+                for dk in drop_keys:
+                    if dk in self.bundle:
+                        self.bundle.remove(dk)
+                    if dk in self.path:
+                        self.path.remove(dk)
+                    self.y[dk] = 0.0
+                    self.z[dk] = None
                 changed = True
         if changed:
             self._cascade_release()
@@ -191,6 +223,7 @@ class CBBA_Agent:
         return changed
 
     def _phase1(self, ghost, tasks: list, dists: dict):
+        tasks = _deduplicate_tasks(tasks)
         candidate_keys = set()
         candidate_tasks = []
         for t in tasks:
@@ -213,6 +246,8 @@ class CBBA_Agent:
                     if ghost.frame - self._task_created_frame.get(k, ghost.frame) <= 60:
                         candidate_tasks.append(t)
                         candidate_keys.add(k)
+        candidate_tasks = _deduplicate_tasks(candidate_tasks, threshold=1.8)
+        candidate_keys = {_task_key(t) for t in candidate_tasks}
         self._dist_cache = {(round(float(pos[0]), 2), round(float(pos[1]), 2)): d for pos, (d, _) in dists.items()}
         missing = [t.target_pos for t in candidate_tasks if (round(float(t.target_pos[0]), 2), round(float(t.target_pos[1]), 2)) not in self._dist_cache]
         if missing:

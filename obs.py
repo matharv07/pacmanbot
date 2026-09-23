@@ -392,60 +392,65 @@ def build_cve(gids, ve, max_ghosts: int = MAX_GHOSTS, vec_dim: int = VEC_DIM):
         out[i, max_ghosts * vec_dim + gid] = 1.0
     return out
 
-def actions_to_tasks(ghost, cand_scores, cand_picks, frame: int, obs_resolution: float = 1.0,
-                     target_speed: float = 1.0, novel_scores=None, novel_indices=None) -> list:
-    """Turn the actor's decisions into CBBA nominations.
-
-    cand_picks index directly into ghost._rl_candidates, so an endorsement is exact: there is no spatial
-    pick to snap onto a candidate and therefore no near-miss that silently becomes a novel waypoint.
-    novel_indices remains the escape hatch for targets no allocator rule proposed.
-    """
+def actions_to_tasks(ghost, cand_scores, cand_picks, frame: int, obs_resolution: float = 1.0, target_speed: float = 1.0, novel_scores=None, novel_indices=None) -> list:
+    """Turn the actor's spatial decisions into CBBA nominations."""
     tasks = []
-    cands = getattr(ghost, '_rl_candidates', None) or []
-    cand_scores = np.asarray(cand_scores, dtype=np.float32).reshape(-1) if cand_scores is not None else np.zeros(0, np.float32)
-    seen = set()
-    for slot in (cand_picks or []):
-        slot = int(slot)
-        if slot < 0 or slot >= len(cands) or slot in seen:
-            continue
-        seen.add(slot)
-        near = cands[slot]
-        conf = float(cand_scores[slot]) if slot < len(cand_scores) else 0.0
-        conf = min(1.0, max(0.0, conf))
-        floor = RL_SCORE_BASE + RL_SCORE_SPAN * conf
-        tasks.append(Task(task_type=near.task_type, target_pos=near.target_pos, score=max(float(near.score) * (1.0 + RL_ENDORSE_GAIN * conf), floor),
-                          created_frame=frame, owner=ghost.gid, assigned_to=near.assigned_to, target_speed=target_speed, origin=ORIGIN_RL_ENDORSE))
-    if novel_indices is None or novel_scores is None:
+    scores_map = novel_scores if novel_scores is not None else cand_scores
+    indices = novel_indices if novel_indices is not None else cand_picks
+    if scores_map is None or indices is None:
         return tasks
-    novel_scores = np.asarray(novel_scores, dtype=np.float32)
-    if novel_scores.ndim < 2:
-        return tasks
-    rows, cols = novel_scores.shape
+    scores_arr = np.asarray(scores_map, dtype=np.float32)
     target = _pacman_target(ghost)
     bm_top = []
     if getattr(ghost, 'belief_map', None) is not None and hasattr(ghost.belief_map, 'top_cells'):
         bm_top = ghost.belief_map.top_cells(n=5)
-    for r, c in novel_indices:
-        r, c = int(r), int(c)
-        if r < 0 or r >= rows or c < 0 or c >= cols:
-            continue
-        world_y = (float(r) + 0.5) / obs_resolution
-        world_x = (float(c) + 0.5) / obs_resolution
-        if not ghost.world.is_passable(world_x, world_y, radius=0.35):
-            continue
-        rel = min(1.0, max(0.0, float(novel_scores[r, c])))
-        conf = rel * rel
-        score = RL_SCORE_BASE + RL_SCORE_SPAN * conf
-        is_power = any(abs(world_y - p[1]) < 0.5 and abs(world_x - p[0]) < 0.5 for p in ghost.known_power_pellets)
-        near_belief = any((abs(world_y - bc[0]) + abs(world_x - bc[1])) <= 3.0 for bc in bm_top)
-        if is_power:
-            tt = TaskType.CONVERT
-        elif (target is not None and (abs(world_y - target[0]) + abs(world_x - target[1])) <= 3.0) or near_belief:
-            tt = TaskType.HUNT
-        else:
-            tt = TaskType.DYNAMIC
-        tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame,
-                          owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed, origin=ORIGIN_RL_NOVEL))
+    if scores_arr.ndim >= 2:
+        rows, cols = scores_arr.shape[-2], scores_arr.shape[-1]
+        seen = set()
+        for item in indices:
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                r, c = int(item[0]), int(item[1])
+            else:
+                idx = int(item)
+                r, c = idx // cols, idx % cols
+            if r < 0 or r >= rows or c < 0 or c >= cols or (r, c) in seen:
+                continue
+            seen.add((r, c))
+            world_y = (float(r) + 0.5) / obs_resolution
+            world_x = (float(c) + 0.5) / obs_resolution
+            if hasattr(ghost, 'world') and not ghost.world.is_passable(world_x, world_y, radius=0.35):
+                continue
+            if getattr(ghost, 'pacman_powered', False) and target is not None:
+                d_pac = math.hypot(world_y - float(target[0]), world_x - float(target[1]))
+                if d_pac < 10.0:
+                    continue
+            conf = min(1.0, max(0.0, float(scores_arr[r, c])))
+            score = RL_SCORE_BASE + RL_SCORE_SPAN * conf
+            power_pellets = getattr(ghost, 'known_power_pellets', None) or []
+            is_power = any(abs(world_y - p[1]) < 0.5 and abs(world_x - p[0]) < 0.5 for p in power_pellets)
+            near_belief = any((abs(world_y - bc[0]) + abs(world_x - bc[1])) <= 3.0 for bc in bm_top)
+            if is_power:
+                tt = TaskType.CONVERT
+            elif (target is not None and (abs(world_y - target[0]) + abs(world_x - target[1])) <= 3.0) or near_belief:
+                tt = TaskType.HUNT
+            else:
+                tt = TaskType.DYNAMIC
+            tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame,
+                              owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed, origin=ORIGIN_RL_NOVEL))
+    elif scores_arr.ndim == 1:
+        cands = getattr(ghost, '_rl_candidates', None) or []
+        seen = set()
+        for slot in indices:
+            slot = int(slot)
+            if slot < 0 or slot >= len(cands) or slot in seen:
+                continue
+            seen.add(slot)
+            near = cands[slot]
+            conf = float(scores_arr[slot]) if slot < len(scores_arr) else 0.0
+            conf = min(1.0, max(0.0, conf))
+            floor = RL_SCORE_BASE + RL_SCORE_SPAN * conf
+            tasks.append(Task(task_type=near.task_type, target_pos=near.target_pos, score=max(float(near.score) * (1.0 + RL_ENDORSE_GAIN * conf), floor),
+                              created_frame=frame, owner=ghost.gid, assigned_to=near.assigned_to, target_speed=target_speed, origin=ORIGIN_RL_ENDORSE))
     return tasks
 
 def build_global_spatial(env, rows: int, cols: int, obs_resolution: float = 1.0) -> np.ndarray:
