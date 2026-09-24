@@ -80,7 +80,7 @@ LR_WARMUP_UPDATES = 10
 KL_LR_SCALE_BOUNDS = (0.40, float(os.environ.get("KL_LR_MAX", "1.25")))
 METRIC_WINDOW = int(os.environ.get("METRIC_WINDOW", "20"))
 PRINT_INTERVAL = int(os.environ.get("PRINT_INTERVAL", "10"))
-CURRICULUM_START_STAGE = 0
+CURRICULUM_START_STAGE = int(os.environ.get("STAGE", os.environ.get("CURRICULUM_START_STAGE", "0")))
 CRITIC_WARMUP_UPDATES = int(os.environ.get("CRITIC_WARMUP_UPDATES", "6"))
 CRITIC_WARMUP_RESUME  = int(os.environ.get("CRITIC_WARMUP_RESUME", "4"))
 critic_warmup_remaining = 0
@@ -445,7 +445,28 @@ def train():
             print(f"Archived previous log file to {archived_path}")
         except Exception as e:
             print(f"Warning: Could not archive {log_path}: {e}")
-    curriculum = CurriculumScheduler(start_stage=CURRICULUM_START_STAGE)
+    requested_stage = None
+    advance_stage_requested = False
+    for i, arg in enumerate(sys.argv):
+        if arg == "--stage" and i + 1 < len(sys.argv):
+            try:
+                requested_stage = int(sys.argv[i + 1])
+            except ValueError:
+                pass
+        elif arg.startswith("--stage="):
+            try:
+                requested_stage = int(arg.split("=")[1])
+            except ValueError:
+                pass
+        elif arg == "--advance-stage":
+            advance_stage_requested = True
+    if requested_stage is None and "STAGE" in os.environ:
+        try:
+            requested_stage = int(os.environ["STAGE"])
+        except ValueError:
+            pass
+    start_stg = requested_stage if requested_stage is not None else CURRICULUM_START_STAGE
+    curriculum = CurriculumScheduler(start_stage=start_stg)
     stage = curriculum.stage
     is_static_pac = (curriculum.stage_idx == 0 and getattr(curriculum, '_updates_in_stage', 0) < 40)
     print(f"Curriculum: starting at Stage {curriculum.stage_idx}\n({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts, static_pacman={is_static_pac})")
@@ -531,6 +552,22 @@ def train():
             if "ret_rms" in ckpt:
                 ret_rms.load_state_dict(ckpt["ret_rms"])
             curriculum.load_state_dict(ckpt["curriculum"])
+            if requested_stage is not None and requested_stage != curriculum.stage_idx:
+                curriculum.stage_idx = min(len(STAGES) - 1, max(0, requested_stage))
+                curriculum._return_history.clear()
+                curriculum._kill_history.clear()
+                curriculum._updates_in_stage = 0
+                critic_warmup_remaining = CRITIC_WARMUP_UPDATES
+                bc_decay_step = 0
+                kl_lr_scale = 1.0
+                print(f"Manual stage override: forced to Stage {curriculum.stage_idx}")
+            elif advance_stage_requested:
+                if not curriculum.is_final:
+                    curriculum.advance()
+                    critic_warmup_remaining = CRITIC_WARMUP_UPDATES
+                    bc_decay_step = 0
+                    kl_lr_scale = 1.0
+                    print(f"Manual stage advance: stepped from checkpoint to Stage {curriculum.stage_idx}")
             start_update = ckpt["update"] + 1
             episodes     = ckpt.get("episodes", 0)
             total_steps  = ckpt.get("total_steps", ckpt["update"] * ROLLOUT_STEPS * NUM_ENVS)
@@ -539,8 +576,8 @@ def train():
             kl_lr_scale  = ckpt.get("kl_lr_scale", 1.0)
             kl_ema       = ckpt.get("kl_ema", None)
             ent_coef     = ckpt.get("ent_coef", ENT_COEF_INIT)
-            global critic_warmup_remaining
-            critic_warmup_remaining = CRITIC_WARMUP_RESUME
+            if requested_stage is None and not advance_stage_requested:
+                critic_warmup_remaining = CRITIC_WARMUP_RESUME
             if "rng_state" in ckpt:
                 torch.set_rng_state(ckpt["rng_state"].cpu())
             if "np_rng_state" in ckpt:
@@ -1233,7 +1270,17 @@ def train():
             f.write(json.dumps(row) + "\n")
         has_eval = (mean_ret is not None and kill_rate is not None)
         curriculum.record_return(mean_ret if has_eval else None, kill_rate=kill_rate if has_eval else None)
-        if curriculum.should_advance():
+        manual_advance = False
+        for sentinel in [".advance_stage", "advance_stage"]:
+            if os.path.exists(sentinel):
+                try:
+                    os.remove(sentinel)
+                except OSError:
+                    pass
+                manual_advance = True
+                print(f"\n⚡ MANUAL STAGE ADVANCE TRIGGERED VIA SENTINEL ({sentinel})! ⚡")
+                break
+        if (curriculum.should_advance() or manual_advance) and not curriculum.is_final:
             curriculum.advance()
             stage = curriculum.stage
             print(f"\n{'='*60}")
