@@ -31,11 +31,23 @@ def test_curriculum_logic():
     assert cs._updates_in_stage == 43
     assert not cs.should_advance(), f"Curriculum must NOT advance before min_updates ({cs.stage.min_updates}) is reached!"
 
-    # Reach min_updates with high performance
+    # Test that high kill rate with low return BLOCKS advancement
+    cs_dual = CurriculumScheduler(start_stage=0)
+    for _ in range(120):
+        cs_dual.record_return(mean_return=10.0, kill_rate=0.95)  # Return 10.0 < advance_return 22.0
+    assert not cs_dual.should_advance(), "Curriculum must NOT advance if mean_return < advance_return, even with 95% kill rate!"
+
+    # Test that high return with low kill rate BLOCKS advancement
+    cs_dual2 = CurriculumScheduler(start_stage=0)
+    for _ in range(120):
+        cs_dual2.record_return(mean_return=35.0, kill_rate=0.50)  # Kill rate 0.50 < target_kill_rate 0.60
+    assert not cs_dual2.should_advance(), "Curriculum must NOT advance if kill_rate < target_kill_rate, even with high return!"
+
+    # Reach min_updates with high performance (both kill rate and return)
     for _ in range(80):
         cs.record_return(mean_return=75.0, kill_rate=0.90)
     assert cs._updates_in_stage >= cs.stage.min_updates
-    assert cs.should_advance(), "Curriculum should advance once min_updates is reached with high kill rate"
+    assert cs.should_advance(), "Curriculum should advance once min_updates is reached with high kill rate and high return"
     cs.advance()
     assert cs.stage_idx == 1, f"Expected Stage 1, got {cs.stage_idx}"
     assert not cs.is_final, "Stage 1 is intermediate"

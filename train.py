@@ -1301,14 +1301,16 @@ def train():
                 min_u = stg.min_updates
                 win_hist = list(curriculum._kill_history)
                 avg_win = (sum(win_hist) / len(win_hist)) if win_hist else 0.0
+                ret_hist = list(curriculum._return_history)
+                avg_ret = (sum(ret_hist) / len(ret_hist)) if ret_hist else 0.0
                 if curriculum.is_final:
-                    readiness = f"\033[96m[FINAL STAGE: Target {stg.target_kill_rate:.0%}]\033[0m"
+                    readiness = f"\033[96m[FINAL STAGE: Target Win {stg.target_kill_rate:.0%}]\033[0m"
                 elif u_in_stage < min_u:
-                    readiness = f"\033[93m[WARMUP: {u_in_stage}/{min_u} upd | Target: {stg.target_kill_rate:.0%}]\033[0m"
-                elif avg_win >= stg.target_kill_rate:
-                    readiness = f"\033[92m[READY TO ADVANCE: Win {avg_win:.1%} ≥ {stg.target_kill_rate:.0%}]\033[0m"
+                    readiness = f"\033[93m[WARMUP: {u_in_stage}/{min_u} upd | Target: Win {stg.target_kill_rate:.0%}, Ret {stg.advance_return:.1f}]\033[0m"
+                elif avg_win >= stg.target_kill_rate and avg_ret >= stg.advance_return:
+                    readiness = f"\033[92m[READY TO ADVANCE: Win {avg_win:.1%} ≥ {stg.target_kill_rate:.0%} | Ret {avg_ret:.1f} ≥ {stg.advance_return:.1f}]\033[0m"
                 else:
-                    readiness = f"\033[94m[COMPETENCY: Win {avg_win:.1%} / {stg.target_kill_rate:.0%} ({u_in_stage}/{min_u} upd)]\033[0m"
+                    readiness = f"\033[94m[COMPETENCY: Win {avg_win:.1%}/{stg.target_kill_rate:.0%} | Ret {avg_ret:.1f}/{stg.advance_return:.1f} ({u_in_stage}/{min_u} upd)]\033[0m"
                 if roll_tacklers:
                     t_counts = {g: roll_tacklers.count(g) for g in range(stg.n_ghosts)}
                     t_total = max(1, sum(t_counts.values()))

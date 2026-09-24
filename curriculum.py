@@ -7,8 +7,8 @@ Stages:
   Stage 2: 27x33 grid, 6 ghosts
   Stage 3: 33x41 grid, 7 ghosts
 
-Advancement is triggered when the rolling kill rate over ADVANCE_WINDOW updates reaches the
-stage target, or plateaus above 0.92x the target. Mean return is recorded for logging only.
+Advancement is triggered when BOTH the rolling kill rate AND the rolling mean return
+over ADVANCE_WINDOW updates reach their stage targets, or plateau above the competency bars.
 """
 
 from __future__ import annotations
@@ -39,9 +39,9 @@ class Stage:
     def cols(self) -> int:
         return int(self.world_width * self.obs_resolution)
 
-STAGES = [Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=2, n_power=3,  advance_return=0.0, min_updates=100, target_kill_rate=0.75, bar_ttk=180.0, bar_deaths=0.50, bar_pac_score=450.0,  bc_init=0.30, pac_speed=0.65),
-    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=12, advance_return=1.5, min_updates=250, target_kill_rate=0.72, bar_ttk=350.0, bar_deaths=1.50, bar_pac_score=1100.0, bc_init=0.15, pac_speed=0.80),
-    Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=20, advance_return=1.5, min_updates=300, target_kill_rate=0.70, bar_ttk=500.0, bar_deaths=2.20, bar_pac_score=1700.0, bc_init=0.08, pac_speed=0.90),
+STAGES = [Stage(world_height=13, world_width=17, obs_resolution=1.0,n_ghosts=2, n_power=3,advance_return=22.0, min_updates=100, target_kill_rate=0.60,bar_ttk=180.0, bar_deaths=0.50, bar_pac_score=450.0,bc_init=0.30, pac_speed=0.65),
+    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=12, advance_return=20.0, min_updates=200, target_kill_rate=0.68, bar_ttk=350.0, bar_deaths=1.50, bar_pac_score=1100.0, bc_init=0.15, pac_speed=0.80),
+    Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=20, advance_return=20.0, min_updates=250, target_kill_rate=0.72, bar_ttk=500.0, bar_deaths=2.20, bar_pac_score=1700.0, bc_init=0.08, pac_speed=0.90),
     Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.85, bar_ttk=605.0, bar_deaths=1.88, bar_pac_score=1942.0, bc_init=0.02, pac_speed=1.00)]
 
 ADVANCE_WINDOW = 50    #rolling window of updates for advancement checks
@@ -77,18 +77,20 @@ class CurriculumScheduler:
             return False
         avg_kill = sum(self._kill_history) / len(self._kill_history)
         avg_ret = sum(self._return_history) / len(self._return_history)
-        if avg_kill >= self.stage.target_kill_rate:
-            print(f"Curriculum advancing: kill {avg_kill:.1%} >= target {self.stage.target_kill_rate:.1%} (avg ret: {avg_ret:.2f})")
+        #Dual condition: both kill rate and return threshold must be met
+        if avg_kill >= self.stage.target_kill_rate and avg_ret >= self.stage.advance_return:
+            print(f"Curriculum advancing: kill {avg_kill:.1%} >= target {self.stage.target_kill_rate:.1%} and avg ret {avg_ret:.2f} >= target {self.stage.advance_return:.2f}")
             return True
-        #plateau: kill rate has flattened above the competency bar (0.92x target)
+        #plateau: performance has flattened above the competency bars (0.92x target kill, 0.90x target return)
         if self._updates_in_stage >= self.stage.min_updates + 2 * ADVANCE_WINDOW:
             half = ADVANCE_WINDOW // 2
-            hist = list(self._kill_history)
-            kill_first = sum(hist[:half]) / half
-            kill_second = sum(hist[half:]) / half
+            hist_k = list(self._kill_history)
+            kill_first = sum(hist_k[:half]) / half
+            kill_second = sum(hist_k[half:]) / half
             competency_kill = self.stage.target_kill_rate * 0.92
-            if (kill_second - kill_first) < 0.02 and avg_kill >= competency_kill:
-                print(f"Curriculum advancing due to plateau: kill progress {kill_second - kill_first:+.3f} < 0.02 (kill: {avg_kill:.1%} >= {competency_kill:.1%}, avg ret: {avg_ret:.2f})")
+            competency_ret = self.stage.advance_return * 0.90
+            if (kill_second - kill_first) < 0.02 and avg_kill >= competency_kill and avg_ret >= competency_ret:
+                print(f"Curriculum advancing due to plateau: kill progress {kill_second - kill_first:+.3f} < 0.02 (kill: {avg_kill:.1%} >= {competency_kill:.1%}, avg ret: {avg_ret:.2f} >= {competency_ret:.2f})")
                 return True
         return False
 
@@ -118,4 +120,5 @@ class CurriculumScheduler:
     def __repr__(self):
         s = self.stage
         avg_k = (sum(self._kill_history) / len(self._kill_history)) if self._kill_history else 0.0
-        return (f"CurriculumScheduler(stage={self.stage_idx}, grid={s.rows}×{s.cols}, ghosts={s.n_ghosts}, updates={self._updates_in_stage}, win_rate={avg_k:.1%})")
+        avg_r = (sum(self._return_history) / len(self._return_history)) if self._return_history else 0.0
+        return (f"CurriculumScheduler(stage={self.stage_idx}, grid={s.rows}×{s.cols}, ghosts={s.n_ghosts}, updates={self._updates_in_stage}, win_rate={avg_k:.1%}, return={avg_r:.1f})")
