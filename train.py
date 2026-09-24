@@ -143,10 +143,12 @@ def push_to_discord(metrics_row):
     lr_scale = metrics_row.get('kl_lr_scale', 1.0)
     gn_a = metrics_row.get('grad_norm_a', 0.0)
     gn_c = metrics_row.get('grad_norm_c', 0.0)
-
+    p_spd = metrics_row.get('pac_speed', 1.0)
+    opp_str = "Static Warmup" if (metrics_row.get('curriculum_stage') == 0 and metrics_row.get('is_static')) else f"Dynamic ({p_spd:.2f}x)"
     msg = (f"**Update {metrics_row['update']}** | Stage {metrics_row['curriculum_stage']} ({metrics_row['grid_size']}) | Runtime: `{runtime}`\n"
         f"```ml\n"
         f"Phase:            {phase} (BC: {bc_coef:.4f})\n"
+        f"Opponent:         {opp_str}\n"
         f"LR:               {cur_lr:.2e} (Scale: {lr_scale:.2f}x)\n"
         f"Episodes / Steps: {metrics_row['episodes']} / {metrics_row['steps']}\n"
         f"-----------------------------------------\n"
@@ -249,7 +251,7 @@ def _pad_spatial(arr, target_h=MAX_H, target_w=MAX_W):
         out[0, :, w:] = 1.0
     return out
 
-def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
+def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False, pac_speed=1.0):
     os.environ['OMP_NUM_THREADS'] = '1'
     os.environ['MKL_NUM_THREADS'] = '1'
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
@@ -260,7 +262,7 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
     except Exception:
         pass
     try:
-        env = Env(env_id, num_ghosts=n_ghosts, world_height=float(rows), world_width=float(cols), n_power=n_power, static_pacman=static_pacman)
+        env = Env(env_id, num_ghosts=n_ghosts, world_height=float(rows), world_width=float(cols), n_power=n_power, static_pacman=static_pacman, pac_speed=pac_speed)
         obs = env.reset()
         conn.send(obs)           #send initial observation
     except Exception as e:
@@ -285,11 +287,15 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
                 obs = env.reset()
                 conn.send(obs)
             elif cmd == "set_curriculum":
-                if len(data) >= 5:
-                    rows, cols, n_ghosts, n_power, static_pacman = data
+                if len(data) >= 6:
+                    rows, cols, n_ghosts, n_power, static_pacman, pac_speed = data[:6]
+                    env.static_pacman = static_pacman
+                    env.pac_speed = float(pac_speed)
+                elif len(data) >= 5:
+                    rows, cols, n_ghosts, n_power, static_pacman = data[:5]
                     env.static_pacman = static_pacman
                 else:
-                    rows, cols, n_ghosts, n_power = data
+                    rows, cols, n_ghosts, n_power = data[:4]
                 env.world_height = float(rows)
                 env.world_width = float(cols)
                 env.num_ghosts = n_ghosts
@@ -339,13 +345,13 @@ def _recv_unordered(conns, procs=None):
     return results
 
 class VecEnv:
-    def __init__(self, n, rows=33, cols=41, n_ghosts=7, n_power=28, static_pacman=False):
+    def __init__(self, n, rows=33, cols=41, n_ghosts=7, n_power=28, static_pacman=False, pac_speed=1.0):
         self.n = n
         ctx = mp.get_context("spawn")
         self.parent, self.child = zip(*[ctx.Pipe() for _ in range(n)])
         self.procs = []
         for i, c in enumerate(self.child):
-            p = ctx.Process(target=_worker, args=(i, c, rows, cols, n_ghosts, n_power, static_pacman), daemon=True)
+            p = ctx.Process(target=_worker, args=(i, c, rows, cols, n_ghosts, n_power, static_pacman, pac_speed), daemon=True)
             p.start()
             self.procs.append(p)
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
@@ -363,11 +369,12 @@ class VecEnv:
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
         return self.current_obs
 
-    def set_curriculum(self, current_stage_idx, static_pacman=False):
+    def set_curriculum(self, current_stage_idx, static_pacman=False, pac_speed=None):
         from curriculum import STAGES
         s = STAGES[current_stage_idx]
+        speed = pac_speed if pac_speed is not None else getattr(s, 'pac_speed', 1.0)
         for p in self.parent:
-            p.send(("set_curriculum", (s.rows, s.cols, s.n_ghosts, s.n_power, static_pacman)))
+            p.send(("set_curriculum", (s.rows, s.cols, s.n_ghosts, s.n_power, static_pacman, speed)))
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
         return self.current_obs
 
@@ -443,7 +450,7 @@ def train():
     is_static_pac = (curriculum.stage_idx == 0 and getattr(curriculum, '_updates_in_stage', 0) < 40)
     print(f"Curriculum: starting at Stage {curriculum.stage_idx}\n({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts, static_pacman={is_static_pac})")
     print("Initializing VecEnv (spawn before CUDA to prevent hang)...")
-    vec_env = VecEnv(NUM_ENVS, rows=stage.rows, cols=stage.cols, n_ghosts=stage.n_ghosts, n_power=stage.n_power, static_pacman=is_static_pac)
+    vec_env = VecEnv(NUM_ENVS, rows=stage.rows, cols=stage.cols, n_ghosts=stage.n_ghosts, n_power=stage.n_power, static_pacman=is_static_pac, pac_speed=stage.pac_speed)
     print("Initializing networks...")
     actor  = GhostActor().to(DEVICE)
     critic = GhostCritic().to(DEVICE)
@@ -762,8 +769,8 @@ def train():
             avg_win = (sum(win_hist) / len(win_hist)) if win_hist else 0.0
             if updates_in_stage >= 40 or (len(win_hist) >= 15 and avg_win >= 0.60):
                 is_static_pac = False
-                vec_env.set_curriculum(0, static_pacman=False)
-                print(f"\n{'='*60}\nSTAGE 0 WARMUP COMPLETE → Pacman Dynamic Evasive Activated!\n{'='*60}\n")
+                vec_env.set_curriculum(0, static_pacman=False, pac_speed=curriculum.stage.pac_speed)
+                print(f"\n{'='*60}\nSTAGE 0 WARMUP COMPLETE → Pacman Dynamic Evasive Activated ({curriculum.stage.pac_speed:.2f}x speed)!\n{'='*60}\n")
         stage_horizon = max(300, getattr(curriculum.stage, 'min_updates', 100) * 3)
         warm = min(1.0, updates_in_stage / max(1, LR_WARMUP_UPDATES))
         if updates_in_stage < LR_WARMUP_UPDATES:
@@ -1215,6 +1222,8 @@ def train():
             "bar_deaths": getattr(curriculum.stage, 'bar_deaths', 1.88),
             "bar_pac_score": getattr(curriculum.stage, 'bar_pac_score', 1942.0),
             "curriculum_stage": curriculum.stage_idx,
+            "pac_speed": getattr(curriculum.stage, 'pac_speed', 1.0),
+            "is_static": (curriculum.stage_idx == 0 and is_static_pac),
             "grid_size": f"{curriculum.stage.rows}x{curriculum.stage.cols}",
             "lr":         opt_actor.param_groups[0]['lr'],
             "kl_lr_scale": round(kl_lr_scale, 3),
@@ -1324,7 +1333,7 @@ def train():
                 r3 = f"{pac_r:.0f}" if pac_r is not None else "—"
                 print(f"\n┌─── Update {update:>5} / 50k ── {runtime} ────────────────────────────────────────────────────────────")
                 print(f"│  Stage {curriculum.stage_idx}: {stg.rows}×{stg.cols}, {stg.n_ghosts} ghosts  {readiness}")
-                opp_str = "\033[93mStatic Warmup (Power Surges)\033[0m" if (curriculum.stage_idx == 0 and is_static_pac) else "\033[96mDynamic Evasive\033[0m"
+                opp_str = "\033[93mStatic Warmup (Power Surges)\033[0m" if (curriculum.stage_idx == 0 and is_static_pac) else f"\033[96mDynamic ({stg.pac_speed:.2f}x)\033[0m"
                 print(f"│  Episodes: {episodes:<7} Steps: {total_steps:<9} Phase: {phase}   Opponent: {opp_str}")
                 print(f"├─ SPEED DOMINANCE ────────────────────────────────────────────────────────────────────────")
                 spd_prior_loss = round(metrics.get("loss_speed_prior", 0.0) / nb, 5)

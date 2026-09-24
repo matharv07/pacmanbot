@@ -46,10 +46,11 @@ DEATH_PEER      = float(_env.get("DEATH_PEER", "-2.0"))
 STEP_COST       = float(_env.get("STEP_COST", "0.12"))
 
 class Env:
-    def __init__(self, env_id: int = 0, num_ghosts: int = _DEFAULT_GHOSTS, world_height: float = float(_DEFAULT_ROWS), world_width: float = float(_DEFAULT_COLS), obs_resolution: float = 1.0, n_power: int = _DEFAULT_POWER, randomize_opponent: bool = True, static_pacman: bool = False):
+    def __init__(self, env_id: int = 0, num_ghosts: int = _DEFAULT_GHOSTS, world_height: float = float(_DEFAULT_ROWS), world_width: float = float(_DEFAULT_COLS), obs_resolution: float = 1.0, n_power: int = _DEFAULT_POWER, randomize_opponent: bool = True, static_pacman: bool = False, pac_speed: float = 1.0):
         self.env_id     = env_id
         self.randomize_opponent = randomize_opponent
         self.static_pacman = static_pacman
+        self.pac_speed = pac_speed
         self.num_ghosts = num_ghosts
         self.world_height = world_height
         self.world_width  = world_width
@@ -87,6 +88,7 @@ class Env:
             world_height=self.world_height, world_width=self.world_width, n_power=self.n_power, random_spawn=False, obs_resolution=self.obs_resolution)
         self.player = Player(self.grid, self._player_start, self.world, obs_resolution=self.obs_resolution)
         self.player.stationary = self.static_pacman
+        self.player.speed_mult = getattr(self, 'pac_speed', 1.0)
         if self.randomize_opponent and not self.static_pacman:
             self._randomize_opponent()
         open_cells = np.array(self.world.prm_nodes) if hasattr(self.world, 'prm_nodes') and self.world.prm_nodes else np.array([[float(self._player_start[0]), float(self._player_start[1])]])

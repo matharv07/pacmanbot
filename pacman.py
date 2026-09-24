@@ -271,6 +271,7 @@ class Player:
         self._route_power_state = False    #power state when route was planned
         self._route_age = 0                #frames since last replan
         self.stationary = False            #if True, ghost skips movement logic
+        self.speed_mult = 1.0              #speed multiplier for curriculum pacing
         self.frame_counter = 0
         self.pos_history = deque(maxlen=20)
         self._unreachable_targets = {}
@@ -466,7 +467,7 @@ class Player:
                 heading_len = 0.0
                 desired_vy = 0.0
                 desired_vx = 0.0
-            speed_mult = 1.0        #1.0 so that nominal motion is at max speed
+            speed_mult = getattr(self, 'speed_mult', 1.0)
             best_score = -float('inf')
             best_vx, best_vy = desired_vx, desired_vy
             num_rays = _NUM_STEERING_RAYS
