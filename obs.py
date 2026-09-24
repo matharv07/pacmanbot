@@ -77,15 +77,17 @@ def _place_blob(channel, fy, fx, rows: int, cols: int, obs_res: float, scale: fl
 def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_resolution: float = 1.0) -> np.ndarray:
     """Returns (SPATIAL_CH, rows, cols) float32 tensor."""
     out = np.zeros((SPATIAL_CH, rows, cols), dtype=np.float32)
-    for hy, hx in ghost.lidar_memory:
-        r_idx = int(hy * obs_resolution)
-        c_idx = int(hx * obs_resolution)
-        if 0 <= r_idx < rows and 0 <= c_idx < cols:
-            out[0, r_idx, c_idx] = 1.0
-            if r_idx > 0: out[0, r_idx-1, c_idx] = 1.0
-            if r_idx < rows-1: out[0, r_idx+1, c_idx] = 1.0
-            if c_idx > 0: out[0, r_idx, c_idx-1] = 1.0
-            if c_idx < cols-1: out[0, r_idx, c_idx+1] = 1.0
+    if ghost.lidar_memory:
+        for hy, hx in ghost.lidar_memory:
+            r_idx = int(hy * obs_resolution)
+            c_idx = int(hx * obs_resolution)
+            if 0 <= r_idx < rows and 0 <= c_idx < cols:
+                out[0, r_idx, c_idx] = 1.0
+        w = out[0] > 0.0
+        out[0, 1:, :][w[:-1, :]] = 1.0
+        out[0, :-1, :][w[1:, :]] = 1.0
+        out[0, :, 1:][w[:, :-1]] = 1.0
+        out[0, :, :-1][w[:, 1:]] = 1.0
     for p in ghost.known_pellets:
         _place_single_pixel(out[1], p[0], p[1], rows, cols, obs_resolution)
     for p in ghost.known_power_pellets:

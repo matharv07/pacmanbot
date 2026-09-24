@@ -150,12 +150,13 @@ class World:
         self._grid_0_3 = ~rasterize_collided(0.3)
         self._grid_0_35 = ~rasterize_collided(0.35)
         self._grid_0_4 = ~rasterize_collided(0.4)
+        self._grid_rows = self._grid_0_0.shape[0]
+        self._grid_cols = self._grid_0_0.shape[1]
 
     def batch_is_passable(self, px, py, radius=0):
         if hasattr(self, '_grid_0_0'):
-            res = 0.1
-            cols = self._grid_0_0.shape[1]
-            rows = self._grid_0_0.shape[0]
+            cols = getattr(self, '_grid_cols', self._grid_0_0.shape[1])
+            rows = getattr(self, '_grid_rows', self._grid_0_0.shape[0])
             cx = (px * 10.0).astype(np.int32)
             cy = (py * 10.0).astype(np.int32)
             valid = (cx >= 0) & (cx < cols) & (cy >= 0) & (cy < rows)
@@ -171,6 +172,8 @@ class World:
             else:
                 grid = self._grid_0_4 if r_float >= 0.38 else (self._grid_0_35 if r_float >= 0.32 else self._grid_0_3)
             if grid is not None:
+                if np.all(valid):
+                    return grid[cy, cx]
                 ans = np.zeros_like(px, dtype=bool)
                 ans[valid] = grid[cy[valid], cx[valid]]
                 return ans
@@ -219,7 +222,9 @@ class World:
         py_flat = p1[1] + fracs * dy[indices]
         passable_flat = self.batch_is_passable(px_flat, py_flat, radius)
         fails = ~passable_flat
-        fail_counts = np.bincount(indices, weights=fails, minlength=len(p2s))
+        if not np.any(fails):
+            return np.ones(len(p2s), dtype=bool)
+        fail_counts = np.bincount(indices[fails], minlength=len(p2s))
         return fail_counts == 0
 
     def batch_line_of_sight_pairs(self, p1s, p2s, radius=0, step_size=0.2):
@@ -241,7 +246,9 @@ class World:
         py_flat = p1s[indices, 1] + fracs * dy[indices]
         passable_flat = self.batch_is_passable(px_flat, py_flat, radius)
         fails = ~passable_flat
-        fail_counts = np.bincount(indices, weights=fails, minlength=len(p1s))
+        if not np.any(fails):
+            return np.ones(len(p1s), dtype=bool)
+        fail_counts = np.bincount(indices[fails], minlength=len(p1s))
         return fail_counts == 0
 
     def batch_raycast(self, origin, directions, max_dist=10.0):

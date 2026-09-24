@@ -9,6 +9,7 @@ if __name__ == "__main__":
 import pygame
 import random
 import math
+import heapq
 import numpy as np
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -312,8 +313,7 @@ class Player:
             if filtered:
                 all_targets = filtered
         #pre-filter to closest 15 targets by manhattan distance to reduce dijkstra_multi overhead
-        all_targets.sort(key=lambda t: abs(t[0] - start[0]) + abs(t[1] - start[1]))
-        targets = all_targets[:15]
+        targets = heapq.nsmallest(15, all_targets, key=lambda t: abs(t[0] - start[0]) + abs(t[1] - start[1])) if len(all_targets) > 15 else all_targets
         dists = pathfinder.dijkstra_multi(self.world, start, targets)
         best_score = float('inf')
         best_target = None

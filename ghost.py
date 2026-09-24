@@ -44,6 +44,7 @@ GHOST_SPEED       = float(_os.environ.get("GHOST_SPEED", "0.50"))
 SPEED_RATIO       = 1.0 / max(1e-6, GHOST_SPEED)   #how many ghost-cells Pacman covers per ghost-cell
 RAY_COUNT         = 90
 MAX_RAY_DIST      = float(_os.environ.get("GHOST_LIDAR", "10"))
+MAX_RAY_DIST_SQ   = MAX_RAY_DIST * MAX_RAY_DIST
 UNKNOWN           = -1
 MEMORY_FRAMES     = 10
 HEARTBEAT_EVERY   = 5
@@ -604,8 +605,8 @@ class Ghost:
         if bm_arr is not None and len(bm_arr) > 0:
             dx = bm_arr[:, 1] - self.x
             dy = bm_arr[:, 0] - self.y
-            dist = np.hypot(dx, dy)
-            valid_mask = dist <= MAX_RAY_DIST
+            dist_sq = dx * dx + dy * dy
+            valid_mask = dist_sq <= MAX_RAY_DIST_SQ
             if np.any(valid_mask):
                 valid_nodes = bm_arr[valid_mask]
                 valid_idxs = np.where(valid_mask)[0]
@@ -628,11 +629,11 @@ class Ghost:
         if pellets_arr is not None and len(pellets_arr) > 0:
             dx = pellets_arr[:, 0] - self.x
             dy = pellets_arr[:, 1] - self.y
-            dist = np.hypot(dx, dy)
-            valid_mask = dist <= MAX_RAY_DIST
+            dist_sq = dx * dx + dy * dy
+            valid_mask = dist_sq <= MAX_RAY_DIST_SQ
             if np.any(valid_mask):
                 valid = pellets_arr[valid_mask]
-                is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0, step_size=0.5)
+                is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0.0, step_size=0.5)
                 if pellets_tup is not None and len(pellets_tup) == len(pellets_arr):
                     valid_idxs = np.where(valid_mask)[0]
                     for idx, v in zip(valid_idxs, is_los):
@@ -655,11 +656,11 @@ class Ghost:
         if power_arr is not None and len(power_arr) > 0:
             dx = power_arr[:, 0] - self.x
             dy = power_arr[:, 1] - self.y
-            dist = np.hypot(dx, dy)
-            valid_mask = dist <= MAX_RAY_DIST
+            dist_sq = dx * dx + dy * dy
+            valid_mask = dist_sq <= MAX_RAY_DIST_SQ
             if np.any(valid_mask):
                 valid = power_arr[valid_mask]
-                is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0, step_size=0.5)
+                is_los = self.world.batch_line_of_sight((self.x, self.y), valid, radius=0.0, step_size=0.5)
                 if power_tup is not None and len(power_tup) == len(power_arr):
                     valid_idxs = np.where(valid_mask)[0]
                     for idx, v in zip(valid_idxs, is_los):
@@ -690,8 +691,8 @@ class Ghost:
             targets = np.array([[(g.x, g.y)] for g in alive_ghosts]).reshape(-1, 2)
             dx = targets[:, 0] - self.x
             dy = targets[:, 1] - self.y
-            dists = np.hypot(dx, dy)
-            valid_mask = dists <= MAX_RAY_DIST
+            dists_sq = dx * dx + dy * dy
+            valid_mask = dists_sq <= MAX_RAY_DIST_SQ
             if np.any(valid_mask):
                 valid_gids = np.array(alive_gids)[valid_mask]
                 valid_targets = targets[valid_mask]
@@ -802,33 +803,35 @@ class Ghost:
         if world_power_pellets is None:
             world_power_pellets = set(getattr(self.world, 'power_pellets', []))
         if self.known_pellets and hasattr(self.world, 'batch_line_of_sight'):
-            p_list = list(self.known_pellets)
-            p_arr = np.array(p_list, dtype=np.float32)
-            dists = np.hypot(p_arr[:, 0] - self.x, p_arr[:, 1] - self.y)
-            close_mask = dists <= MAX_RAY_DIST
-            if np.any(close_mask):
-                close_pts = p_arr[close_mask]
-                close_indices = np.where(close_mask)[0]
-                is_los = self.world.batch_line_of_sight((self.x, self.y), close_pts, radius=0.0, step_size=0.5)
-                for idx, los in zip(close_indices, is_los):
-                    if los:
-                        pt = p_list[idx]
-                        if pt not in world_pellets:
-                            self.known_pellets.discard(pt)
+            missing_pellets = [pt for pt in self.known_pellets if pt not in world_pellets]
+            if missing_pellets:
+                p_arr = np.array(missing_pellets, dtype=np.float32)
+                dx = p_arr[:, 0] - self.x
+                dy = p_arr[:, 1] - self.y
+                dists_sq = dx * dx + dy * dy
+                close_mask = dists_sq <= MAX_RAY_DIST_SQ
+                if np.any(close_mask):
+                    close_pts = p_arr[close_mask]
+                    close_indices = np.where(close_mask)[0]
+                    is_los = self.world.batch_line_of_sight((self.x, self.y), close_pts, radius=0.0, step_size=0.5)
+                    for idx, los in zip(close_indices, is_los):
+                        if los:
+                            self.known_pellets.discard(missing_pellets[idx])
         if self.known_power_pellets and hasattr(self.world, 'batch_line_of_sight'):
-            pow_list = list(self.known_power_pellets)
-            pow_arr = np.array(pow_list, dtype=np.float32)
-            pow_dists = np.hypot(pow_arr[:, 0] - self.x, pow_arr[:, 1] - self.y)
-            close_pow = pow_dists <= MAX_RAY_DIST
-            if np.any(close_pow):
-                close_pow_pts = pow_arr[close_pow]
-                close_pow_indices = np.where(close_pow)[0]
-                pow_los = self.world.batch_line_of_sight((self.x, self.y), close_pow_pts, radius=0.0, step_size=0.5)
-                for idx, los in zip(close_pow_indices, pow_los):
-                    if los:
-                        pt = pow_list[idx]
-                        if pt not in world_power_pellets:
-                            self.known_power_pellets.discard(pt)
+            missing_power = [pt for pt in self.known_power_pellets if pt not in world_power_pellets]
+            if missing_power:
+                pow_arr = np.array(missing_power, dtype=np.float32)
+                dx = pow_arr[:, 0] - self.x
+                dy = pow_arr[:, 1] - self.y
+                pow_dists_sq = dx * dx + dy * dy
+                close_pow = pow_dists_sq <= MAX_RAY_DIST_SQ
+                if np.any(close_pow):
+                    close_pow_pts = pow_arr[close_pow]
+                    close_pow_indices = np.where(close_pow)[0]
+                    pow_los = self.world.batch_line_of_sight((self.x, self.y), close_pow_pts, radius=0.0, step_size=0.5)
+                    for idx, los in zip(close_pow_indices, pow_los):
+                        if los:
+                            self.known_power_pellets.discard(missing_power[idx])
         self._last_visible_belief_idxs = visible_belief_idxs
         return diffs, newly_discovered, stale_refreshed
 

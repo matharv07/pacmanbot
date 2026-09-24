@@ -543,12 +543,13 @@ class BeliefMap:
             self._W_dirty = False
         W = self._base_W.copy()
         valid_mask = self._valid_mask
+        exp_accum = None
         if hasattr(self, '_danger'):
             my_danger = self._danger[:, np.newaxis]
             nbr_danger = self._danger[self._nbr_idx]
             nbr_danger = np.where(valid_mask, nbr_danger, my_danger)
             delta_danger = np.clip(my_danger - nbr_danger, -3.0, 3.0)
-            W[valid_mask] *= np.exp(delta_danger[valid_mask] * 0.8)
+            exp_accum = delta_danger[valid_mask] * 0.8
         p_dir = self.predicted_dir if self.predicted_dir != (0, 0) else self.last_known_dir
         if self.last_known_pos is not None and p_dir != (0, 0):
             dr, dc = p_dir
@@ -561,7 +562,8 @@ class BeliefMap:
             nbr_dists = self._pellet_dists[self._nbr_idx]
             nbr_dists = np.where(valid_mask, nbr_dists, my_dists)
             delta_pellet = np.clip(my_dists - nbr_dists, -3.0, 3.0)
-            W[valid_mask] *= np.exp(delta_pellet[valid_mask] * 0.4)
+            term = delta_pellet[valid_mask] * 0.4
+            exp_accum = term if exp_accum is None else (exp_accum + term)
         if hasattr(self, '_power_dists') and getattr(self, '_last_known_power', None):
             is_pow = getattr(self, '_last_powered_flag', False)
             my_pow = self._power_dists[:, np.newaxis]
@@ -569,7 +571,10 @@ class BeliefMap:
             nbr_pow = np.where(valid_mask, nbr_pow, my_pow)
             delta_pow = np.clip(my_pow - nbr_pow, -3.0, 3.0)
             pow_mult = 0.8 if not is_pow else 0.1
-            W[valid_mask] *= np.exp(delta_pow[valid_mask] * pow_mult)
+            term = delta_pow[valid_mask] * pow_mult
+            exp_accum = term if exp_accum is None else (exp_accum + term)
+        if exp_accum is not None:
+            W[valid_mask] *= np.exp(exp_accum)
         W_sum = W.sum(axis=1, keepdims=True)
         W_sum = np.where(W_sum > 0, W_sum, 1.0)
         W /= W_sum
