@@ -375,6 +375,14 @@ class Player:
                 return self.grid[int(r)][int(c)] == WALL
             return True
         self.prev_y, self.prev_x = self.y, self.x
+        if self.stationary:
+            self.vx = 0.0
+            self.vy = 0.0
+            if not self.powered:
+                if random.random() < 0.015:
+                    self.powered = True
+                    self.power_timer = 35
+            return
         if AUTO_MODE:
             self.frame_counter += 1
             self._route_age += 1

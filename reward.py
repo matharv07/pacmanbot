@@ -16,11 +16,7 @@ import math
 import numpy as np
 
 class RewardShaper:
-    """Tracks per-ghost potentials and returns the shaping delta each step."""
-
-    def __init__(self, alpha=6.0, beta=1.75, gamma_ex=0.008, delta_peak=2.5,
-                 delta_spread=2.5, delta_ent=1.0, beta_mesh=1.0,
-                 alpha_corner=1.0, beta_disp=0.6, gamma=0.99):
+    def __init__(self, alpha=6.0, beta=1.75, gamma_ex=0.005, delta_peak=1.2, delta_spread=1.2, delta_ent=0.6, beta_mesh=0.5, alpha_corner=1.2, beta_disp=0.4, gamma=0.99):
         """
         Parameters
         ----------
@@ -48,8 +44,6 @@ class RewardShaper:
 
     @staticmethod
     def _engage_radius(ghost) -> float:
-        """Encirclement/cornering radius scaled to the board. A fixed 12 cells covered almost the whole
-        13x17 stage but only a corner of 33x41, so the same weights meant different things per stage."""
         w = getattr(ghost, 'world', None)
         h = getattr(w, 'height', None)
         wd = getattr(w, 'width', None)
@@ -99,9 +93,9 @@ class RewardShaper:
             lead_x = target[1] + p_dir[1] * 3.0
             d_lead = abs(ghost.y - lead_y) + abs(ghost.x - lead_x)
             d = min(d, d_lead + 0.5)
-        kill_zone  = 0.4 * math.exp(-d / 2.5)
-        near_chase = 0.35 * math.exp(-d / 5.0)
-        far_guide  = 0.25 * math.exp(-d / 14.0)
+        kill_zone  = 0.50 * max(0.0, 1.0 - d / 4.0) ** 2
+        near_chase = 0.35 * math.exp(-d / 6.0)
+        far_guide  = 0.15 * math.exp(-d / 14.0)
         return self.alpha * (kill_zone + near_chase + far_guide)
 
     def _phi_flee(self, ghost, target) -> float:
@@ -128,7 +122,6 @@ class RewardShaper:
         return -self.alpha * 2.0 * math.exp(-d / 6.0)
 
     def _phi_surround(self, ghost, all_ghosts, target) -> float:
-        """Rewards multi-angle pincer/encirclement around Pacman using circular variance and distance compression."""
         if getattr(ghost, 'pacman_powered', False) or target is None:
             return 0.0
         pr, pc = target
@@ -147,12 +140,9 @@ class RewardShaper:
         if len(angles) < 2:
             return 0.0
         N = len(angles)
-        R = math.hypot(sum(math.cos(a) for a in angles) / N,
-                       sum(math.sin(a) for a in angles) / N)
+        R = math.hypot(sum(math.cos(a) for a in angles) / N, sum(math.sin(a) for a in angles) / N)
         encirclement = 1.0 - R
-        #distance compression: surges as the perimeter tightens around Pacman -- steeper proximity curve to reward closing in as a group
         avg_prox = sum(math.exp(-d / 5.0) for d in dists) / N
-        #bonus for having 3+ ghosts converging (proper swarm)
         swarm_bonus = 1.0 + 0.3 * max(0, N - 2)
         return self.beta * encirclement * avg_prox * swarm_bonus
 
@@ -182,16 +172,12 @@ class RewardShaper:
         sigma = math.sqrt(max(0.0, var))
         diag = math.hypot(ghost.world.width, ghost.world.height) if ghost.world else 50.0
         norm_spread = min(1.0, sigma / max(diag, 1.0))
-        # 3. Normalized entropy
         n_nodes = max(len(b), 2)
         entropy = -float(np.sum(p * np.log(p + 1e-12)))
         norm_entropy = min(1.0, entropy / math.log(n_nodes))
-        return (self.delta_peak * peak 
-                - self.delta_spread * norm_spread 
-                - self.delta_ent * norm_entropy)
+        return (self.delta_peak * peak - self.delta_spread * norm_spread - self.delta_ent * norm_entropy)
 
     def _phi_dispersion(self, ghost, all_ghosts) -> float:
-        """Repulsive potential to prevent ghosts from clumping up during search."""
         if len(all_ghosts) < 2:
             return 0.0
         min_dist = 999.0
@@ -207,15 +193,9 @@ class RewardShaper:
         return 0.0
 
     def _phi_mesh(self, ghost, all_ghosts) -> float:
-        """
-        Extended mesh connectivity potential.
-        Rewards being inside the multi-hop connected radio mesh (radio radius = 12.0). Multi-hop means a
-        strung-out CHAIN counts as fully connected, so this does not ask the swarm to bunch up.
-        """
         alive = [g for g in all_ghosts.values() if not getattr(g, 'dead', False)]
         if len(alive) < 2:
             return 0.0
-
         visited = {ghost.gid}
         queue = [ghost]
         while queue:
@@ -225,12 +205,10 @@ class RewardShaper:
                     if math.hypot(curr.y - g.y, curr.x - g.x) <= 12.0:
                         visited.add(g.gid)
                         queue.append(g)
-
         frac_connected = len(visited) / len(alive)
         return self.beta_mesh * frac_connected
 
     def _phi_corner(self, ghost, all_ghosts, target) -> float:
-        """Rewards closing in on and trapping Pacman in a dead-end or restricted corridor."""
         if getattr(ghost, 'pacman_powered', False) or target is None:
             return 0.0
         pr, pc = target

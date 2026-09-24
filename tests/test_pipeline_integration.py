@@ -72,41 +72,33 @@ def test_actor_critic_shapes_and_logprobs():
     sp = torch.randn(2, SPATIAL_CH, H, W)
     ve = torch.randn(2, VEC_DIM)
     vm = torch.ones(2, H, W, dtype=torch.bool)
-    #row 1 has no live candidates at all: the pointer head must stay finite rather than emit NaN
-    cf = torch.randn(2, MAX_CANDIDATES, CAND_FEAT_DIM)
-    cc = torch.randint(0, H * W, (2, MAX_CANDIDATES))
-    cm = torch.zeros(2, MAX_CANDIDATES, dtype=torch.bool); cm[0, :9] = True
-    (idx, lp, scores, nidx, nlp, nsc, pool, vec,
-     speed, speed_lp, direction, dir_lp, gate, gate_lp, cand_logits) = actor(sp, ve, vm, cf, cc, cm, K_cand=3, K_novel=1)
-    assert cand_logits.shape == (2, MAX_CANDIDATES), f"cand_logits shape mismatch: {cand_logits.shape}"
-    assert torch.isfinite(cand_logits[0, :9]).all(), "live candidate logits must be finite"
-    assert torch.isinf(cand_logits[0, 9:]).all(), "padded candidate logits must be masked to -inf"
-    #Q-critic: one value per candidate, COMA baseline and gate are finite and the gate is boolean
-    from net import counterfactual_gate
-    q_all = critic.q_all(critic.encode_spatial(torch.randn(2, 12, H, W)), torch.randn(2, critic.vec_mlp[0].in_features), cf, cm)
-    assert q_all.shape == (2, MAX_CANDIDATES)
-    b, adv, use = counterfactual_gate(q_all, cand_logits, cm, idx[:, 0])
-    assert b.shape == (2,) and adv.shape == (2,) and use.dtype == torch.bool and torch.isfinite(b).all() and torch.isfinite(adv).all()
-    assert idx.shape == (2, 3), f"idx shape mismatch: {idx.shape}"
-    assert lp.shape == (2, 3), f"lp shape mismatch: {lp.shape}"
-    assert nidx.shape == (2, 1) and nsc.shape == (2, H, W)
-    assert scores.shape == (2, MAX_CANDIDATES)
-    assert torch.isfinite(lp).all() and torch.isfinite(nlp).all(), "pointer head produced non-finite log-probs"
-    assert speed.shape == (2, 1), f"speed shape mismatch: {speed.shape}"
-    assert speed_lp.shape == (2, 1), f"speed_lp shape mismatch: {speed_lp.shape}"
-    assert direction.shape == (2, 1), f"direction shape mismatch: {direction.shape}"
-    assert dir_lp.shape == (2, 1), f"dir_lp shape mismatch: {dir_lp.shape}"
-    assert gate.shape == (2, 1), f"gate shape mismatch: {gate.shape}"
-    assert gate_lp.shape == (2, 1), f"gate_lp shape mismatch: {gate_lp.shape}"
-    (eval_lp, eval_ent, _cell_ent, cand_frac, _novel_ent, _pool, _vec,
-     cand_logits, flat_logits, speed_params) = actor.evaluate_actions(sp, ve, vm, cf, cc, cm, idx, nidx, speed, direction, gate)
-    assert eval_lp.shape == (2, 7), f"eval_lp shape mismatch: {eval_lp.shape}"
+    
+    (sel_idx, sel_lp, scores, pool, vec, speed_act, speed_lp, mu) = actor(sp, ve, vm, K=3)
+    assert sel_idx.shape == (2, 3), f"sel_idx shape mismatch: {sel_idx.shape}"
+    assert sel_lp.shape == (2, 3), f"sel_lp shape mismatch: {sel_lp.shape}"
+    assert scores.shape == (2, H, W), f"scores shape mismatch: {scores.shape}"
+    assert pool.shape == (2, 128), f"pool shape mismatch: {pool.shape}"
+    assert vec.shape == (2, 128), f"vec shape mismatch: {vec.shape}"
+    assert speed_act.shape == (2,), f"speed_act shape mismatch: {speed_act.shape}"
+    assert speed_lp.shape == (2,), f"speed_lp shape mismatch: {speed_lp.shape}"
+    assert torch.isfinite(sel_lp).all(), "spatial log-probs non-finite"
+    assert torch.isfinite(speed_lp).all(), "speed log-probs non-finite"
+    
+    # Global spatial critic check
+    from obs import GLOBAL_SPATIAL_CH, CRITIC_VEC_DIM
+    gsp = torch.randn(2, GLOBAL_SPATIAL_CH, H, W)
+    cve = torch.randn(2, CRITIC_VEC_DIM)
+    v_pred = critic(gsp, cve)
+    assert v_pred.shape == (2,), f"critic v_pred shape mismatch: {v_pred.shape}"
+    assert torch.isfinite(v_pred).all(), "critic produced non-finite values"
+
+    # evaluate_actions check
+    eval_lp, eval_ent, e_pool, e_vec, flat_clean, e_mu, sp_lp_sum, spd_lp = actor.evaluate_actions(
+        sp, ve, vm, actions=sel_idx, speed_actions=speed_act)
+    assert eval_lp.shape == (2,), f"eval_lp shape mismatch: {eval_lp.shape}"
     assert eval_ent.shape == (2,), f"eval_ent shape mismatch: {eval_ent.shape}"
-    assert cand_logits.shape == (2, MAX_CANDIDATES)
-    #a fresh pointer head is uniform over its live set, and a ghost with no candidates contributes nothing
-    assert abs(cand_frac[0].item() - 1.0) < 1e-3, f"fresh head should be at max entropy, got {cand_frac[0].item()}"
-    assert cand_frac[1].item() == 0.0
-    rollout_lp = torch.cat([lp, nlp, speed_lp, dir_lp, gate_lp], dim=1)
+    assert flat_clean.shape == (2, H * W), f"flat_clean shape mismatch: {flat_clean.shape}"
+    rollout_lp = sel_lp.sum(1) + speed_lp
     diff = torch.abs(rollout_lp - eval_lp).max().item()
     print(f"Log-prob difference between rollout and evaluate_actions: {diff:.6f}")
     assert diff < 1e-4, f"Mismatch between rollout log-prob and evaluate_actions: {diff}"

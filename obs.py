@@ -436,7 +436,7 @@ def actions_to_tasks(ghost, cand_scores, cand_picks, frame: int, obs_resolution:
             else:
                 tt = TaskType.DYNAMIC
             tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame,
-                              owner=ghost.gid, assigned_to=ghost.gid, target_speed=target_speed, origin=ORIGIN_RL_NOVEL))
+                              owner=-1, assigned_to=-1, target_speed=target_speed, origin=ORIGIN_RL_NOVEL))
     elif scores_arr.ndim == 1:
         cands = getattr(ghost, '_rl_candidates', None) or []
         seen = set()
@@ -450,7 +450,7 @@ def actions_to_tasks(ghost, cand_scores, cand_picks, frame: int, obs_resolution:
             conf = min(1.0, max(0.0, conf))
             floor = RL_SCORE_BASE + RL_SCORE_SPAN * conf
             tasks.append(Task(task_type=near.task_type, target_pos=near.target_pos, score=max(float(near.score) * (1.0 + RL_ENDORSE_GAIN * conf), floor),
-                              created_frame=frame, owner=ghost.gid, assigned_to=near.assigned_to, target_speed=target_speed, origin=ORIGIN_RL_ENDORSE))
+                              created_frame=frame, owner=-1, assigned_to=-1, target_speed=target_speed, origin=ORIGIN_RL_ENDORSE))
     return tasks
 
 def build_global_spatial(env, rows: int, cols: int, obs_resolution: float = 1.0) -> np.ndarray:

@@ -267,31 +267,15 @@ class Ghost:
                         moved = True
                 if moved and hasattr(self, '_committed_path'):
                     self._committed_path = []
-            if not moved and dist_pac < 4.5:
+            if not moved and dist_pac < 1.0:
                 has_los = True
                 if self.world and hasattr(self.world, 'line_of_sight'):
                     has_los = self.world.line_of_sight((self.x, self.y), (pac_x, pac_y), radius=self.radius, step_size=0.5)
-                if has_los:
-                    if dist_pac < 1.8:
-                        #close-range direct capture
-                        if dist_pac > 0.01:
-                            desired_vx = (pac_x - self.x) / dist_pac
-                            desired_vy = (pac_y - self.y) / dist_pac
-                        moved = True
-                    else:
-                        #corridor lead interception: project pacman forward to cut off intersection
-                        p_dir = getattr(self, '_player_dir', (0, 0))
-                        lookahead = min(2.0, dist_pac * 0.45)
-                        lead_y = pac_y + p_dir[0] * lookahead
-                        lead_x = pac_x + p_dir[1] * lookahead
-                        if self.world and not self.world.is_passable(lead_x, lead_y, radius=self.radius):
-                            lead_y, lead_x = pac_y, pac_x
-                        d_lead = math.hypot(lead_y - self.y, lead_x - self.x)
-                        if d_lead > 0.01:
-                            desired_vx = (lead_x - self.x) / d_lead
-                            desired_vy = (lead_y - self.y) / d_lead
-                            moved = True
-                    if moved and hasattr(self, '_committed_path'):
+                if has_los and dist_pac > 0.01:
+                    desired_vx = (pac_x - self.x) / dist_pac
+                    desired_vy = (pac_y - self.y) / dist_pac
+                    moved = True
+                    if hasattr(self, '_committed_path'):
                         self._committed_path = []
         GRAB_DIST = 2.0
         #never detour for a pellet while a powered Pacman is within lock-on range (it chases inside ~12.5)

@@ -44,14 +44,14 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-NUM_ENVS            = int(os.environ.get("NUM_ENVS", "14"))
-ROLLOUT_STEPS       = int(os.environ.get("ROLLOUT_STEPS", "128"))
+NUM_ENVS            = int(os.environ.get("NUM_ENVS", "16"))
+ROLLOUT_STEPS       = int(os.environ.get("ROLLOUT_STEPS", "256"))
 MINI_BATCH          = int(os.environ.get("MINI_BATCH", "2048"))
-MICRO_BATCH         = int(os.environ.get("MICRO_BATCH", "512"))
+MICRO_BATCH         = int(os.environ.get("MICRO_BATCH", "1024"))
 ROLLOUT_INFER_CHUNK = int(os.environ.get("ROLLOUT_INFER_CHUNK", "1024"))
 _eff_infer_chunk = ROLLOUT_INFER_CHUNK
 _eff_micro_batch = MICRO_BATCH
-PPO_EPOCHS      = 2
+PPO_EPOCHS      = int(os.environ.get("PPO_EPOCHS", "4"))
 GAMMA           = 0.985
 GAE_LAMBDA      = 0.96
 CLIP_EPS        = 0.20
@@ -63,22 +63,23 @@ ENT_COEF_BOUNDS = (0.001, 0.2)
 ENT_COEF_STEP   = 1.10
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
-LR              = 1.5e-4
-LR_CRITIC       = 3.0e-4
-STAGE_BC_INIT   = [0.05, 0.05, 0.05, 0.05]
-BC_FLOOR        = 0.02
+LR              = 1.2e-4
+LR_CRITIC       = 2.5e-4
+STAGE_BC_INIT   = [s.bc_init for s in STAGES]
+BC_FLOOR        = 0.0
 SPATIAL_BC_W    = float(os.environ.get("SPATIAL_BC_W", "1.0"))
 K_WAYPOINTS     = 3
 LOG_DIR         = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file__), "logs"))
 CKPT_DIR        = os.environ.get("CKPT_DIR", os.path.join(os.path.dirname(__file__), "checkpoints"))
 BC_HOLD_UPDATES   = int(os.environ.get("BC_HOLD_UPDATES", "60"))
 BC_ANNEAL_UPDATES = int(os.environ.get("BC_ANNEAL_UPDATES", "150"))
-TARGET_KL       = float(os.environ.get("TARGET_KL", "0.025"))  
+TARGET_KL       = float(os.environ.get("TARGET_KL", "0.020"))  
 KL_EMA_ALPHA    = 0.5
 KL_LR_STEP      = 1.10
 LR_WARMUP_UPDATES = 10
-KL_LR_SCALE_BOUNDS = (0.40, float(os.environ.get("KL_LR_MAX", "2.5")))
+KL_LR_SCALE_BOUNDS = (0.40, float(os.environ.get("KL_LR_MAX", "1.25")))
 METRIC_WINDOW = int(os.environ.get("METRIC_WINDOW", "20"))
+PRINT_INTERVAL = int(os.environ.get("PRINT_INTERVAL", "5"))
 CURRICULUM_START_STAGE = 0
 CRITIC_WARMUP_UPDATES = int(os.environ.get("CRITIC_WARMUP_UPDATES", "6"))
 CRITIC_WARMUP_RESUME  = int(os.environ.get("CRITIC_WARMUP_RESUME", "4"))
@@ -121,36 +122,52 @@ def push_to_discord(metrics_row):
     if bc_coef > 0.25:
         phase = "Hybrid RL + IL"
     elif bc_coef > 0.06:
-        phase = "IL -> RL Transition"
+        phase = "IL → RL Transition"
     else:
-        phase = "Pure RL"
+        phase = "Reinforcement Learning"
     def _r(v, suf='', nd=0):
         return f"{v:.{nd}f}{suf}" if v is not None else "—"
-    ret_str = f"{metrics_row['mean_return']:.3f}" if metrics_row['mean_return'] is not None else "—"
+    ret_str = f"{metrics_row['mean_return']:.3f}" if metrics_row.get('mean_return') is not None else "—"
     kill_str = f"{metrics_row['kill_rate']:.1%}" if metrics_row.get('kill_rate') is not None else "—"
-    pac_str = f"{metrics_row['pacman_score']:.1f}" if metrics_row['pacman_score'] is not None else "—"
-    msg = (f"**Update {metrics_row['update']}** | Stage {metrics_row['curriculum_stage']} ({metrics_row['grid_size']}) | Runtime: {runtime}\n"
+    pac_str = f"{metrics_row['pacman_score']:.1f}" if metrics_row.get('pacman_score') is not None else "—"
+    ev_val = metrics_row.get('explained_var', 0.0)
+    ev_str = f"{ev_val:+.2f}" if ev_val is not None else "—"
+    spd_val = metrics_row.get('speed_mean', 1.0)
+    fast_pct = metrics_row.get('speed_fast_pct', 1.0)
+    spd_str = f"{spd_val:.2f}x ({fast_pct:.0%} fast)" if spd_val is not None else "—"
+    res_val = metrics_row.get('restruct_rate', 0.0)
+    res_str = f"{res_val:.1%}" if res_val is not None else "—"
+    kl_ema = metrics_row.get('kl_ema')
+    kl_ema_str = f"{kl_ema:.4f}" if kl_ema is not None else "—"
+    cur_lr = metrics_row.get('lr', 0.0)
+    lr_scale = metrics_row.get('kl_lr_scale', 1.0)
+    gn_a = metrics_row.get('grad_norm_a', 0.0)
+    gn_c = metrics_row.get('grad_norm_c', 0.0)
+
+    msg = (f"**Update {metrics_row['update']}** | Stage {metrics_row['curriculum_stage']} ({metrics_row['grid_size']}) | Runtime: `{runtime}`\n"
         f"```ml\n"
-        f"Phase:            {phase}\n"
-        f"Learning Rate:    {metrics_row.get('lr', 0.0):.2e}\n"
+        f"Phase:            {phase} (BC: {bc_coef:.4f})\n"
+        f"LR:               {cur_lr:.2e} (Scale: {lr_scale:.2f}x)\n"
         f"Episodes / Steps: {metrics_row['episodes']} / {metrics_row['steps']}\n"
         f"-----------------------------------------\n"
-        f"Mean Return:      {ret_str}\n"
+        f"Speed Dominance:  {spd_str}\n"
+        f"Swarm Restruct:   {res_str}\n"
+        f"Ghost Return:     {ret_str}\n"
         f"Kill Rate:        {kill_str}\n"
+        f"Pacman Score:     {pac_str}\n"
         f"-----------------------------------------\n"
         f"TARGETS (roll {metrics_row.get('roll_n', 0)} upd) vs heuristic bar\n"
-        f"  time-to-kill:   {_r(metrics_row.get('time_to_kill_roll'), 'f')}  (bar 605f)\n"
-        f"  ghosts lost:    {_r(metrics_row.get('ghost_deaths_roll'), '', 2)}  (bar 1.88)\n"
-        f"  pacman score:   {_r(metrics_row.get('pacman_score_roll'), '')}  (bar 1942)\n"
+        f"  time-to-kill:   {_r(metrics_row.get('time_to_kill_roll'), 'f')}  (bar {metrics_row.get('bar_ttk', 605.0):.0f}f)\n"
+        f"  ghosts lost:    {_r(metrics_row.get('ghost_deaths_roll'), '', 2)}  (bar {metrics_row.get('bar_deaths', 1.88):.2f})\n"
+        f"  pacman score:   {_r(metrics_row.get('pacman_score_roll'), '')}  (bar {metrics_row.get('bar_pac_score', 1942.0):.0f})\n"
         f"-----------------------------------------\n"
-        f"Policy Loss:      {metrics_row['actor_loss']:+.5f}\n"
-        f"Value Loss:       {metrics_row['value_loss']:.5f}\n"
+        f"Actor Loss:       {metrics_row['actor_loss']:+.5f}\n"
+        f"Value Loss:       {metrics_row['value_loss']:.5f} (EV: {ev_str})\n"
+        f"Approx KL:        {metrics_row['approx_kl']:.5f} (EMA: {kl_ema_str})\n"
+        f"Grad Norms:       Act: {gn_a:.2f} | Crit: {gn_c:.2f}\n"
+        f"Clip Frac:        {metrics_row['clip_frac']:.1%}\n"
+        f"Entropy:          {metrics_row['entropy']:.4f} (coef {metrics_row.get('ent_coef', 0.0):.4f})\n"
         f"BC Loss:          {metrics_row['bc_loss']:.5f}\n"
-        f"Entropy:          {metrics_row['entropy']:.5f}\n"
-        f"Approx KL:        {metrics_row['approx_kl']:.5f}\n"
-        f"Clip Fraction:    {metrics_row['clip_frac']:.1%}\n"
-        f"-----------------------------------------\n"
-        f"BC Coef:          {bc_coef:.4f}\n"
         f"Timings:          Rollout {metrics_row.get('t_rollout', 0.0)}s | PPO {metrics_row.get('t_ppo', 0.0)}s\n"
         f"```")
     try:
@@ -232,7 +249,7 @@ def _pad_spatial(arr, target_h=MAX_H, target_w=MAX_W):
         out[0, :, w:] = 1.0
     return out
 
-def _worker(env_id, conn, rows, cols, n_ghosts, n_power):
+def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False):
     os.environ['OMP_NUM_THREADS'] = '1'
     os.environ['MKL_NUM_THREADS'] = '1'
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
@@ -243,7 +260,7 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power):
     except Exception:
         pass
     try:
-        env = Env(env_id, num_ghosts=n_ghosts, world_height=float(rows), world_width=float(cols), n_power=n_power)
+        env = Env(env_id, num_ghosts=n_ghosts, world_height=float(rows), world_width=float(cols), n_power=n_power, static_pacman=static_pacman)
         obs = env.reset()
         conn.send(obs)           #send initial observation
     except Exception as e:
@@ -268,7 +285,11 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power):
                 obs = env.reset()
                 conn.send(obs)
             elif cmd == "set_curriculum":
-                rows, cols, n_ghosts, n_power = data
+                if len(data) >= 5:
+                    rows, cols, n_ghosts, n_power, static_pacman = data
+                    env.static_pacman = static_pacman
+                else:
+                    rows, cols, n_ghosts, n_power = data
                 env.world_height = float(rows)
                 env.world_width = float(cols)
                 env.num_ghosts = n_ghosts
@@ -318,13 +339,13 @@ def _recv_unordered(conns, procs=None):
     return results
 
 class VecEnv:
-    def __init__(self, n, rows=33, cols=41, n_ghosts=7, n_power=28):
+    def __init__(self, n, rows=33, cols=41, n_ghosts=7, n_power=28, static_pacman=False):
         self.n = n
         ctx = mp.get_context("spawn")
         self.parent, self.child = zip(*[ctx.Pipe() for _ in range(n)])
         self.procs = []
         for i, c in enumerate(self.child):
-            p = ctx.Process(target=_worker, args=(i, c, rows, cols, n_ghosts, n_power), daemon=True)
+            p = ctx.Process(target=_worker, args=(i, c, rows, cols, n_ghosts, n_power, static_pacman), daemon=True)
             p.start()
             self.procs.append(p)
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
@@ -342,11 +363,11 @@ class VecEnv:
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
         return self.current_obs
 
-    def set_curriculum(self, current_stage_idx):
+    def set_curriculum(self, current_stage_idx, static_pacman=False):
         from curriculum import STAGES
         s = STAGES[current_stage_idx]
         for p in self.parent:
-            p.send(("set_curriculum", (s.rows, s.cols, s.n_ghosts, s.n_power)))
+            p.send(("set_curriculum", (s.rows, s.cols, s.n_ghosts, s.n_power, static_pacman)))
         self.current_obs = _recv_unordered(self.parent, procs=self.procs)
         return self.current_obs
 
@@ -405,6 +426,7 @@ def _critic_pool_expand(critic, spatial_unique, env_n_ghosts):
     return torch.repeat_interleave(pool, repeats, dim=0)
 
 def train():
+    global critic_warmup_remaining
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(CKPT_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, "metrics.jsonl")
@@ -418,9 +440,10 @@ def train():
             print(f"Warning: Could not archive {log_path}: {e}")
     curriculum = CurriculumScheduler(start_stage=CURRICULUM_START_STAGE)
     stage = curriculum.stage
-    print(f"Curriculum: starting at Stage {curriculum.stage_idx}\n({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts)")
+    is_static_pac = (curriculum.stage_idx == 0 and getattr(curriculum, '_updates_in_stage', 0) < 40)
+    print(f"Curriculum: starting at Stage {curriculum.stage_idx}\n({stage.rows}×{stage.cols}, {stage.n_ghosts} ghosts, static_pacman={is_static_pac})")
     print("Initializing VecEnv (spawn before CUDA to prevent hang)...")
-    vec_env = VecEnv(NUM_ENVS, rows=stage.rows, cols=stage.cols, n_ghosts=stage.n_ghosts, n_power=stage.n_power)
+    vec_env = VecEnv(NUM_ENVS, rows=stage.rows, cols=stage.cols, n_ghosts=stage.n_ghosts, n_power=stage.n_power, static_pacman=is_static_pac)
     print("Initializing networks...")
     actor  = GhostActor().to(DEVICE)
     critic = GhostCritic().to(DEVICE)
@@ -529,9 +552,10 @@ def train():
     print("VecEnv initialized. Starting training...")
     t0 = time.time()
 
-    def run_ppo(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_act, b_spd, b_olp, b_adv, b_ret, lam_bc, ret_rms, ent_coef):
+    def run_ppo(update, b_sp, b_gsp_unique, b_gsp_ids, b_ve, b_cve, b_vm, b_ht, b_hs, b_act, b_spd, b_res, b_olp, b_adv, b_ret, lam_bc, ret_rms, ent_coef):
         t_ppo_start = time.time()
-        metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "approx_kl": 0, "clip_fraction": 0, "n_batches": 0}    
+        metrics = {"actor_loss": 0, "value_loss": 0, "bc_loss": 0, "entropy": 0, "approx_kl": 0, "clip_fraction": 0, "explained_var": 0,
+            "speed_mu": 0, "speed_fast_pct": 0, "restruct_rate": 0, "loss_speed_prior": 0, "grad_norm_a": 0, "grad_norm_c": 0, "n_batches": 0}
         N_total = b_sp.shape[0]
         uid_to_indices = defaultdict(list)
         b_gsp_ids_np = b_gsp_ids.cpu().numpy()
@@ -583,6 +607,11 @@ def train():
                     mb_ent = 0.0
                     mb_approx_kl = 0.0
                     mb_clip_fraction = 0.0
+                    mb_ev = 0.0
+                    mb_speed_mu = 0.0
+                    mb_speed_fast = 0.0
+                    mb_restruct_rate = 0.0
+                    mb_spd_prior = 0.0
                     try:
                         for start_i in range(0, n_idx, _eff_micro_batch):
                             end_i = min(start_i + _eff_micro_batch, n_idx)
@@ -597,6 +626,7 @@ def train():
                             mb_hs  = b_hs[chunk_idx]
                             mb_act = b_act[chunk_idx]
                             mb_spd = b_spd[chunk_idx]
+                            mb_res = b_res[chunk_idx]
                             mb_olp = b_olp[chunk_idx]
                             mb_adv = b_adv[chunk_idx]
                             mb_ret = b_ret[chunk_idx]
@@ -605,8 +635,9 @@ def train():
                                 mb_act = mb_act.clamp(max=_hw - 1)
                             mb_spd = mb_spd.clamp(min=0.0, max=1.0)
                             with torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
-                                new_lp, ent, pool, vec, flat_logits, speed_mu, sp_lp, spd_lp = actor.evaluate_actions(
-                                    mb_sp, mb_ve, mb_vm, mb_act, mb_spd)
+                                (new_lp, ent, pool, vec, flat_logits, speed_mu, sp_lp, spd_lp,
+                                 res_lp, res_prob) = actor.evaluate_actions(
+                                    mb_sp, mb_ve, mb_vm, mb_act, mb_spd, restruct_actions=mb_res)
                                 unique_ids, inv_idx = torch.unique(mb_gsp_ids, return_inverse=True)
                                 mb_gsp_unique = b_gsp_unique[unique_ids]
                                 mb_c_pool = critic.encode_spatial(mb_gsp_unique)
@@ -617,11 +648,18 @@ def train():
                                 with torch.no_grad():
                                     clip_fraction = (torch.abs(ratio - 1.0) > CLIP_EPS).float().mean()
                                     approx_kl = 0.5 * log_ratio.pow(2).mean()
-
+                                    y_true = ret_rms(mb_ret)
+                                    if y_true.numel() > 1:
+                                        var_y = torch.var(y_true, unbiased=False)
+                                        var_diff = torch.var(y_true - v_pred, unbiased=False)
+                                        ev = 1.0 - (var_diff / (var_y + 1e-8))
+                                        ev = torch.clamp(ev, -1.0, 1.0)
+                                    else:
+                                        ev = torch.tensor(0.0, device=DEVICE)
                                 s1 = ratio * mb_adv
                                 s2 = ratio.clamp(1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * mb_adv
                                 a_loss = -torch.min(s1, s2).mean()
-                                v_loss = F.smooth_l1_loss(v_pred, ret_rms(mb_ret))
+                                v_loss = F.smooth_l1_loss(v_pred, y_true)
                                 if lam_bc > 1e-6:
                                     mb_ht_masked = mb_ht * mb_vm.float()
                                     ht_flat     = mb_ht_masked.view(mb_ht_masked.shape[0], -1)
@@ -633,27 +671,31 @@ def train():
                                         fl_bc     = flat_logits[valid_bc].clamp(min=-1e4)
                                         log_pi    = F.log_softmax(fl_bc, dim=-1)
                                         bc_spatial = -(ht_prob * log_pi).sum(dim=-1).mean()
-                                        bc_speed = F.smooth_l1_loss(speed_mu[valid_bc], torch.ones_like(speed_mu[valid_bc]))
+                                        target_spd = mb_hs[valid_bc].squeeze(-1).clamp(0.0, 1.0)
+                                        bc_speed = F.smooth_l1_loss(speed_mu[valid_bc], target_spd)
                                         bc = (bc_spatial * SPATIAL_BC_W + bc_speed * 0.1) * bc_valid_frac
                                     else:
                                         bc = torch.tensor(0.0, device=DEVICE)
                                 else:
                                     bc = torch.tensor(0.0, device=DEVICE)
-
-                                if critic_warmup_remaining > 0:
-                                    loss_actor = lam_bc * bc
-                                else:
-                                    loss_actor = a_loss - ent_coef * ent.mean() + lam_bc * bc
+                                loss_speed_prior = 0.015 * (1.0 - speed_mu).pow(2).mean()
+                                loss_actor = a_loss - ent_coef * ent.mean() + lam_bc * bc + loss_speed_prior
                                 loss_critic = VF_COEF * v_loss
-
                             (loss_critic * weight).backward()
-                            (loss_actor * weight).backward()
+                            if critic_warmup_remaining <= 0:
+                                if getattr(loss_actor, "requires_grad", False):
+                                    (loss_actor * weight).backward()
                             mb_a_loss += a_loss.item() * weight
                             mb_v_loss += v_loss.item() * weight
                             mb_bc_loss += bc.item() * weight
                             mb_ent += ent.mean().item() * weight
                             mb_approx_kl += approx_kl.item() * weight
                             mb_clip_fraction += clip_fraction.item() * weight
+                            mb_ev += ev.item() * weight
+                            mb_speed_mu += speed_mu.mean().item() * weight
+                            mb_speed_fast += (speed_mu >= 0.85).float().mean().item() * weight
+                            mb_restruct_rate += (mb_res > 0.5).float().mean().item() * weight
+                            mb_spd_prior += loss_speed_prior.item() * weight
                     except torch.cuda.OutOfMemoryError:
                         torch.cuda.empty_cache()
                         new_mb = max(_eff_micro_batch // 2, 32)
@@ -667,36 +709,46 @@ def train():
                             msg = "  ⚠️  PPO OOM at minimum micro-batch — skipping mini-batch"
                             print(msg)
                             push_discord_warning(msg)
-                grad_norm_a = nn.utils.clip_grad_norm_(actor.parameters(), MAX_GRAD_NORM)
+                if critic_warmup_remaining <= 0:
+                    grad_norm_a = nn.utils.clip_grad_norm_(actor.parameters(), MAX_GRAD_NORM)
+                else:
+                    grad_norm_a = torch.tensor(0.0)
                 grad_norm_c = nn.utils.clip_grad_norm_(critic.parameters(), MAX_GRAD_NORM)
-                if torch.isfinite(grad_norm_c) and torch.isfinite(grad_norm_a):
+                if torch.isfinite(grad_norm_c) and (critic_warmup_remaining > 0 or torch.isfinite(grad_norm_a)):
                     opt_critic.step()
                     if critic_warmup_remaining <= 0:
                         if mb_approx_kl <= 4.0 * TARGET_KL:
                             opt_actor.step()
                         else:
                             opt_actor.zero_grad()
-                    else:
-                        opt_actor.step()
                 else:
                     opt_critic.zero_grad()
-                    opt_actor.zero_grad()
+                    if critic_warmup_remaining <= 0:
+                        opt_actor.zero_grad()
                 metrics["actor_loss"] += mb_a_loss
                 metrics["value_loss"] += mb_v_loss
                 metrics["bc_loss"]    += mb_bc_loss
                 metrics["entropy"]    += mb_ent
                 metrics["approx_kl"]  += mb_approx_kl
                 metrics["clip_fraction"] += mb_clip_fraction
+                metrics["explained_var"] += mb_ev
+                metrics["speed_mu"] += mb_speed_mu
+                metrics["speed_fast_pct"] += mb_speed_fast
+                metrics["restruct_rate"] += mb_restruct_rate
+                metrics["loss_speed_prior"] += mb_spd_prior
+                metrics["grad_norm_a"] = float(grad_norm_a)
+                metrics["grad_norm_c"] = float(grad_norm_c)
                 metrics["n_batches"]  += 1
                 epoch_kls.append(mb_approx_kl)
             epoch_mean_kl = float(np.mean(epoch_kls)) if epoch_kls else 0.0
-            if epoch_mean_kl > 1.5 * TARGET_KL:
+            if epoch_mean_kl > 1.2 * TARGET_KL:
                 break
         t_ppo = time.time() - t_ppo_start
         if critic_warmup_remaining > 0:
             critic_warmup_remaining -= 1
         return metrics, t_ppo
     current_returns = [0.0] * NUM_ENVS
+    roll_tacklers   = collections.deque(maxlen=100)
     rollout_transfer = BatchTransfer(DEVICE)
     train_transfer   = BatchTransfer(DEVICE)
     max_updates = int(os.environ.get("MAX_UPDATES", "50001"))
@@ -705,6 +757,13 @@ def train():
         exec_since = 0      #updates in this stage during which picks were allowed to execute (drives the anneal)
     for update in range(start_update, max_updates):
         updates_in_stage = update - _stage_start_update
+        if curriculum.stage_idx == 0 and is_static_pac:
+            win_hist = list(curriculum._kill_history)
+            avg_win = (sum(win_hist) / len(win_hist)) if win_hist else 0.0
+            if updates_in_stage >= 40 or (len(win_hist) >= 15 and avg_win >= 0.60):
+                is_static_pac = False
+                vec_env.set_curriculum(0, static_pacman=False)
+                print(f"\n{'='*60}\nSTAGE 0 WARMUP COMPLETE → Pacman Dynamic Evasive Activated!\n{'='*60}\n")
         stage_horizon = max(300, getattr(curriculum.stage, 'min_updates', 100) * 3)
         warm = min(1.0, updates_in_stage / max(1, LR_WARMUP_UPDATES))
         if updates_in_stage < LR_WARMUP_UPDATES:
@@ -735,6 +794,7 @@ def train():
         buf_hspeed    = [[] for _ in range(NUM_ENVS)]
         buf_actions   = [[] for _ in range(NUM_ENVS)]
         buf_speeds    = [[] for _ in range(NUM_ENVS)]
+        buf_restruct  = [[] for _ in range(NUM_ENVS)]
         buf_logprobs  = [[] for _ in range(NUM_ENVS)]
         buf_values    = [[] for _ in range(NUM_ENVS)]
         buf_rewards   = [[] for _ in range(NUM_ENVS)]
@@ -743,8 +803,9 @@ def train():
         ep_returns       = []
         ep_pacman_scores = []
         ep_kills         = []
-        ep_deaths        = []      #ghosts lost per episode  -- target metric 2
-        ep_kill_frames   = []      #frames to kill, KILLS ONLY -- target metric 1
+        ep_deaths        = []
+        ep_kill_frames   = []
+        rollout_restruct_events = 0
         env_pred_trajs = [[] for _ in range(NUM_ENVS)]
         completed_pred_seqs = []
         for _ in range(ROLLOUT_STEPS):
@@ -772,9 +833,10 @@ def train():
                     buf_hspeed[e].append(np.empty((0, 1), dtype=np.float32))
                     buf_actions[e].append(np.empty((0, K_WAYPOINTS), dtype=np.int64))
                     buf_speeds[e].append(np.empty((0,), dtype=np.float32))
+                    buf_restruct[e].append(np.empty((0,), dtype=np.float32))
                     buf_logprobs[e].append(np.empty((0,), dtype=np.float32))
                     continue
-                #Pad trimmed observations to current stage size for CNN
+                #pad trimmed observations to current stage size for CNN
                 sp_padded = _pad_spatial(sp, target_h=stage.rows, target_w=stage.cols)
                 vm_padded = _pad_spatial(vm, target_h=stage.rows, target_w=stage.cols)
                 ht_padded = _pad_spatial(ht, target_h=stage.rows, target_w=stage.cols)
@@ -820,16 +882,20 @@ def train():
                 while True:
                     try:
                         idx_chunks, lp_chunks, sc_chunks, spd_chunks, spd_lp_chunks = [], [], [], [], []
+                        res_chunks, res_lp_chunks = [], []
                         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=(DEVICE.type == "cuda")):
                             for ci in range(0, n_total, _eff_infer_chunk):
                                 ce = min(ci + _eff_infer_chunk, n_total)
-                                c_idx, c_lp, c_scores, _, _, c_speed_idx, c_speed_lp, _ = actor_rollout(
-                                    t_sp[ci:ce], t_ve[ci:ce], t_vm[ci:ce], K=K_WAYPOINTS)
+                                (c_idx, c_lp, c_scores, _, _, c_speed_idx, c_speed_lp, _,
+                                 c_res_act, c_res_lp, _) = actor_rollout(
+                                    t_sp[ci:ce], t_ve[ci:ce], t_vm[ci:ce], K=K_WAYPOINTS, return_restruct=True)
                                 idx_chunks.append(c_idx)
                                 lp_chunks.append(c_lp)
                                 sc_chunks.append(c_scores)
                                 spd_chunks.append(c_speed_idx)
                                 spd_lp_chunks.append(c_speed_lp)
+                                res_chunks.append(c_res_act)
+                                res_lp_chunks.append(c_res_lp)
                             pool_exp = _critic_pool_expand(critic_rollout, t_gsp_unique, active_n_ghosts)
                             val_all = critic_rollout.forward_from_pool(pool_exp, t_cve)
                             val_all = ret_rms(val_all, unnorm=True)
@@ -848,6 +914,8 @@ def train():
                 sc_t  = torch.cat(sc_chunks, dim=0).float().cpu().numpy()
                 spd_t = torch.cat(spd_chunks, dim=0).float().cpu().numpy()
                 spd_lp_t = torch.cat(spd_lp_chunks, dim=0).float().cpu().numpy()
+                res_t = torch.cat(res_chunks, dim=0).float().cpu().numpy()
+                res_lp_t = torch.cat(res_lp_chunks, dim=0).float().cpu().numpy()
                 val_all_np = val_all.float().cpu().numpy()
                 offset = 0
                 for e in range(NUM_ENVS):
@@ -861,14 +929,20 @@ def train():
                     e_lp  = lp_t[offset:offset + n_g]
                     e_spd = spd_t[offset:offset + n_g]
                     e_spd_lp = spd_lp_t[offset:offset + n_g]
+                    e_res = res_t[offset:offset + n_g]
+                    e_res_lp = res_lp_t[offset:offset + n_g]
                     e_val = val_all_np[offset:offset + n_g]
                     env_act = {}
                     for i, gid in enumerate(gids):
-                        env_act[gid] = (e_idx[i].tolist(), e_sc[i], float(e_spd[i]))
+                        is_res = bool(e_res[i] > 0.5)
+                        env_act[gid] = (e_idx[i].tolist(), e_sc[i], float(e_spd[i]), is_res)
+                        if is_res:
+                            rollout_restruct_events += 1
                     step_actions[e] = env_act
                     buf_actions[e].append(e_idx)
                     buf_speeds[e].append(e_spd.astype(np.float32))
-                    buf_logprobs[e].append(e_lp.sum(axis=1) + e_spd_lp)
+                    buf_restruct[e].append(e_res.astype(np.float32))
+                    buf_logprobs[e].append(e_lp.sum(axis=1) + e_spd_lp + e_res_lp)
                     v_dict = {gids[i]: float(e_val[i]) for i in range(n_g)}
                     buf_values[e].append(v_dict)
                     offset += n_g
@@ -895,6 +969,9 @@ def train():
                     ep_deaths.append(info_list[e].get("ghosts_dead", 0))
                     if _caught:
                         ep_kill_frames.append(info_list[e].get("frames", 0))
+                        killer = info_list[e].get("killer_gid", -1)
+                        if killer >= 0:
+                            roll_tacklers.append(killer)
                     current_returns[e] = 0.0
         total_steps += ROLLOUT_STEPS * NUM_ENVS
         for e in range(NUM_ENVS):
@@ -999,7 +1076,7 @@ def train():
         #flatten per-env rollouts into a single batch 
         all_sp, all_ve, all_vm, all_ht, all_hs = [], [], [], [], []
         all_cve, all_gsp_ids = [], []
-        all_act, all_spd, all_lp, all_adv, all_ret = [], [], [], [], []
+        all_act, all_spd, all_res, all_lp, all_adv, all_ret = [], [], [], [], [], []
         for e in range(NUM_ENVS):
             T = len(buf_rewards[e])
             if T == 0:
@@ -1023,6 +1100,7 @@ def train():
                     all_hs.append(buf_hspeed[e][t][i])
                     all_act.append(buf_actions[e][t][i])
                     all_spd.append(buf_speeds[e][t][i])
+                    all_res.append(buf_restruct[e][t][i])
                     all_lp.append(buf_logprobs[e][t][i])
                     all_adv.append(adv_dict_list[t].get(gid, 0.0))
                     all_ret.append(ret_dict_list[t].get(gid, 0.0))
@@ -1039,13 +1117,14 @@ def train():
         arr_hs  = np.array(all_hs, dtype=np.float32)
         arr_act = np.array(all_act, dtype=np.int64)
         arr_spd = np.array(all_spd, dtype=np.float32)
+        arr_res = np.array(all_res, dtype=np.float32)
         arr_olp = np.array(all_lp, dtype=np.float32)
         arr_adv = np.array(all_adv, dtype=np.float32)
         arr_ret = np.array(all_ret, dtype=np.float32)
         (ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs,
-         ds_act, ds_spd, ds_olp, ds_adv, ds_ret) = train_transfer.transfer(
+         ds_act, ds_spd, ds_res, ds_olp, ds_adv, ds_ret) = train_transfer.transfer(
             arr_sp, arr_gsp_unique, arr_gsp_ids, arr_ve, arr_cve, arr_vm, arr_ht, arr_hs,
-            arr_act, arr_spd, arr_olp, arr_adv, arr_ret)
+            arr_act, arr_spd, arr_res, arr_olp, arr_adv, arr_ret)
         N_total = ds_sp.shape[0]
         #verify action indices are within spatial bounds
         _sp_hw = ds_sp.shape[-2] * ds_sp.shape[-1]
@@ -1079,7 +1158,7 @@ def train():
         if actor_stepped:
             bc_decay_step += 1
         metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs,
-                                  ds_act, ds_spd, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms, ent_coef)
+                                  ds_act, ds_spd, ds_res, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms, ent_coef)
         measured_ent = metrics["entropy"] / max(1, metrics["n_batches"])
         if actor_stepped:
             ent_target = ENT_TARGET - (ENT_TARGET - ENT_TARGET_END) * min(1.0, updates_in_stage / max(1, ENT_DECAY_UPDATES))
@@ -1099,6 +1178,10 @@ def train():
         critic_rollout.load_state_dict(critic.state_dict())
         nb = max(1, metrics["n_batches"])
         wall_s = round(time.time() - t0, 1)
+        ev_avg = round(metrics.get("explained_var", 0.0) / nb, 3)
+        spd_avg = round(metrics.get("speed_mu", 0.0) / nb, 3)
+        fast_pct = round(metrics.get("speed_fast_pct", 0.0) / nb, 3)
+        restruct_pct = round(metrics.get("restruct_rate", 0.0) / nb, 3)
         row = {
             "update":     update,
             "episodes":   episodes,
@@ -1113,6 +1196,12 @@ def train():
             "clip_frac":  round(metrics["clip_fraction"] / nb, 4),
             "bc_coef":    round(lam_bc, 4),
             "kl_ema":     (round(kl_ema, 5) if kl_ema is not None else None),
+            "explained_var": ev_avg,
+            "speed_mean": spd_avg,
+            "speed_fast_pct": fast_pct,
+            "restruct_rate": restruct_pct,
+            "grad_norm_a": round(metrics.get("grad_norm_a", 0.0), 3),
+            "grad_norm_c": round(metrics.get("grad_norm_c", 0.0), 3),
             "mean_return": mean_ret,
             "pacman_score": mean_pac,
             "kill_rate": kill_rate,
@@ -1122,6 +1211,9 @@ def train():
             "ghost_deaths_roll": loss_r,
             "pacman_score_roll": pac_r,
             "roll_n":     len(roll_ttk),
+            "bar_ttk":    getattr(curriculum.stage, 'bar_ttk', 605.0),
+            "bar_deaths": getattr(curriculum.stage, 'bar_deaths', 1.88),
+            "bar_pac_score": getattr(curriculum.stage, 'bar_pac_score', 1942.0),
             "curriculum_stage": curriculum.stage_idx,
             "grid_size": f"{curriculum.stage.rows}x{curriculum.stage.cols}",
             "lr":         opt_actor.param_groups[0]['lr'],
@@ -1146,6 +1238,7 @@ def train():
             roll_ttk.clear()
             roll_loss.clear()
             roll_pac.clear()
+            roll_tacklers.clear()
             bc_decay_step = 0
             kl_ema = None
             kl_lr_scale = 1.0   #run 13 carried the 0.2 floor from stage 3 into stage 4 for the rest of the run
@@ -1180,7 +1273,7 @@ def train():
                          "np_rng_state": np.random.get_state()}, path)
             with open(log_path, "a") as f:
                 f.write(json.dumps({"checkpoint": path, "update": update, "reason": "curriculum_advance"}) + "\n")
-        if update == 1 or update % 10 == 0:
+        if update <= 5 or update % PRINT_INTERVAL == 0:
             if update % 10 == 0:
                 threading.Thread(target=push_to_discord, args=(row,), daemon=True).start()
             try:
@@ -1196,26 +1289,61 @@ def train():
                     phase = "\033[92mReinforcement Learning\033[0m"
                 stg = curriculum.stage
                 cur_lr = opt_actor.param_groups[0]['lr']
-                print(f"\n┌─── Update {update:>5} / 50k ── {runtime} ─────────────────────────────────")
-                print(f"│  Phase: {phase}   Curriculum: Stage {curriculum.stage_idx} ({stg.rows}×{stg.cols}, {stg.n_ghosts}g)")
-                print(f"│  Episodes: {episodes:<8}  Steps: {total_steps:<10}  LR: {cur_lr:.2e}")
-                warmup_tag = f"  [Critic Warmup: {critic_warmup_remaining} left]" if critic_warmup_remaining > 0 else ""
-                print(f"│  BC Coef:   {lam_bc:.4f}    Policy Loss: {row['actor_loss']:>+.5f}{warmup_tag}")
-                print(f"│  Value Loss: {row['value_loss']:.5f}    LR scale: {kl_lr_scale:.2f} (KL ema: {kl_ema if kl_ema is None else round(kl_ema, 4)})")
-                print(f"│  BC Loss:   {row['bc_loss']:.5f}    Entropy: {row['entropy']:.5f} (coef {ent_coef:.4f}; KL: {row['approx_kl']:.4f}, Clip: {row['clip_frac']:.1%})")
+                u_in_stage = curriculum._updates_in_stage
+                min_u = stg.min_updates
+                win_hist = list(curriculum._kill_history)
+                avg_win = (sum(win_hist) / len(win_hist)) if win_hist else 0.0
+                if curriculum.is_final:
+                    readiness = f"\033[96m[FINAL STAGE: Target {stg.target_kill_rate:.0%}]\033[0m"
+                elif u_in_stage < min_u:
+                    readiness = f"\033[93m[WARMUP: {u_in_stage}/{min_u} upd | Target: {stg.target_kill_rate:.0%}]\033[0m"
+                elif avg_win >= stg.target_kill_rate:
+                    readiness = f"\033[92m[READY TO ADVANCE: Win {avg_win:.1%} ≥ {stg.target_kill_rate:.0%}]\033[0m"
+                else:
+                    readiness = f"\033[94m[COMPETENCY: Win {avg_win:.1%} / {stg.target_kill_rate:.0%} ({u_in_stage}/{min_u} upd)]\033[0m"
+                if roll_tacklers:
+                    t_counts = {g: roll_tacklers.count(g) for g in range(stg.n_ghosts)}
+                    t_total = max(1, sum(t_counts.values()))
+                    tackler_str = " | ".join([f"G{g}: {cnt/t_total:.0%}" for g, cnt in t_counts.items()])
+                else:
+                    tackler_str = "No kills recorded yet"
+                restruct_per_ep = (rollout_restruct_events / max(1, len(ep_returns))) if ep_returns else 0.0
+                step_fps = int((ROLLOUT_STEPS * NUM_ENVS) / max(0.001, t_rollout + t_ppo))
+                if DEVICE.type == "cuda" and torch.cuda.is_available():
+                    v_used = torch.cuda.memory_allocated() / (1024 ** 3)
+                    v_tot = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                    vram_str = f"{v_used:.1f} / {v_tot:.1f} GB"
+                else:
+                    vram_str = "CPU / N/A"
                 ret_str = f"{row['mean_return']:.3f}" if row['mean_return'] is not None else "—"
                 pac_str = f"{row['pacman_score']:.1f}" if row['pacman_score'] is not None else "—"
                 kill_str = f"{row['kill_rate']:.1%}" if row.get('kill_rate') is not None else "—"
-                print(f"│  Ghost Return: {ret_str:<10}  Kill Rate: {kill_str:<8}  Pacman Score: {pac_str}")
                 ttk_str  = f"{ttk:.0f}f" if ttk is not None else "—"
                 loss_str = f"{ghost_loss:.2f}" if ghost_loss is not None else "—"
-                print(f"│  TARGETS → time-to-kill: {ttk_str:<8} ghosts lost: {loss_str:<7} pac score: {pac_str}")
                 r1 = f"{ttk_r:.0f}f" if ttk_r is not None else "—"
                 r2 = f"{loss_r:.2f}" if loss_r is not None else "—"
                 r3 = f"{pac_r:.0f}" if pac_r is not None else "—"
-                print(f"│  rolling({len(roll_ttk)}):  time-to-kill: {r1:<8} ghosts lost: {r2:<7} pac score: {r3}   [heuristic bar 605f / 1.88 / 1942]")
-                print(f"│  Timings: Rollout {t_rollout:.1f}s | PPO {t_ppo:.1f}s")
-                print(f"└{'─'*64}")
+                print(f"\n┌─── Update {update:>5} / 50k ── {runtime} ────────────────────────────────────────────────────────────")
+                print(f"│  Stage {curriculum.stage_idx}: {stg.rows}×{stg.cols}, {stg.n_ghosts} ghosts  {readiness}")
+                opp_str = "\033[93mStatic Warmup (Power Surges)\033[0m" if (curriculum.stage_idx == 0 and is_static_pac) else "\033[96mDynamic Evasive\033[0m"
+                print(f"│  Episodes: {episodes:<7} Steps: {total_steps:<9} Phase: {phase}   Opponent: {opp_str}")
+                print(f"├─ SPEED DOMINANCE ────────────────────────────────────────────────────────────────────────")
+                spd_prior_loss = round(metrics.get("loss_speed_prior", 0.0) / nb, 5)
+                print(f"│  Mean Speed: {spd_avg:.2f}x   Fast (≥0.85x): {fast_pct:.1%}   Speed Prior Loss: {spd_prior_loss:.5f}")
+                print(f"├─ STABILITY & OPTIMIZATION ───────────────────────────────────────────────────────────────")
+                warmup_tag = f"  [Critic Warmup: {critic_warmup_remaining} left]" if critic_warmup_remaining > 0 else ""
+                print(f"│  Actor Loss: {row['actor_loss']:>+.5f}{warmup_tag}   Value Loss: {row['value_loss']:.5f}   Expl. Var (EV): {ev_avg:+.2f}")
+                print(f"│  Approx KL: {row['approx_kl']:.4f}   KL EMA: {(round(kl_ema, 4) if kl_ema is not None else 0.0):.4f} (Target: {TARGET_KL:.3f})   Clip Frac: {row['clip_frac']:.1%}")
+                print(f"│  LR Scale: {kl_lr_scale:.2f}x   Actor LR: {cur_lr:.2e}   Grad Norms: [Act: {row['grad_norm_a']:.2f}, Crit: {row['grad_norm_c']:.2f}]")
+                print(f"│  Entropy: {row['entropy']:.4f} (coef {ent_coef:.4f})   BC Loss: {row['bc_loss']:.5f} (coef {lam_bc:.4f})")
+                print(f"├─ HUNTING PERFORMANCE & TEAMWORK ────────────────────────────────────────────────────────")
+                print(f"│  Kill Rate: {kill_str:<6} (Roll: {avg_win:.1%})   Time-To-Kill: {ttk_str:<5} (Roll: {r1})   Deaths: {loss_str:<4} (Roll: {r2})")
+                print(f"│  Ghost Return: {ret_str:<7}   Pacman Score: {pac_str:<6} (Roll: {r3})")
+                print(f"│  Swarm Restructure: {restruct_pct:.1%} ({restruct_per_ep:.1f} events/ep)")
+                print(f"│  Tacklers: {tackler_str}")
+                print(f"├─ SYSTEM THROUGHPUT & HARDWARE ───────────────────────────────────────────────────────────")
+                print(f"│  Throughput: {step_fps:,} steps/s   Rollout: {t_rollout:.1f}s   PPO: {t_ppo:.1f}s   VRAM: {vram_str}")
+                print(f"└──────────────────────────────────────────────────────────────────────────────────────────")
                 sys.stdout.flush()
             except (BrokenPipeError, OSError):
                 pass

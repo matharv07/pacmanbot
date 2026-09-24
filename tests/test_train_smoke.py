@@ -30,13 +30,12 @@ def test_single_env_rollout_and_step():
     t_cc = torch.from_numpy(flatten_cand_cells(cc, stage.cols))
     t_cm = torch.from_numpy(cm)
     with torch.no_grad():
-        (idx, lp, scores, nidx, nlp, nsc, pool, vec,
-         speed, speed_lp, direction, dir_lp, gate, gate_lp, cand_logits) = actor(t_sp, t_ve, t_vm, t_cf, t_cc, t_cm)
+        out_act = actor(t_sp, t_ve, t_vm, K=3)
+        idx, lp, scores, pool, vec, speed_act, speed_lp, _ = out_act
     action_dict = {}
     for i, gid in enumerate(gids):
-        novel_pairs = [(int(x // stage.cols), int(x % stage.cols)) for x in nidx[i].numpy()]
-        action_dict[gid] = ([int(x) for x in idx[i].numpy()], scores[i].numpy(), novel_pairs, nsc[i].numpy(),
-                            float(speed[i].item()), float(direction[i].item()), float(gate[i].item()))
+        indices = [(int(x // stage.cols), int(x % stage.cols)) for x in idx[i].numpy()]
+        action_dict[gid] = (indices, scores[i].numpy(), float(speed_act[i].item()))
     obs, rewards, done, info = env.step(action_dict, want_bc=False)
     print(f"Step successful. Rewards: {rewards}, Done: {done}, Info: {info}")
     assert "pacman_caught" in info

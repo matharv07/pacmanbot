@@ -104,9 +104,12 @@ class GhostActor(nn.Module):
         self.film = FiLM(128, 128)
         self.head = nn.Conv2d(128, 1, 1)
         self.speed_mu = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 1))
-        self.speed_log_std = nn.Parameter(torch.tensor([-1.2]))  # initial std ~= 0.30
+        self.speed_log_std = nn.Parameter(torch.tensor([-1.2]))
         nn.init.orthogonal_(self.speed_mu[-1].weight, gain=0.01)
-        nn.init.constant_(self.speed_mu[-1].bias, 3.0)  # sigmoid(3.0) ~= 0.953 (nominally 1.0 full speed)
+        nn.init.constant_(self.speed_mu[-1].bias, 3.0)
+        self.restruct_head = nn.Sequential(nn.Linear(256, 64), nn.LayerNorm(64), nn.ReLU(), nn.Linear(64, 1))
+        nn.init.orthogonal_(self.restruct_head[-1].weight, gain=0.01)
+        nn.init.constant_(self.restruct_head[-1].bias, -1.0)
 
     def encode(self, spatial, vector):
         x = self.stem(spatial)
@@ -165,13 +168,18 @@ class GhostActor(nn.Module):
         speed_dist = torch.distributions.Normal(mu, std)
         raw_speed = speed_dist.sample()
         speed_act = torch.clamp(raw_speed, 0.0, 1.0)
-        speed_lp = speed_dist.log_prob(raw_speed)
+        speed_lp = speed_dist.log_prob(speed_act)
+        restruct_logit = self.restruct_head(tok).squeeze(-1)
+        restruct_prob = torch.sigmoid(restruct_logit).clamp(1e-6, 1.0 - 1e-6)
+        restruct_dist = torch.distributions.Bernoulli(probs=restruct_prob)
+        restruct_act = restruct_dist.sample()
+        restruct_lp = restruct_dist.log_prob(restruct_act)
+        if kwargs.get('return_restruct', False):
+            return (sel_idx, sel_lp, scores, pool, vec, speed_act, speed_lp, mu, restruct_act, restruct_lp, restruct_prob)
         return (sel_idx, sel_lp, scores, pool, vec, speed_act, speed_lp, mu)
 
-    def evaluate_actions(self, spatial, vector, mask=None, actions=None, speed_actions=None, *args, **kwargs):
-        """
-        Re-computes log-probs and entropy for stored actions in PPO.
-        """
+    def evaluate_actions(self, spatial, vector, mask=None, actions=None, speed_actions=None, restruct_actions=None, *args, **kwargs):
+        """Re-computes log-probs and entropy for stored actions in PPO."""
         if mask is None:
             mask = (spatial[:, 0] == 0)
         else:
@@ -201,6 +209,17 @@ class GhostActor(nn.Module):
         speed_ent = speed_dist.entropy()
         logprobs = spatial_lp_sum + speed_lp
         entropy  = spatial_ent_sum + 0.1 * speed_ent
+        restruct_logit = self.restruct_head(tok).squeeze(-1)
+        restruct_prob = torch.sigmoid(restruct_logit).clamp(1e-6, 1.0 - 1e-6)
+        restruct_dist = torch.distributions.Bernoulli(probs=restruct_prob)
+        if restruct_actions is not None:
+            if restruct_actions.ndim > 1:
+                restruct_actions = restruct_actions.squeeze(-1)
+            restruct_lp = restruct_dist.log_prob(restruct_actions.float())
+            restruct_ent = restruct_dist.entropy()
+            logprobs = logprobs + restruct_lp
+            entropy = entropy + 0.05 * restruct_ent
+            return logprobs, entropy, pool, vec, flat_clean, mu, spatial_lp_sum, speed_lp, restruct_lp, restruct_prob
         return logprobs, entropy, pool, vec, flat_clean, mu, spatial_lp_sum, speed_lp
 
 class GhostCritic(nn.Module):

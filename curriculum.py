@@ -1,12 +1,11 @@
 """
 Curriculum Learning Scheduler.
 
-Stages (re-laid 2026-09-20 after runs 13/14 showed the 3- and 4-ghost boards are the HARDEST for the swarm
-and taught nothing measurable in 325 updates):
-  Stage 0: 13x17 grid, 2 ghosts  - solo skills: survive the powered phase, deny/convert pellets, track Pacman --- a kill needs cooperation (Pacman is 2x faster), so this stage is gated on time, not kill rate
-  Stage 1: 21x27 grid, 5 ghosts  - first swarm stage: enough ghosts for encirclement / mesh / flank terms to fire
-  Stage 2: 27x33 grid, 6 ghosts  - full swarm pressure
-  Stage 3: 33x41 grid, 7 ghosts  - full game (final)
+Stages:
+  Stage 0: 13x17 grid, 2 ghosts
+  Stage 1: 21x27 grid, 5 ghosts
+  Stage 2: 27x33 grid, 6 ghosts
+  Stage 3: 33x41 grid, 7 ghosts
 
 Advancement is triggered when the rolling kill rate over ADVANCE_WINDOW updates reaches the
 stage target, or plateaus above 0.92x the target. Mean return is recorded for logging only.
@@ -23,9 +22,13 @@ class Stage:
     obs_resolution: float
     n_ghosts: int
     n_power: int
-    advance_return: float          #logging/reference only; gates use kill rate (see should_advance)
+    advance_return: float
     min_updates: int
     target_kill_rate: float
+    bar_ttk: float = 605.0
+    bar_deaths: float = 1.88
+    bar_pac_score: float = 1942.0
+    bc_init: float = 0.05
 
     @property
     def rows(self) -> int:
@@ -35,12 +38,12 @@ class Stage:
     def cols(self) -> int:
         return int(self.world_width * self.obs_resolution)
 
-STAGES = [Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=2, n_power=3,  advance_return=0.0, min_updates=60,  target_kill_rate=0.0),
-          Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=12, advance_return=1.5, min_updates=100, target_kill_rate=0.78),
-          Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=20, advance_return=1.5, min_updates=120, target_kill_rate=0.82),
-          Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.90)]
+STAGES = [Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=2, n_power=3,  advance_return=0.0, min_updates=100, target_kill_rate=0.75, bar_ttk=180.0, bar_deaths=0.50, bar_pac_score=450.0,  bc_init=0.30),
+    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=12, advance_return=1.5, min_updates=250, target_kill_rate=0.72, bar_ttk=350.0, bar_deaths=1.50, bar_pac_score=1100.0, bc_init=0.15),
+    Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=20, advance_return=1.5, min_updates=300, target_kill_rate=0.70, bar_ttk=500.0, bar_deaths=2.20, bar_pac_score=1700.0, bc_init=0.08),
+    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.85, bar_ttk=605.0, bar_deaths=1.88, bar_pac_score=1942.0, bc_init=0.02)]
 
-ADVANCE_WINDOW = 40    #rolling window of updates for advancement checks
+ADVANCE_WINDOW = 50    #rolling window of updates for advancement checks
 
 class CurriculumScheduler:
     def __init__(self, start_stage: int = 0):

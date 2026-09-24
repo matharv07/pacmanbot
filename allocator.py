@@ -103,7 +103,6 @@ def _lookup_dist(dists: dict, target: tuple) -> Optional[tuple]:
     key_r1 = (round(tr, 1), round(tc, 1))
     if key_r1 in dists:
         return dists[key_r1]
-    # Fast nearest-neighbor fallback within 0.5 units if exact key not found due to float precision
     best_info = None
     min_d = 0.5
     for k, v in dists.items():
@@ -114,8 +113,6 @@ def _lookup_dist(dists: dict, target: tuple) -> Optional[tuple]:
     return best_info
 
 def pellet_threat(ghost, pac_pos) -> Optional[tuple]:
-    """Nearest KNOWN unconverted power pellet within PELLET_THREAT_DIST of the Pacman estimate that Pacman is
-    not moving away from, as (y, x). None when there is no such pellet."""
     if pac_pos is None or not getattr(ghost, 'known_power_pellets', None):
         return None
     p_dir = getattr(ghost, '_player_dir', (0.0, 0.0))
@@ -162,7 +159,7 @@ def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
         score = (1.2 + 2.0 * base_score + close_gradient) * conf
         if threat is not None and dist < PELLET_THREAT_HOLD:
             score *= PELLET_THREAT_DAMP
-        tasks.append(Task(task_type=TaskType.HUNT, target_pos=(pr_r, pc_r), score=score, created_frame=frame, owner=ghost.gid, target_speed=1.0))
+        tasks.append(Task(task_type=TaskType.HUNT, target_pos=(pr_r, pc_r), score=score, assigned_to=-1, created_frame=frame, owner=ghost.gid, target_speed=1.0))
         if is_primary:
             for cr, cc in _get_cutoff_candidates(ghost, pr, pc):
                 cr_r, cc_r = round(float(cr), 1), round(float(cc), 1)
