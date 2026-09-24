@@ -79,7 +79,7 @@ KL_LR_STEP      = 1.10
 LR_WARMUP_UPDATES = 10
 KL_LR_SCALE_BOUNDS = (0.40, float(os.environ.get("KL_LR_MAX", "1.25")))
 METRIC_WINDOW = int(os.environ.get("METRIC_WINDOW", "20"))
-PRINT_INTERVAL = int(os.environ.get("PRINT_INTERVAL", "5"))
+PRINT_INTERVAL = int(os.environ.get("PRINT_INTERVAL", "10"))
 CURRICULUM_START_STAGE = 0
 CRITIC_WARMUP_UPDATES = int(os.environ.get("CRITIC_WARMUP_UPDATES", "6"))
 CRITIC_WARMUP_RESUME  = int(os.environ.get("CRITIC_WARMUP_RESUME", "4"))
@@ -1273,9 +1273,8 @@ def train():
                          "np_rng_state": np.random.get_state()}, path)
             with open(log_path, "a") as f:
                 f.write(json.dumps({"checkpoint": path, "update": update, "reason": "curriculum_advance"}) + "\n")
-        if update <= 5 or update % PRINT_INTERVAL == 0:
-            if update % 10 == 0:
-                threading.Thread(target=push_to_discord, args=(row,), daemon=True).start()
+        if update % 10 == 0:
+            threading.Thread(target=push_to_discord, args=(row,), daemon=True).start()
             try:
                 elapsed = wall_s
                 mins, secs = divmod(int(elapsed), 60)
