@@ -39,10 +39,10 @@ class Stage:
     def cols(self) -> int:
         return int(self.world_width * self.obs_resolution)
 
-STAGES = [Stage(world_height=13, world_width=17, obs_resolution=1.0,n_ghosts=2, n_power=3,advance_return=19.5, min_updates=100, target_kill_rate=0.54,bar_ttk=180.0, bar_deaths=0.50, bar_pac_score=450.0,bc_init=0.30, pac_speed=0.65),
-    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=12, advance_return=20.0, min_updates=200, target_kill_rate=0.68, bar_ttk=350.0, bar_deaths=1.50, bar_pac_score=1100.0, bc_init=0.15, pac_speed=0.80),
-    Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=20, advance_return=20.0, min_updates=250, target_kill_rate=0.72, bar_ttk=500.0, bar_deaths=2.20, bar_pac_score=1700.0, bc_init=0.08, pac_speed=0.90),
-    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.85, bar_ttk=605.0, bar_deaths=1.88, bar_pac_score=1942.0, bc_init=0.02, pac_speed=1.00)]
+STAGES = [Stage(world_height=13, world_width=17, obs_resolution=1.0, n_ghosts=2, n_power=3, advance_return=19.5, min_updates=100, target_kill_rate=0.54, bar_ttk=180.0, bar_deaths=0.50, bar_pac_score=450.0, bc_init=0.30, pac_speed=0.65),
+    Stage(world_height=21, world_width=27, obs_resolution=1.0, n_ghosts=5, n_power=12, advance_return=20.0, min_updates=200, target_kill_rate=0.68, bar_ttk=350.0, bar_deaths=1.50, bar_pac_score=1100.0, bc_init=0.00, pac_speed=0.80),
+    Stage(world_height=27, world_width=33, obs_resolution=1.0, n_ghosts=6, n_power=20, advance_return=20.0, min_updates=250, target_kill_rate=0.72, bar_ttk=500.0, bar_deaths=2.20, bar_pac_score=1700.0, bc_init=0.00, pac_speed=0.90),
+    Stage(world_height=33, world_width=41, obs_resolution=1.0, n_ghosts=7, n_power=28, advance_return=float('inf'), min_updates=50000, target_kill_rate=0.85, bar_ttk=605.0, bar_deaths=1.88, bar_pac_score=1942.0, bc_init=0.00, pac_speed=1.00)]
 
 ADVANCE_WINDOW = 50    #rolling window of updates for advancement checks
 
