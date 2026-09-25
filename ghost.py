@@ -6,7 +6,7 @@ import numpy as np
 from pathfinder import next_step, path_belief, ghost_dists, find_topological_flee_target_belief
 from cbba import CBBA_Agent
 from beliefmap import BeliefMap
-from allocator import TaskType, pellet_threat, PELLET_THREAT_HOLD
+from allocator import TaskType
 
 CELL = 20
 COLS = 41
@@ -121,7 +121,7 @@ class Ghost:
         self._proximity_channel_cache = None
         self._proximity_channel_frame = -1
         self._proximity_channel_target = None
-        self._last_synced_map: dict[int, np.ndarray] = {}   # per-peer snapshot for delta sync
+        self._last_synced_map: dict[int, np.ndarray] = {}
         self.power_pellets_converted_this_frame = 0
         self.callout: Optional[str] = None
         self.callout_timer: int = 0
@@ -166,7 +166,7 @@ class Ghost:
             pac_danger_pos = self.known_pacman or self.last_lost_pacman
             drop_keys = []
             for k in list(self.cbba_agent.bundle):
-                if k[0] == TaskType.HUNT:
+                if k[0] in (TaskType.HUNT, TaskType.FLANK):
                     drop_keys.append(k)
                 elif pac_danger_pos is not None:
                     t_obj = self.cbba_agent._task_map.get(k)
@@ -178,6 +178,10 @@ class Ghost:
                 if dk in self.cbba_agent.path:
                     self.cbba_agent.path.remove(dk)
             active_task = self.cbba_agent.get_active_task()
+        if not self.pacman_powered and self.known_pacman is not None:
+            if active_task is not None and active_task.task_type in (TaskType.EXPLORE, TaskType.DYNAMIC):
+                self.cbba_agent.emergency_preempt_explore()
+                active_task = self.cbba_agent.get_active_task()
         #use tolerance-based comparison
         if active_task is not None:
             tpr, tpc = active_task.target_pos
@@ -246,104 +250,69 @@ class Ghost:
                             moved = True
                             if hasattr(self, '_committed_path'):
                                 self._committed_path = []
-        if not moved and not self.pacman_powered and self.known_pacman:
-            pr, pc = self.known_pacman
-            pac_y, pac_x = float(pr), float(pc)
-            dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
-            threat = pellet_threat(self, (pac_y, pac_x)) if 1.8 <= dist_pac < PELLET_THREAT_HOLD else None
-            if threat is not None:
-                d_me = math.hypot(threat[0] - self.y, threat[1] - self.x)
-                d_pac_pellet = math.hypot(threat[0] - pac_y, threat[1] - pac_x)
-                if d_me * SPEED_RATIO < d_pac_pellet:   #we arrive first at the real speed ratio
-                    dx, dy = threat[1] - self.x, threat[0] - self.y
-                    d = math.hypot(dx, dy)
-                    if d > 0.01:
-                        desired_vx, desired_vy = dx / d, dy / d
-                        moved = True
-                else:                                   #back off along the line away from Pacman
-                    dx, dy = self.x - pac_x, self.y - pac_y
-                    d = math.hypot(dx, dy)
-                    if d > 0.01:
-                        desired_vx, desired_vy = dx / d, dy / d
-                        moved = True
-                if moved and hasattr(self, '_committed_path'):
-                    self._committed_path = []
-            if not moved and dist_pac < 1.0:
-                has_los = True
-                if self.world and hasattr(self.world, 'line_of_sight'):
-                    has_los = self.world.line_of_sight((self.x, self.y), (pac_x, pac_y), radius=self.radius, step_size=0.5)
-                if has_los and dist_pac > 0.01:
-                    desired_vx = (pac_x - self.x) / dist_pac
-                    desired_vy = (pac_y - self.y) / dist_pac
-                    moved = True
-                    if hasattr(self, '_committed_path'):
-                        self._committed_path = []
-        GRAB_DIST = 2.0
-        #never detour for a pellet while a powered Pacman is within lock-on range (it chases inside ~12.5)
-        powered_near = self.pacman_powered and (self.known_pacman or self.last_lost_pacman) is not None and \
-            math.hypot((self.known_pacman or self.last_lost_pacman)[0] - self.y, (self.known_pacman or self.last_lost_pacman)[1] - self.x) < 13.0
-        if not moved and not powered_near and (not self.known_pacman or self.pacman_powered or dist_pac > 4.5):
-            best_power = None
-            best_pd = float('inf')
-            #denial uses only power pellets this ghost has seen or been told about
-            for px, py in self.known_power_pellets:
-                pd = math.hypot(py - self.y, px - self.x)
-                if pd < GRAB_DIST and pd < best_pd:
-                    best_power = (py, px)
-                    best_pd = pd
-            if best_power is not None:
-                dx, dy = best_power[1] - self.x, best_power[0] - self.y
-                d = math.hypot(dx, dy)
-                if d > 0:
-                    desired_vx = dx / d
-                    desired_vy = dy / d
-                moved = True
-                if hasattr(self, '_committed_path'):
-                    self._committed_path = []
         if not moved and active_task is not None:
             target = active_task.target_pos
-            replan = False
-            prev_target = getattr(self, '_committed_target', None)
-            if not getattr(self, '_committed_path', []):
-                replan = True
-            elif prev_target != target:
-                if self.frame - getattr(self, '_last_replan_frame', -999) > 10:
-                    replan = True
-                elif prev_target and math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 3.0:
-                    replan = True
-            if replan:
-                full_path = self.plan_path(target)
-                if len(full_path) >= 2:
-                    self._committed_path = full_path[1:]
-                    self._committed_target = target
-                    self._last_replan_frame = self.frame
-                else:
-                    self._committed_path = []
-                    d_target = math.hypot(self.y - target[0], self.x - target[1])
-                    if d_target < 1.0:
-                        self.cbba_agent.remove_task(active_task)
-                        active_task = None
+            #terminal strike: if active task is HUNT and within contact range (<= 1.2 cells), steer directly into continuous collision
+            if active_task.task_type == TaskType.HUNT:
+                pac_y, pac_x = float(target[0]), float(target[1])
+                dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
+                if dist_pac <= 1.2:
+                    has_los = False
+                    if self.world and hasattr(self.world, 'line_of_sight'):
+                        has_los = self.world.line_of_sight((self.x, self.y), (pac_x, pac_y), radius=self.radius, step_size=0.5)
                     else:
-                        self.cbba_agent.mark_unreachable(target, self.frame)
-                        self.cbba_agent.remove_task(active_task)
-                        active_task = None
-            if hasattr(self, '_committed_path') and self._committed_path:
-                next_cell = self._committed_path[0]
-                if abs(self.y - next_cell[0]) < 0.4 and abs(self.x - next_cell[1]) < 0.4:
-                    self._committed_path.pop(0)
-                    if self._committed_path:
-                        next_cell = self._committed_path[0]
-                    else:
-                        self.cbba_agent.remove_task(active_task)
-                        active_task = None
-                if self._committed_path:
-                    target_y, target_x = next_cell[0], next_cell[1]
-                    dx, dy = target_x - self.x, target_y - self.y
-                    d = math.hypot(dx, dy)
-                    if d > 0:
-                        desired_vx = dx / d
-                        desired_vy = dy / d
+                        has_los = True
+                    if has_los and dist_pac > 0.01:
+                        desired_vx = (pac_x - self.x) / dist_pac
+                        desired_vy = (pac_y - self.y) / dist_pac
                         moved = True
+                        if hasattr(self, '_committed_path'):
+                            self._committed_path = []
+            if not moved:
+                replan = False
+                prev_target = getattr(self, '_committed_target', None)
+                if not getattr(self, '_committed_path', []):
+                    replan = True
+                elif prev_target != target:
+                    if self.frame - getattr(self, '_last_replan_frame', -999) > 10:
+                        replan = True
+                    elif prev_target and math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 3.0:
+                        replan = True
+                if replan:
+                    full_path = self.plan_path(target)
+                    if len(full_path) >= 2:
+                        self._committed_path = full_path[1:]
+                        self._committed_target = target
+                        self._last_replan_frame = self.frame
+                    else:
+                        self._committed_path = []
+                        d_target = math.hypot(self.y - target[0], self.x - target[1])
+                        if d_target < 1.0:
+                            if active_task.task_type != TaskType.HUNT:
+                                self.cbba_agent.remove_task(active_task)
+                                active_task = None
+                        else:
+                            self.cbba_agent.mark_unreachable(target, self.frame)
+                            self.cbba_agent.remove_task(active_task)
+                            active_task = None
+                if hasattr(self, '_committed_path') and self._committed_path:
+                    next_cell = self._committed_path[0]
+                    if abs(self.y - next_cell[0]) < 0.4 and abs(self.x - next_cell[1]) < 0.4:
+                        self._committed_path.pop(0)
+                        if self._committed_path:
+                            next_cell = self._committed_path[0]
+                        else:
+                            if active_task.task_type != TaskType.HUNT:
+                                self.cbba_agent.remove_task(active_task)
+                                active_task = None
+                    if self._committed_path:
+                        target_y, target_x = next_cell[0], next_cell[1]
+                        dx, dy = target_x - self.x, target_y - self.y
+                        d = math.hypot(dx, dy)
+                        if d > 0:
+                            desired_vx = dx / d
+                            desired_vy = dy / d
+                            moved = True
         if not moved:
             target = None
             if self.pacman_powered:
@@ -500,7 +469,6 @@ class Ghost:
                     if pt is None:
                         pt = (float(arr_xy[0]), float(arr_xy[1]))
                     if getattr(self, 'world', None):
-                        # Use tolerance to remove exact matching power pellet
                         for pp in list(self.world.power_pellets):
                             if abs(pp[0] - pt[0]) < 0.05 and abs(pp[1] - pt[1]) < 0.05:
                                 self.world.power_pellets.remove(pp)

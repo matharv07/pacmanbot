@@ -245,6 +245,43 @@ class Env:
                     break
         self._last_exec_cand[gid] = slot
 
+    def _trigger_emergency_sighting(self, sighting_gid: int, sighting_ghost):
+        """Instantaneous event interrupt: generates HUNT/FLANK tasks and auctions to local peers with zero frame latency."""
+        from allocator import _score_hunt, _get_cutoff_candidates
+        from pathfinder import dijkstra_multi
+        pac_coord = sighting_ghost.known_pacman
+        if pac_coord is None:
+            return
+        sighting_ghost.cbba_agent.emergency_preempt_explore()
+        hunt_targets = [(round(float(pac_coord[0]), 1), round(float(pac_coord[1]), 1))]
+        for cr, cc in _get_cutoff_candidates(sighting_ghost, pac_coord[0], pac_coord[1]):
+            hunt_targets.append((round(float(cr), 1), round(float(cc), 1)))
+        s_pos = (sighting_ghost.y, sighting_ghost.x)
+        local_gids = [g.gid for g in self.ghosts.values() if not g.dead and math.hypot(g.y - s_pos[0], g.x - s_pos[1]) <= 18.0]
+        if not local_gids:
+            local_gids = [sighting_gid]
+        for lgid in local_gids:
+            lg = self.ghosts[lgid]
+            lg.known_pacman = (round(float(pac_coord[0]), 1), round(float(pac_coord[1]), 1))
+            lg.pacman_last_seen = self.frame
+            lg.cbba_agent.emergency_preempt_explore()
+        for lgid in local_gids:
+            lg = self.ghosts[lgid]
+            d_map = dijkstra_multi(lg.world, (lg.y, lg.x), hunt_targets)
+            h_dists = d_map
+            e_tasks = _score_hunt(lg, h_dists, self.frame)
+            if e_tasks:
+                lg.cbba_agent._phase1(lg, e_tasks, h_dists)
+        if len(local_gids) > 1:
+            for _ in range(2):
+                payloads = {lgid: self.ghosts[lgid].cbba_agent.get_consensus_payload() for lgid in local_gids}
+                for gi in local_gids:
+                    agent_i = self.ghosts[gi].cbba_agent
+                    for gj in local_gids:
+                        if gi != gj:
+                            p_j = payloads[gj]
+                            agent_i.receive_consensus(gj, p_j["y"], p_j["z"], p_j["s"], self.frame, p_j.get("meta"))
+
     def step(self, action_dict: dict, want_bc: bool = False):
         alive = [gid for gid, g in self.ghosts.items() if not g.dead]
         R = int(self.world_height * self.obs_resolution)
@@ -408,6 +445,7 @@ class Env:
                 if has_los and not getattr(ghost, '_had_los_prev', False) and not powered:
                     if gid in rewards:
                         rewards[gid] += 0.5    #LOS discovery reward
+                    self._trigger_emergency_sighting(gid, ghost)
                 ghost._had_los_prev = has_los
                 ghost.update((self.player.y, self.player.x), powered, self.ghosts, speed_mult=getattr(ghost, 'current_speed_mult', 1.0))
                 if not powered and not self.player.dead:

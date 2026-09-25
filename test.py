@@ -56,15 +56,16 @@ def _run_episode(actor, env, stage, critic=None):
         t_cc = torch.from_numpy(flatten_cand_cells(cc, stage.cols).astype(np.int64))
         t_cm = torch.from_numpy(cm.astype(bool))
         with torch.inference_mode():
-            out_act = actor(t_sp, t_ve, t_vm, K=K_CAND)
-            idx, lp, scores, _pool, _vec, speed_idx, speed_lp, _ = out_act
+            out_act = actor(t_sp, t_ve, t_vm, K=K_CAND, return_restruct=True)
+            idx, lp, scores, _pool, _vec, speed_idx, speed_lp, _, res_act, _, _ = out_act
         idx_np    = idx.cpu().numpy()
         scores_np = scores.float().cpu().numpy()
         spd_np    = speed_idx.cpu().numpy()
+        res_np    = (res_act > 0.5).cpu().numpy()
         action_dict = {}
         for i, gid in enumerate(gids):
             indices = [(int(x // stage.cols), int(x % stage.cols)) for x in idx_np[i]]
-            action_dict[gid] = (indices, scores_np[i], spd_np[i])
+            action_dict[gid] = (indices, scores_np[i], spd_np[i], bool(res_np[i]))
         obs, _rewards, done, info = env.step(action_dict, want_bc=False)
         if done:
             surviving = sum(1 for g in env.ghosts.values() if not g.dead)

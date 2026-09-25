@@ -367,7 +367,7 @@ def build_candidates(ghost, rows: int, cols: int, obs_resolution: float = 1.0, d
 
 def _task_key_local(task) -> tuple:
     #mirrors cbba._task_key without importing cbba (obs is imported by cbba's callers)
-    return (int(task.task_type), (round(float(task.target_pos[0]), 1), round(float(task.target_pos[1]), 1)))
+    return (int(task.task_type), (int(round(float(task.target_pos[0]))), int(round(float(task.target_pos[1])))))
 
 AUTH_SCORE = float(_os.environ.get("AUTH_SCORE", "100.0"))   #a confident pick must win its OWN auction outright
 

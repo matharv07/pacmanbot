@@ -98,7 +98,7 @@ class CBBA_Agent:
             pac_pos = getattr(ghost, 'known_pacman', None) or getattr(ghost, 'last_lost_pacman', None)
             drop_keys = []
             for k in list(self.bundle):
-                if k[0] == TaskType.HUNT:
+                if k[0] in (TaskType.HUNT, TaskType.FLANK):
                     drop_keys.append(k)
                 elif pac_pos is not None and len(k) >= 2 and isinstance(k[1], (tuple, list)):
                     d_pac = math.hypot(float(k[1][0]) - float(pac_pos[0]), float(k[1][1]) - float(pac_pos[1]))
@@ -138,15 +138,38 @@ class CBBA_Agent:
         if task is None:
             return
         if hasattr(task, 'task_type') and hasattr(task, 'target_pos'):
+            key = _task_key(task)
             t_type = int(task.task_type)
             ty, tx = float(task.target_pos[0]), float(task.target_pos[1])
-            self.path = [k for k in self.path if not (k[0] == t_type and abs(float(k[1][0]) - ty) < 0.15 and abs(float(k[1][1]) - tx) < 0.15)]
-            self.bundle = [k for k in self.bundle if not (k[0] == t_type and abs(float(k[1][0]) - ty) < 0.15 and abs(float(k[1][1]) - tx) < 0.15)]
+            def _match(k):
+                if k == key:
+                    return True
+                if k[0] == t_type and len(k) >= 2 and isinstance(k[1], (tuple, list)) and len(k[1]) >= 2:
+                    kr, kc = float(k[1][0]), float(k[1][1])
+                    if abs(kr - round(ty)) < 0.15 and abs(kc - round(tx)) < 0.15:
+                        return True
+                    if abs(kr - ty) < 0.75 and abs(kc - tx) < 0.75:
+                        return True
+                return False
+            self.path = [k for k in self.path if not _match(k)]
+            self.bundle = [k for k in self.bundle if not _match(k)]
         elif isinstance(task, (tuple, list)) and len(task) >= 2:
-            t_type = int(task[0])
-            ty, tx = float(task[1][0]), float(task[1][1])
-            self.path = [k for k in self.path if not (k[0] == t_type and abs(float(k[1][0]) - ty) < 0.15 and abs(float(k[1][1]) - tx) < 0.15)]
-            self.bundle = [k for k in self.bundle if not (k[0] == t_type and abs(float(k[1][0]) - ty) < 0.15 and abs(float(k[1][1]) - tx) < 0.15)]
+            key = (int(task[0]), (int(round(float(task[1][0]))), int(round(float(task[1][1])))))
+            self.path = [k for k in self.path if k != key]
+            self.bundle = [k for k in self.bundle if k != key]
+
+    def emergency_preempt_explore(self):
+        """Cleanly strip explore/dynamic search tasks so intercept tasks take immediate priority."""
+        displace = [k for k in list(self.bundle) if k[0] in (TaskType.EXPLORE, TaskType.DYNAMIC)]
+        for dk in displace:
+            if dk in self.bundle:
+                self.bundle.remove(dk)
+            if dk in self.path:
+                self.path.remove(dk)
+            self.y[dk] = 0.0
+            self.z[dk] = None
+        if displace:
+            self._cascade_release()
 
     def get_known_task_for(self, other_gid: int) -> Optional[Task]:
         best_task = None
@@ -277,7 +300,31 @@ class CBBA_Agent:
                 break 
         kept = set(new_bundle)
         self.bundle = new_bundle
-        self.path   = [k for k in self.path if k in kept]
+        #priority displacement: if bundle is full, allow high-priority tasks (HUNT/FLANK) to evict low-priority tasks (EXPLORE/DYNAMIC)
+        while len(self.bundle) >= self.lt:
+            displaceable = [k for k in self.bundle if k[0] in (TaskType.EXPLORE, TaskType.DYNAMIC)]
+            if not displaceable:
+                break
+            best_cand_gain = 0.0
+            for task in candidate_tasks:
+                key = _task_key(task)
+                if key in self.bundle:
+                    continue
+                if task.task_type in (TaskType.HUNT, TaskType.FLANK):
+                    gain, _ = self._marginal_gain(key, ghost)
+                    if gain > best_cand_gain:
+                        best_cand_gain = gain
+            worst_k = min(displaceable, key=lambda k: self.y.get(k, 0.0))
+            if best_cand_gain > self.y.get(worst_k, 0.0) + 1.0:
+                self.bundle.remove(worst_k)
+                if worst_k in self.path:
+                    self.path.remove(worst_k)
+                self.y[worst_k] = 0.0
+                self.z[worst_k] = None
+                self._cascade_release()
+            else:
+                break
+
         #greedily adding tasks until bundle full or no valid candidate remains
         while len(self.bundle) < self.lt:
             best_key = None
