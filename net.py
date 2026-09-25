@@ -164,7 +164,7 @@ class GhostActor(nn.Module):
         sel_idx, sel_lp = _sample_k(flat, base_invalid, K)
         tok = torch.cat([pool, vec], dim=1)
         mu = torch.sigmoid(self.speed_mu(tok)).squeeze(-1)  #(B,)
-        std = torch.exp(torch.clamp(self.speed_log_std, -3.0, 0.5))
+        std = torch.exp(torch.clamp(self.speed_log_std, -1.6, 0.5))
         speed_dist = torch.distributions.Normal(mu, std)
         raw_speed = speed_dist.sample()
         speed_act = torch.clamp(raw_speed, 0.0, 1.0)
@@ -200,7 +200,7 @@ class GhostActor(nn.Module):
         spatial_ent_sum = spatial_ents.sum(1)
         tok = torch.cat([pool, vec], dim=1)
         mu = torch.sigmoid(self.speed_mu(tok)).squeeze(-1)
-        std = torch.exp(torch.clamp(self.speed_log_std, -3.0, 0.5))
+        std = torch.exp(torch.clamp(self.speed_log_std, -1.6, 0.5))
         speed_dist = torch.distributions.Normal(mu, std)
         if speed_actions.ndim > 1:
             speed_actions = speed_actions.squeeze(-1)

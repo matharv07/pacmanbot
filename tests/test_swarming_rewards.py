@@ -231,6 +231,46 @@ def test_corridor_anti_clustering_jam_penalty():
     assert rewards_crowded[0] < rewards_spaced[0]
     print("✓ Corridor anti-clustering jam penalty verified!")
 
+def test_exploration_reward_and_anti_starvation():
+    from worker import Env
+    from curriculum import STAGES
+    stage = STAGES[0]
+    env = Env(env_id=0, num_ghosts=2, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
+    env.reset()
+    
+    g0, g1 = env.ghosts[0], env.ghosts[1]
+    passable_cells = []
+    for r in range(int(env.world_height)):
+        for c in range(int(env.world_width)):
+            if env.world.is_passable(float(c) + 0.5, float(r) + 0.5, radius=0.35):
+                d0 = math.hypot(g0.y - (r + 0.5), g0.x - (c + 0.5))
+                d1 = math.hypot(g1.y - (r + 0.5), g1.x - (c + 0.5))
+                if d0 > 4.0 and d1 > 4.0:
+                    passable_cells.append((r, c))
+    r0, c0 = passable_cells[0]
+    rows, cols = int(env.world_height), int(env.world_width)
+    idx0 = r0 * cols + c0
+    smap0 = np.zeros((rows, cols), dtype=np.float32)
+    smap0[r0, c0] = 1.0
+    
+    # Ghost 0 nominates 1 valid task; Ghost 1 nominates empty
+    actions = {
+        0: ([idx0], smap0, 1.0, True),
+        1: ([], np.zeros((rows, cols), dtype=np.float32), 1.0, True)
+    }
+    obs, rewards, done, info = env.step(actions, want_bc=False)
+    
+    winners0 = set(env.ghosts[0].cbba_agent.z.values())
+    winners1 = set(env.ghosts[1].cbba_agent.z.values())
+    assert 0 in winners0 and 1 in winners0, f"Both ghosts must win tasks in CBBA consensus, got winners: {winners0}"
+    assert 0 in winners1 and 1 in winners1, f"Consensus must be fully converged across mesh, got winners: {winners1}"
+    
+    # Exploration node discovery: ghost 0 has discovered PRM nodes during sweep
+    g0 = env.ghosts[0]
+    assert g0.prm_known_count > 0, "Ghost 0 should have discovered PRM nodes during step"
+    assert rewards[0] > -1.0, f"Ghost 0 reward {rewards[0]} should reflect non-penalized exploration"
+    print("✓ Exploration reward & anti-starvation backup tasks verified!")
+
 if __name__ == "__main__":
     test_phi_surround_pincer_vs_tailing()
     test_phi_hunt_lead_interception()
@@ -238,4 +278,5 @@ if __name__ == "__main__":
     test_worker_swarm_catch_bonus()
     test_phi_corner_dead_end_trapping()
     test_corridor_anti_clustering_jam_penalty()
+    test_exploration_reward_and_anti_starvation()
     print("All swarming & group catch unit tests passed!")

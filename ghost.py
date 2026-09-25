@@ -162,11 +162,11 @@ class Ghost:
             self._check_oscillation()
             return newly_discovered, stale_refreshed
         active_task = self.cbba_agent.step(self, self.frame)
-        if self.pacman_powered:
+        if self.pacman_powered and not getattr(self, 'rl_mode', False):
             pac_danger_pos = self.known_pacman or self.last_lost_pacman
             drop_keys = []
             for k in list(self.cbba_agent.bundle):
-                if k[0] in (TaskType.HUNT, TaskType.FLANK):
+                if k[0] == TaskType.HUNT:
                     drop_keys.append(k)
                 elif pac_danger_pos is not None:
                     t_obj = self.cbba_agent._task_map.get(k)
@@ -178,7 +178,7 @@ class Ghost:
                 if dk in self.cbba_agent.path:
                     self.cbba_agent.path.remove(dk)
             active_task = self.cbba_agent.get_active_task()
-        if not self.pacman_powered and self.known_pacman is not None:
+        if not self.pacman_powered and self.known_pacman is not None and not getattr(self, 'rl_mode', False):
             if active_task is not None and active_task.task_type in (TaskType.EXPLORE, TaskType.DYNAMIC):
                 self.cbba_agent.emergency_preempt_explore()
                 active_task = self.cbba_agent.get_active_task()
@@ -186,15 +186,28 @@ class Ghost:
         if active_task is not None:
             tpr, tpc = active_task.target_pos
             if abs(self.y - tpr) < 0.5 and abs(self.x - tpc) < 0.5:
-                #cleanly remove completed task without mutating task_pos in place (preserves CBBA key matching)
-                self.cbba_agent.remove_task(active_task)
-                active_task = self.cbba_agent.get_active_task()
+                is_hunt = (active_task.task_type == TaskType.HUNT)
+                pac_near = False
+                if is_hunt and not self.pacman_powered and self.known_pacman is not None:
+                    d_kp = math.hypot(self.known_pacman[0] - self.y, self.known_pacman[1] - self.x)
+                    if d_kp <= 6.0:
+                        pac_near = True
+                        self._reached_hunt_target_near_pacman = True
+                if not pac_near:
+                    #cleanly remove completed task without mutating task_pos in place (preserves CBBA key matching)
+                    self.cbba_agent.remove_task(active_task)
+                    active_task = self.cbba_agent.get_active_task()
+                else:
+                    #dynamically repath to live Pacman position instead of stalling
+                    self._committed_target = self.known_pacman
+                    self._committed_path = []
         desired_vx = 0.0
         desired_vy = 0.0
         moved = False
         dist_pac = 999.0
-        #Terminal Evasion: actively flee away from powered Pacman when nearby
-        if not moved and self.pacman_powered:
+        self._is_striking = False
+        #Terminal Evasion: actively flee away from powered Pacman when nearby (heuristics only)
+        if not moved and self.pacman_powered and not getattr(self, 'rl_mode', False):
             pac_target = self.known_pacman or self.last_lost_pacman
             if pac_target is None and hasattr(self, 'belief_map') and self.belief_map is not None:
                 top = self.belief_map.top_cells(n=1)
@@ -250,69 +263,76 @@ class Ghost:
                             moved = True
                             if hasattr(self, '_committed_path'):
                                 self._committed_path = []
-        if not moved and active_task is not None:
-            target = active_task.target_pos
-            #terminal strike: if active task is HUNT and within contact range (<= 1.2 cells), steer directly into continuous collision
-            if active_task.task_type == TaskType.HUNT:
-                pac_y, pac_x = float(target[0]), float(target[1])
+        #Terminal strike reflex: if unpowered Pacman in line-of-sight within 2.5 cells, steer directly into Pacman at max speed (1.0)
+        if not moved and not self.pacman_powered:
+            pac_strike_target = None
+            if self.known_pacman is not None:
+                pac_strike_target = self.known_pacman
+            elif active_task is not None:
+                pac_strike_target = active_task.target_pos
+            if pac_strike_target is not None:
+                pac_y, pac_x = float(pac_strike_target[0]), float(pac_strike_target[1])
                 dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
-                if dist_pac <= 1.2:
+                if dist_pac <= 2.5:
                     has_los = False
                     if self.world and hasattr(self.world, 'line_of_sight'):
-                        has_los = self.world.line_of_sight((self.x, self.y), (pac_x, pac_y), radius=self.radius, step_size=0.5)
+                        has_los = self.world.line_of_sight((self.x, self.y), (pac_x, pac_y), radius=self.radius, step_size=0.3)
                     else:
                         has_los = True
                     if has_los and dist_pac > 0.01:
                         desired_vx = (pac_x - self.x) / dist_pac
                         desired_vy = (pac_y - self.y) / dist_pac
+                        speed_mult = 1.0
+                        self._is_striking = True
                         moved = True
                         if hasattr(self, '_committed_path'):
                             self._committed_path = []
-            if not moved:
-                replan = False
-                prev_target = getattr(self, '_committed_target', None)
-                if not getattr(self, '_committed_path', []):
+        if not moved and active_task is not None:
+            target = active_task.target_pos
+            replan = False
+            prev_target = getattr(self, '_committed_target', None)
+            if not getattr(self, '_committed_path', []):
+                replan = True
+            elif prev_target != target:
+                if self.frame - getattr(self, '_last_replan_frame', -999) > 10:
                     replan = True
-                elif prev_target != target:
-                    if self.frame - getattr(self, '_last_replan_frame', -999) > 10:
-                        replan = True
-                    elif prev_target and math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 3.0:
-                        replan = True
-                if replan:
-                    full_path = self.plan_path(target)
-                    if len(full_path) >= 2:
-                        self._committed_path = full_path[1:]
-                        self._committed_target = target
-                        self._last_replan_frame = self.frame
-                    else:
-                        self._committed_path = []
-                        d_target = math.hypot(self.y - target[0], self.x - target[1])
-                        if d_target < 1.0:
-                            if active_task.task_type != TaskType.HUNT:
-                                self.cbba_agent.remove_task(active_task)
-                                active_task = None
-                        else:
-                            self.cbba_agent.mark_unreachable(target, self.frame)
+                elif prev_target and math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 3.0:
+                    replan = True
+            if replan:
+                full_path = self.plan_path(target)
+                if len(full_path) >= 2:
+                    self._committed_path = full_path[1:]
+                    self._committed_target = target
+                    self._last_replan_frame = self.frame
+                else:
+                    self._committed_path = []
+                    d_target = math.hypot(self.y - target[0], self.x - target[1])
+                    if d_target < 1.0:
+                        if active_task.task_type != TaskType.HUNT:
                             self.cbba_agent.remove_task(active_task)
                             active_task = None
-                if hasattr(self, '_committed_path') and self._committed_path:
-                    next_cell = self._committed_path[0]
-                    if abs(self.y - next_cell[0]) < 0.4 and abs(self.x - next_cell[1]) < 0.4:
-                        self._committed_path.pop(0)
-                        if self._committed_path:
-                            next_cell = self._committed_path[0]
-                        else:
-                            if active_task.task_type != TaskType.HUNT:
-                                self.cbba_agent.remove_task(active_task)
-                                active_task = None
+                    else:
+                        self.cbba_agent.mark_unreachable(target, self.frame)
+                        self.cbba_agent.remove_task(active_task)
+                        active_task = None
+            if hasattr(self, '_committed_path') and self._committed_path:
+                next_cell = self._committed_path[0]
+                if abs(self.y - next_cell[0]) < 0.4 and abs(self.x - next_cell[1]) < 0.4:
+                    self._committed_path.pop(0)
                     if self._committed_path:
-                        target_y, target_x = next_cell[0], next_cell[1]
-                        dx, dy = target_x - self.x, target_y - self.y
-                        d = math.hypot(dx, dy)
-                        if d > 0:
-                            desired_vx = dx / d
-                            desired_vy = dy / d
-                            moved = True
+                        next_cell = self._committed_path[0]
+                    else:
+                        if active_task.task_type != TaskType.HUNT:
+                            self.cbba_agent.remove_task(active_task)
+                            active_task = None
+                if self._committed_path:
+                    target_y, target_x = next_cell[0], next_cell[1]
+                    dx, dy = target_x - self.x, target_y - self.y
+                    d = math.hypot(dx, dy)
+                    if d > 0:
+                        desired_vx = dx / d
+                        desired_vy = dy / d
+                        moved = True
         if not moved:
             target = None
             if self.pacman_powered:
@@ -411,8 +431,21 @@ class Ghost:
                 hit_fracs = (hit_indices + 1) / n_steps
                 ray_penalties = np.where(has_hit, 1000.0 / hit_fracs, 0.0)
                 interests = 1.5 * (ray_vx_arr * desired_vx + ray_vy_arr * desired_vy)
-                hysteresis = 0.3 * (ray_vx_arr * cur_vx_norm + ray_vy_arr * cur_vy_norm)
-                scores = interests + hysteresis - ray_penalties
+                hysteresis = 0.8 * (ray_vx_arr * cur_vx_norm + ray_vy_arr * cur_vy_norm)
+                peer_penalties = np.zeros(num_rays, dtype=np.float32)
+                if not getattr(self, '_is_striking', False) and all_ghosts:
+                    for ogid, og in all_ghosts.items():
+                        if ogid == self.gid or getattr(og, 'dead', False):
+                            continue
+                        d_peer = math.hypot(og.y - self.y, og.x - self.x)
+                        if d_peer < 1.8:
+                            ux = (og.x - self.x) / max(d_peer, 1e-4)
+                            uy = (og.y - self.y) / max(d_peer, 1e-4)
+                            cos_align = ray_vx_arr * ux + ray_vy_arr * uy
+                            fwd_mask = cos_align > 0.0
+                            if np.any(fwd_mask):
+                                peer_penalties[fwd_mask] += 1.5 * ((1.8 - d_peer) / 1.8) * cos_align[fwd_mask]
+                scores = interests + hysteresis - ray_penalties - peer_penalties
                 best_idx = int(np.argmax(scores))
                 best_vx, best_vy = float(ray_vx_arr[best_idx]), float(ray_vy_arr[best_idx])
                 self._steer_cache = (best_vx, best_vy)
@@ -422,8 +455,12 @@ class Ghost:
                 best_vx, best_vy = getattr(self, '_steer_cache', (desired_vx, desired_vy))
         target_vy = best_vy * self.max_speed * speed_mult
         target_vx = best_vx * self.max_speed * speed_mult
-        smooth_vy = self.vy * 0.7 + target_vy * 0.3
-        smooth_vx = self.vx * 0.7 + target_vx * 0.3
+        if getattr(self, '_is_striking', False):
+            smooth_vy = target_vy
+            smooth_vx = target_vx
+        else:
+            smooth_vy = self.vy * 0.25 + target_vy * 0.75
+            smooth_vx = self.vx * 0.25 + target_vx * 0.75
         smooth_safe = True
         if self.world and hasattr(self.world, 'batch_is_passable'):
             smooth_mag = math.hypot(smooth_vx, smooth_vy)
@@ -730,6 +767,7 @@ class Ghost:
             last = self.prm_last_seen.get(n, -1)
             if last == -1:
                 self.prm_known_count += 1
+                newly_discovered += 1
             else:
                 staleness = min(self.frame - last, 200) / 200.0
                 if staleness > 0.25: stale_refreshed += staleness

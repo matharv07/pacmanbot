@@ -68,9 +68,13 @@ class Env:
         self._cached_htasks: dict[int, list] = {}
         self._cached_full_htasks: dict[int, list] = {}
         self._cached_hdists: dict[int, dict] = {}
+        self._cached_rl_tasks: dict[int, list] = {}
+        self._cached_rl_scores_map: dict[int, np.ndarray] = {}
+        self._cached_rl_speed: dict[int, float] = {}
         self.max_frames = int(world_height * world_width * 2) + 1000
         self._pending_pred = None
         self._stored_predictor_weights = None
+        self._last_emergency_auction_frame: dict[int, int] = {}
 
     def sync_predictor(self, state_dict):
         """Synchronize trained MovementPredictor weights across all active ghosts' belief maps."""
@@ -84,6 +88,7 @@ class Env:
 
     def reset(self):
         self.max_frames = int(self.world_height * self.world_width * 2) + 1000
+        self._last_emergency_auction_frame = {}
         self.grid, self._player_start, self.world = generate_map(
             world_height=self.world_height, world_width=self.world_width, n_power=self.n_power, random_spawn=False, obs_resolution=self.obs_resolution)
         self.player = Player(self.grid, self._player_start, self.world, obs_resolution=self.obs_resolution)
@@ -113,6 +118,9 @@ class Env:
             g.rl_mode = True
             g.cbba_agent.rl_mode = True
         self._prev_pac_dist.clear()
+        self._cached_rl_tasks.clear()
+        self._cached_rl_scores_map.clear()
+        self._cached_rl_speed.clear()
         self.frame = 0
         self._killer_gid = -1
         self.shaper.reset()
@@ -246,32 +254,74 @@ class Env:
         self._last_exec_cand[gid] = slot
 
     def _trigger_emergency_sighting(self, sighting_gid: int, sighting_ghost):
-        """Instantaneous event interrupt: generates HUNT/FLANK tasks and auctions to local peers with zero frame latency."""
-        from allocator import _score_hunt, _get_cutoff_candidates
+        """Instantaneous event interrupt: auctions RL tasks (or heuristic fallback) to local peers with zero frame latency."""
         from pathfinder import dijkstra_multi
+        from cbba import _deduplicate_tasks
         pac_coord = sighting_ghost.known_pacman
         if pac_coord is None:
             return
-        sighting_ghost.cbba_agent.emergency_preempt_explore()
-        hunt_targets = [(round(float(pac_coord[0]), 1), round(float(pac_coord[1]), 1))]
-        for cr, cc in _get_cutoff_candidates(sighting_ghost, pac_coord[0], pac_coord[1]):
-            hunt_targets.append((round(float(cr), 1), round(float(cc), 1)))
         s_pos = (sighting_ghost.y, sighting_ghost.x)
         local_gids = [g.gid for g in self.ghosts.values() if not g.dead and math.hypot(g.y - s_pos[0], g.x - s_pos[1]) <= 18.0]
         if not local_gids:
             local_gids = [sighting_gid]
+        pac_target = (round(float(pac_coord[0]), 1), round(float(pac_coord[1]), 1))
         for lgid in local_gids:
             lg = self.ghosts[lgid]
-            lg.known_pacman = (round(float(pac_coord[0]), 1), round(float(pac_coord[1]), 1))
+            lg.known_pacman = pac_target
             lg.pacman_last_seen = self.frame
-            lg.cbba_agent.emergency_preempt_explore()
-        for lgid in local_gids:
-            lg = self.ghosts[lgid]
-            d_map = dijkstra_multi(lg.world, (lg.y, lg.x), hunt_targets)
-            h_dists = d_map
-            e_tasks = _score_hunt(lg, h_dists, self.frame)
-            if e_tasks:
-                lg.cbba_agent._phase1(lg, e_tasks, h_dists)
+        is_rl = getattr(sighting_ghost, 'rl_mode', False) or any(self.ghosts[g].rl_mode for g in local_gids)
+        if is_rl:
+            from allocator import Task, TaskType, ORIGIN_RL_NOVEL
+            from obs import RL_SCORE_BASE, RL_SCORE_SPAN
+            e_pool = []
+            for lgid in local_gids:
+                e_pool.extend(self._cached_rl_tasks.get(lgid, []))
+                sc_map = self._cached_rl_scores_map.get(lgid)
+                pr_idx = min(max(0, int(round(pac_target[0]))), int(self.world_height * self.obs_resolution) - 1)
+                pc_idx = min(max(0, int(round(pac_target[1]))), int(self.world_width * self.obs_resolution) - 1)
+                conf = float(sc_map[pr_idx, pc_idx]) if (sc_map is not None and 0 <= pr_idx < sc_map.shape[0] and 0 <= pc_idx < sc_map.shape[1]) else 0.8
+                rl_score = RL_SCORE_BASE + RL_SCORE_SPAN * min(1.0, max(0.0, conf))
+                spd = self._cached_rl_speed.get(lgid, 1.0)
+                e_pool.append(Task(task_type=TaskType.HUNT, target_pos=pac_target, score=rl_score,
+                                   assigned_to=-1, created_frame=self.frame, owner=lgid,
+                                   target_speed=spd, origin=ORIGIN_RL_NOVEL))
+            # Lead cutoff task if Pacman has significant velocity
+            p_vy = float(getattr(self.player, 'vy', 0.0))
+            p_vx = float(getattr(self.player, 'vx', 0.0))
+            p_spd = math.hypot(p_vy, p_vx)
+            if p_spd > 0.08:
+                lead_y = round(pac_target[0] + (p_vy / p_spd) * 2.5, 1)
+                lead_x = round(pac_target[1] + (p_vx / p_spd) * 2.5, 1)
+                if self.world.is_passable(lead_x, lead_y, radius=0.35):
+                    for lgid in local_gids:
+                        sc_map = self._cached_rl_scores_map.get(lgid)
+                        lr_idx = min(max(0, int(round(lead_y))), int(self.world_height * self.obs_resolution) - 1)
+                        lc_idx = min(max(0, int(round(lead_x))), int(self.world_width * self.obs_resolution) - 1)
+                        l_conf = float(sc_map[lr_idx, lc_idx]) if (sc_map is not None and 0 <= lr_idx < sc_map.shape[0] and 0 <= lc_idx < sc_map.shape[1]) else 0.8
+                        l_score = RL_SCORE_BASE + RL_SCORE_SPAN * min(1.0, max(0.0, l_conf))
+                        spd = self._cached_rl_speed.get(lgid, 1.0)
+                        e_pool.append(Task(task_type=TaskType.HUNT, target_pos=(lead_y, lead_x), score=l_score * 1.05,
+                                           assigned_to=-1, created_frame=self.frame, owner=lgid,
+                                           target_speed=spd, origin=ORIGIN_RL_NOVEL))
+            deduped_e_tasks = _deduplicate_tasks(e_pool, threshold=1.5)
+            all_targets = [t.target_pos for t in deduped_e_tasks]
+            for lgid in local_gids:
+                lg = self.ghosts[lgid]
+                d_rl = dijkstra_multi(lg.world, (lg.y, lg.x), all_targets) if all_targets else {}
+                if deduped_e_tasks:
+                    lg.cbba_agent._phase1(lg, deduped_e_tasks, d_rl)
+        else:
+            from allocator import _score_hunt
+            sighting_ghost.cbba_agent.emergency_preempt_explore()
+            for lgid in local_gids:
+                self.ghosts[lgid].cbba_agent.emergency_preempt_explore()
+            hunt_targets = [pac_target]
+            for lgid in local_gids:
+                lg = self.ghosts[lgid]
+                h_dists = dijkstra_multi(lg.world, (lg.y, lg.x), hunt_targets)
+                e_tasks = _score_hunt(lg, h_dists, self.frame)
+                if e_tasks:
+                    lg.cbba_agent._phase1(lg, e_tasks, h_dists)
         if len(local_gids) > 1:
             for _ in range(2):
                 payloads = {lgid: self.ghosts[lgid].cbba_agent.get_consensus_payload() for lgid in local_gids}
@@ -339,14 +389,47 @@ class Env:
                     speed = speed_idx_to_mult(speed_val)
                     g.current_speed_mult = speed
                     tasks = actions_to_tasks(g, scores_map, indices, self.frame, target_speed=speed)
+                    self._cached_rl_tasks[gid] = tasks
+                    self._cached_rl_scores_map[gid] = scores_map
+                    self._cached_rl_speed[gid] = speed
                     if tasks:
                         pool_tasks.extend(tasks)
-                for gid in alive:
-                    own_h = list(self._cached_full_htasks.get(gid, self._cached_htasks.get(gid, [])))
-                    if own_h:
-                        pool_tasks.extend(own_h)
+                if want_bc:
+                    for gid in alive:
+                        own_h = list(self._cached_full_htasks.get(gid, self._cached_htasks.get(gid, [])))
+                        if own_h:
+                            pool_tasks.extend(own_h)
                 from cbba import _deduplicate_tasks
                 deduped_pool = _deduplicate_tasks(pool_tasks, threshold=1.5)
+                needed = len(alive) - len(deduped_pool)
+                if needed > 0:
+                    from allocator import Task, TaskType, ORIGIN_RL_NOVEL
+                    existing_targets = [t.target_pos for t in deduped_pool]
+                    aux_targets = []
+                    for gid in alive:
+                        g_aux = self.ghosts[gid]
+                        if hasattr(g_aux, 'belief_map') and hasattr(g_aux.belief_map, 'top_cells'):
+                            top_aux = g_aux.belief_map.top_cells(n=max(4, needed * 2))
+                            for tc in top_aux:
+                                if not any(math.hypot(tc[0] - et[0], tc[1] - et[1]) < 2.5 for et in (existing_targets + aux_targets)):
+                                    aux_targets.append(tc)
+                                    if len(aux_targets) >= needed:
+                                        break
+                        if len(aux_targets) >= needed:
+                            break
+                    if len(aux_targets) < needed:
+                        for gid in alive:
+                            g_aux = self.ghosts[gid]
+                            for n in getattr(g_aux, 'prm_last_seen', {}):
+                                if not any(math.hypot(n[0] - et[0], n[1] - et[1]) < 3.0 for et in (existing_targets + aux_targets)):
+                                    if g_aux.world.is_passable(float(n[1]), float(n[0]), radius=0.35):
+                                        aux_targets.append(n)
+                                        if len(aux_targets) >= needed:
+                                            break
+                            if len(aux_targets) >= needed:
+                                break
+                    for at in aux_targets:
+                        deduped_pool.append(Task(task_type=TaskType.HUNT, target_pos=(float(at[0]), float(at[1])), score=0.6, origin=ORIGIN_RL_NOVEL))
                 from pathfinder import dijkstra_multi
                 all_targets = [t.target_pos for t in deduped_pool]
                 for gid in spatial_gids:
@@ -359,7 +442,7 @@ class Env:
                         g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
                         g.cbba_agent._phase1(g, deduped_pool, h_dists)
                 if any_restruct and len(alive) > 1:
-                    for _ in range(2):
+                    for round_idx in range(2):
                         payloads = {gid: self.ghosts[gid].cbba_agent.get_consensus_payload() for gid in alive}
                         for gid_i in alive:
                             agent_i = self.ghosts[gid_i].cbba_agent
@@ -367,6 +450,15 @@ class Env:
                                 if gid_i != gid_j:
                                     p_j = payloads[gid_j]
                                     agent_i.receive_consensus(gid_j, p_j["y"], p_j["z"], p_j["s"], self.frame, p_j.get("meta"))
+                        if round_idx < 1:
+                            for gid in spatial_gids:
+                                g = self.ghosts[gid]
+                                if len(g.cbba_agent.bundle) == 0:
+                                    h_dists = dict(self._cached_hdists.get(gid, {}))
+                                    if all_targets:
+                                        d_rl = dijkstra_multi(g.world, (g.y, g.x), all_targets)
+                                        h_dists.update(d_rl)
+                                    g.cbba_agent._phase1(g, deduped_pool, h_dists)
                 from cbba import _task_key
                 for gid in spatial_gids:
                     g = self.ghosts[gid]
@@ -427,11 +519,21 @@ class Env:
                     if a_gid in rewards and not self.ghosts[a_gid].dead:
                         rewards[a_gid] -= 0.004 * score_diff
             if not powered_before and getattr(self.player, 'powered', False):
+                from allocator import TaskType
                 for a_gid in alive:
-                    if a_gid in rewards and not self.ghosts[a_gid].dead:
+                    if not self.ghosts[a_gid].dead:
                         g_a = self.ghosts[a_gid]
-                        d_pel = math.hypot(g_a.y - self.player.y, g_a.x - self.player.x)
-                        rewards[a_gid] -= 0.5 + 2.0 * math.exp(-d_pel / 6.0)
+                        g_a.pacman_powered = True
+                        g_a.pacman_power_timer = 40
+                        purge_keys = [k for k in list(g_a.cbba_agent.bundle) if k[0] == TaskType.HUNT]
+                        for pk in purge_keys:
+                            if pk in g_a.cbba_agent.bundle:
+                                g_a.cbba_agent.bundle.remove(pk)
+                            if pk in g_a.cbba_agent.path:
+                                g_a.cbba_agent.path.remove(pk)
+                        if a_gid in rewards:
+                            d_pel = math.hypot(g_a.y - self.player.y, g_a.x - self.player.x)
+                            rewards[a_gid] -= 0.5 + 2.0 * math.exp(-d_pel / 6.0)
             powered = self.player.powered
             new_pac_v = np.array([float(self.player.vy), float(self.player.vx)], dtype=np.float32)
             if self._pending_pred is not None:
@@ -442,12 +544,57 @@ class Env:
                 if ghost.dead:
                     continue
                 has_los = (ghost.known_pacman is not None)
+                from allocator import TaskType
+                cooldown_ok = (self.frame - self._last_emergency_auction_frame.get(gid, -999) >= 4)
+                trigger_emergency = False
+                prev_b_top = getattr(ghost, '_prev_belief_peak', None)
                 if has_los and not getattr(ghost, '_had_los_prev', False) and not powered:
                     if gid in rewards:
                         rewards[gid] += 0.5    #LOS discovery reward
-                    self._trigger_emergency_sighting(gid, ghost)
+                    trigger_emergency = True
+                if not trigger_emergency and has_los and not powered and cooldown_ok:
+                    if hasattr(ghost, 'belief_map') and hasattr(ghost.belief_map, 'predicted_vel'):
+                        pred_vy, pred_vx = ghost.belief_map.predicted_vel
+                        p_vy_cur = float(getattr(self.player, 'vy', 0.0))
+                        p_vx_cur = float(getattr(self.player, 'vx', 0.0))
+                        if math.hypot(p_vy_cur, p_vx_cur) > 0.15:
+                            v_err = math.hypot(p_vy_cur - pred_vy, p_vx_cur - pred_vx)
+                            if v_err >= 0.85:
+                                trigger_emergency = True
+                if not trigger_emergency and has_los and not powered and cooldown_ok:
+                    active_t = ghost.cbba_agent.get_active_task()
+                    if active_t is not None and active_t.task_type == TaskType.HUNT:
+                        d_drift = math.hypot(self.player.y - active_t.target_pos[0], self.player.x - active_t.target_pos[1])
+                        if d_drift >= 3.5:
+                            trigger_emergency = True
+                if not trigger_emergency and getattr(ghost, '_reached_hunt_target_near_pacman', False) and not powered and cooldown_ok:
+                    ghost._reached_hunt_target_near_pacman = False
+                    trigger_emergency = True
                 ghost._had_los_prev = has_los
-                ghost.update((self.player.y, self.player.x), powered, self.ghosts, speed_mult=getattr(ghost, 'current_speed_mult', 1.0))
+                new_disc, stale_ref = ghost.update((self.player.y, self.player.x), powered, self.ghosts, speed_mult=getattr(ghost, 'current_speed_mult', 1.0))
+                if gid in rewards and not powered:
+                    if has_los:
+                        if new_disc > 0:
+                            rewards[gid] += 0.04 * min(new_disc, 3)
+                        if stale_ref > 0.2:
+                            rewards[gid] += 0.008 * min(stale_ref, 1.0)
+                    else:
+                        if new_disc > 0:
+                            rewards[gid] += 0.08 * min(new_disc, 5)
+                        if stale_ref > 0.2:
+                            rewards[gid] += 0.015 * min(stale_ref, 2.0)
+                if hasattr(ghost, 'belief_map') and hasattr(ghost.belief_map, 'top_cells'):
+                    top_c = ghost.belief_map.top_cells(n=1)
+                    cur_b_top = top_c[0] if top_c else None
+                    if not trigger_emergency and not powered and cooldown_ok and prev_b_top is not None and cur_b_top is not None:
+                        d_belief_shift = math.hypot(cur_b_top[0] - prev_b_top[0], cur_b_top[1] - prev_b_top[1])
+                        if d_belief_shift >= 4.5:
+                            trigger_emergency = True
+                    ghost._prev_belief_peak = cur_b_top
+
+                if trigger_emergency:
+                    self._last_emergency_auction_frame[gid] = self.frame
+                    self._trigger_emergency_sighting(gid, ghost)
                 if not powered and not self.player.dead:
                     d_pac = math.hypot(ghost.y - self.player.y, ghost.x - self.player.x)
                     p_vy = float(getattr(self.player, 'vy', 0.0))
@@ -616,10 +763,27 @@ class Env:
                 conv = getattr(self.ghosts[gid], 'power_pellets_converted_this_frame', 0)
                 if conv > 0:
                     rewards[gid] += 2.5 * conv
+                    d_pac_pel = math.hypot(self.ghosts[gid].y - self.player.y, self.ghosts[gid].x - self.player.x)
+                    if d_pac_pel <= 5.0:
+                        rewards[gid] += 3.5 * conv
                     for ogid in alive:
                         if ogid != gid and not self.ghosts[ogid].dead and ogid in rewards:
                             rewards[ogid] += 0.6 * conv
                     self.ghosts[gid].power_pellets_converted_this_frame = 0
+            alive_gids = [g.gid for g in self.ghosts.values() if not g.dead]
+            if len(alive_gids) > 1:
+                for i in range(len(alive_gids)):
+                    for j in range(i + 1, len(alive_gids)):
+                        g_i = self.ghosts[alive_gids[i]]
+                        g_j = self.ghosts[alive_gids[j]]
+                        d_peer = math.hypot(g_i.y - g_j.y, g_i.x - g_j.x)
+                        if d_peer < 0.85:
+                            if not (getattr(g_i, '_is_striking', False) and getattr(g_j, '_is_striking', False)):
+                                p_jam = 0.015 * (1.0 - d_peer / 0.85)
+                                if g_i.gid in rewards:
+                                    rewards[g_i.gid] -= p_jam
+                                if g_j.gid in rewards:
+                                    rewards[g_j.gid] -= p_jam
         pacman_caught = bool(getattr(self.player, "dead", False))
         for gid, g in self.ghosts.items():
             if gid not in rewards:

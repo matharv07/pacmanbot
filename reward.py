@@ -16,7 +16,7 @@ import math
 import numpy as np
 
 class RewardShaper:
-    def __init__(self, alpha=6.0, beta=1.75, gamma_ex=0.005, delta_peak=1.2, delta_spread=1.2, delta_ent=0.6, beta_mesh=0.5, alpha_corner=1.2, beta_disp=0.4, gamma=0.99):
+    def __init__(self, alpha=6.0, beta=1.75, gamma_ex=0.25, delta_peak=1.2, delta_spread=1.2, delta_ent=0.6, beta_mesh=0.5, alpha_corner=1.2, beta_disp=0.4, gamma=0.99):
         """
         Parameters
         ----------

@@ -2,7 +2,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 import ast
-from allocator import TaskType, Task, generate_tasks
+from allocator import TaskType, Task, generate_tasks, ORIGIN_RL_NOVEL
 from pathfinder import astar, leg_cost_belief, ghost_dists
 
 AUCTION_EVERY   = 6      #full auction every 0.6s 
@@ -98,7 +98,7 @@ class CBBA_Agent:
             pac_pos = getattr(ghost, 'known_pacman', None) or getattr(ghost, 'last_lost_pacman', None)
             drop_keys = []
             for k in list(self.bundle):
-                if k[0] in (TaskType.HUNT, TaskType.FLANK):
+                if k[0] == TaskType.HUNT:
                     drop_keys.append(k)
                 elif pac_pos is not None and len(k) >= 2 and isinstance(k[1], (tuple, list)):
                     d_pac = math.hypot(float(k[1][0]) - float(pac_pos[0]), float(k[1][1]) - float(pac_pos[1]))
@@ -159,8 +159,8 @@ class CBBA_Agent:
             self.bundle = [k for k in self.bundle if k != key]
 
     def emergency_preempt_explore(self):
-        """Cleanly strip explore/dynamic search tasks so intercept tasks take immediate priority."""
-        displace = [k for k in list(self.bundle) if k[0] in (TaskType.EXPLORE, TaskType.DYNAMIC)]
+        """Cleanly strip explore tasks so intercept tasks take immediate priority."""
+        displace = [k for k in list(self.bundle) if k[0] == TaskType.EXPLORE]
         for dk in displace:
             if dk in self.bundle:
                 self.bundle.remove(dk)
@@ -208,13 +208,14 @@ class CBBA_Agent:
             owner = t_meta[1] if t_meta else -1
             speed = t_meta[2] if t_meta else 1.0
             rec_score = t_meta[3] if (t_meta and len(t_meta) >= 4) else None
+            rec_origin = t_meta[4] if (t_meta and len(t_meta) >= 5) else (ORIGIN_RL_NOVEL if getattr(self, 'rl_mode', False) else 0)
             if key not in self._task_map:
                 t_type, t_pos = key[0], key[1]
                 if rec_score is not None:
                     score = float(rec_score)
                 else:
                     score = max(y_k.get(key, 0.0), self.y.get(key, 0.0), 0.1)
-                self._task_map[key] = Task(task_type=TaskType(t_type), target_pos=t_pos, score=score, assigned_to=assigned_to, owner=owner, target_speed=speed, created_frame=frame)
+                self._task_map[key] = Task(task_type=TaskType(t_type), target_pos=t_pos, score=score, assigned_to=assigned_to, owner=owner, target_speed=speed, created_frame=frame, origin=rec_origin)
                 self._task_created_frame[key] = frame
             else:
                 existing = self._task_map[key]
@@ -300,9 +301,14 @@ class CBBA_Agent:
                 break 
         kept = set(new_bundle)
         self.bundle = new_bundle
-        #priority displacement: if bundle is full, allow high-priority tasks (HUNT/FLANK) to evict low-priority tasks (EXPLORE/DYNAMIC)
-        while len(self.bundle) >= self.lt:
-            displaceable = [k for k in self.bundle if k[0] in (TaskType.EXPLORE, TaskType.DYNAMIC)]
+        effective_lt = self.lt
+        if getattr(ghost, 'rl_mode', False):
+            effective_lt = 1
+        elif hasattr(ghost, 'known_agents') and ghost.known_agents and len(candidate_tasks) <= (len(ghost.known_agents) + 1):
+            effective_lt = 1
+
+        while len(self.bundle) >= effective_lt:
+            displaceable = [k for k in self.bundle if k[0] == TaskType.EXPLORE]
             if not displaceable:
                 break
             best_cand_gain = 0.0
@@ -310,7 +316,7 @@ class CBBA_Agent:
                 key = _task_key(task)
                 if key in self.bundle:
                     continue
-                if task.task_type in (TaskType.HUNT, TaskType.FLANK):
+                if task.task_type == TaskType.HUNT:
                     gain, _ = self._marginal_gain(key, ghost)
                     if gain > best_cand_gain:
                         best_cand_gain = gain
@@ -324,9 +330,8 @@ class CBBA_Agent:
                 self._cascade_release()
             else:
                 break
-
         #greedily adding tasks until bundle full or no valid candidate remains
-        while len(self.bundle) < self.lt:
+        while len(self.bundle) < effective_lt:
             best_key = None
             best_gain = 0.0
             best_n = 0
@@ -359,21 +364,20 @@ class CBBA_Agent:
             return 0.0, 0
         if self._unreachable_cache.get(task.target_pos, -1) > ghost.frame:
             return 0.0, 0
-        #distance horizon gate: distant ghosts should not abandon quadrant for remote peer hunt/cutoff tasks unless explicitly designated (assigned_to == ghost.gid) or self-owned
-        if task.task_type in (TaskType.HUNT, TaskType.FLANK) and task.assigned_to != ghost.gid:
+        #distance horizon gate: distant ghosts should not abandon quadrant for remote peer hunt tasks unless explicitly designated (assigned_to == ghost.gid) or self-owned
+        if task.task_type == TaskType.HUNT and task.assigned_to != ghost.gid:
             if task.owner != ghost.gid and task.owner != -1:
                 tgt = task.target_pos
                 cache_key = (round(float(tgt[0]), 2), round(float(tgt[1]), 2))
                 d_tgt = self._dist_cache.get(cache_key)
                 if d_tgt is None:
                     d_tgt = math.hypot(ghost.y - tgt[0], ghost.x - tgt[1])
-                horizon = 22.0
+                horizon = 35.0
                 if hasattr(ghost, 'world') and ghost.world is not None:
                     dim = max(getattr(ghost.world, 'height', 20), getattr(ghost.world, 'width', 20))
-                    horizon = max(22.0, dim * 0.65)
-                if d_tgt > horizon:
+                    horizon = max(35.0, dim * 1.5)
+                if not getattr(ghost, 'rl_mode', False) and d_tgt > horizon:
                     return 0.0, 0
-
         s_old = self._path_score(self.path, ghost)
         best_gain = -math.inf
         best_n = 0

@@ -160,17 +160,6 @@ def _score_hunt(ghost, dists: dict, frame: int) -> list[Task]:
         if threat is not None and dist < PELLET_THREAT_HOLD:
             score *= PELLET_THREAT_DAMP
         tasks.append(Task(task_type=TaskType.HUNT, target_pos=(pr_r, pc_r), score=score, assigned_to=-1, created_frame=frame, owner=ghost.gid, target_speed=1.0))
-        if is_primary:
-            for cr, cc in _get_cutoff_candidates(ghost, pr, pc):
-                cr_r, cc_r = round(float(cr), 1), round(float(cc), 1)
-                cutoff_info = _lookup_dist(dists, (cr, cc))
-                if cutoff_info and cutoff_info[0] != math.inf:
-                    c_dist = cutoff_info[0]
-                    cutoff_score = (1.2 + 2.0 * _dist_score(c_dist, HUNT_SCALE) + 2.5 * math.exp(-c_dist / 6.0)) * conf
-                    if threat is not None and c_dist < PELLET_THREAT_HOLD:
-                        cutoff_score *= PELLET_THREAT_DAMP
-                    #multi-directional flank task: assigned_to = -1 so CBBA bids purely on agent distance & positioning
-                    tasks.append(Task(task_type=TaskType.FLANK, target_pos=(cr_r, cc_r), score=1.15 * cutoff_score, assigned_to=-1, created_frame=frame, owner=ghost.gid, target_speed=1.0))
     return tasks
 
 def _score_convert(ghost, dists: dict, frame: int) -> List[Task]:
@@ -346,16 +335,10 @@ def generate_tasks(ghost, frame: int) -> tuple[List[Task], dict]:
         if pac_pos is not None:
             pr, pc = float(pac_pos[0]), float(pac_pos[1])
             targets.add((pr, pc))
-            for cr, cc in _get_cutoff_candidates(ghost, pr, pc):
-                targets.add((cr, cc))
         elif hasattr(ghost, 'belief_map') and ghost.belief_map is not None:
             top = ghost.belief_map.top_cells(n=3)
             for cell in top:
                 targets.add((float(cell[0]), float(cell[1])))
-            if top:
-                pr, pc = float(top[0][0]), float(top[0][1])
-                for cr, cc in _get_cutoff_candidates(ghost, pr, pc):
-                    targets.add((cr, cc))
     for p in getattr(ghost, 'known_power_pellets', []):
         targets.add((p[1], p[0]))
     explore_tasks = _score_explore(ghost, frame)

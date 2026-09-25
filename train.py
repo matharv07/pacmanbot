@@ -51,7 +51,7 @@ MICRO_BATCH         = int(os.environ.get("MICRO_BATCH", "1024"))
 ROLLOUT_INFER_CHUNK = int(os.environ.get("ROLLOUT_INFER_CHUNK", "1024"))
 _eff_infer_chunk = ROLLOUT_INFER_CHUNK
 _eff_micro_batch = MICRO_BATCH
-PPO_EPOCHS      = int(os.environ.get("PPO_EPOCHS", "4"))
+PPO_EPOCHS      = int(os.environ.get("PPO_EPOCHS", "2"))
 GAMMA           = 0.985
 GAE_LAMBDA      = 0.96
 CLIP_EPS        = 0.20
@@ -65,7 +65,7 @@ VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 1.2e-4
 LR_CRITIC       = 2.5e-4
-STAGE_BC_INIT   = [s.bc_init for s in STAGES]
+STAGE_BC_INIT   = [0.0] * len(STAGES) if os.environ.get("NO_BC", "0") == "1" else [s.bc_init for s in STAGES]
 BC_FLOOR        = 0.0
 SPATIAL_BC_W    = float(os.environ.get("SPATIAL_BC_W", "1.0"))
 K_WAYPOINTS     = 3
@@ -73,11 +73,11 @@ LOG_DIR         = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file_
 CKPT_DIR        = os.environ.get("CKPT_DIR", os.path.join(os.path.dirname(__file__), "checkpoints"))
 BC_HOLD_UPDATES   = int(os.environ.get("BC_HOLD_UPDATES", "60"))
 BC_ANNEAL_UPDATES = int(os.environ.get("BC_ANNEAL_UPDATES", "150"))
-TARGET_KL       = float(os.environ.get("TARGET_KL", "0.020"))  
+TARGET_KL       = float(os.environ.get("TARGET_KL", "0.080"))  
 KL_EMA_ALPHA    = 0.5
 KL_LR_STEP      = 1.10
 LR_WARMUP_UPDATES = 10
-KL_LR_SCALE_BOUNDS = (0.40, float(os.environ.get("KL_LR_MAX", "1.25")))
+KL_LR_SCALE_BOUNDS = (0.20, float(os.environ.get("KL_LR_MAX", "1.25")))
 METRIC_WINDOW = int(os.environ.get("METRIC_WINDOW", "20"))
 PRINT_INTERVAL = int(os.environ.get("PRINT_INTERVAL", "10"))
 CURRICULUM_START_STAGE = int(os.environ.get("STAGE", os.environ.get("CURRICULUM_START_STAGE", "0")))
@@ -437,7 +437,14 @@ def train():
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(CKPT_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, "metrics.jsonl")
-    if "--resume" not in sys.argv and os.path.exists(log_path):
+    specific_ckpt = None
+    for i, arg in enumerate(sys.argv):
+        if arg in ("--ckpt", "-c") and i + 1 < len(sys.argv):
+            specific_ckpt = sys.argv[i + 1]
+        elif arg.startswith("--ckpt="):
+            specific_ckpt = arg.split("=")[1]
+    is_resuming = ("--resume" in sys.argv or specific_ckpt is not None)
+    if not is_resuming and os.path.exists(log_path):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         archived_path = os.path.join(LOG_DIR, f"metrics_{ts}.jsonl")
         try:
@@ -497,10 +504,15 @@ def train():
     roll_pac   = collections.deque(maxlen=METRIC_WINDOW)
     kl_ema       = None   #EMA of measured approx_kl driving the LR controller
     ent_coef     = ENT_COEF_INIT
-    if "--resume" in sys.argv:
-        ckpts = sorted(glob.glob(os.path.join(CKPT_DIR, "ckpt_*.pt")), key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[1]))
-        if ckpts:
-            ckpt_path = ckpts[-1]
+    if is_resuming:
+        ckpt_path = None
+        if specific_ckpt and os.path.exists(specific_ckpt):
+            ckpt_path = specific_ckpt
+        else:
+            ckpts = sorted(glob.glob(os.path.join(CKPT_DIR, "ckpt_*.pt")), key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[1]))
+            if ckpts:
+                ckpt_path = ckpts[-1]
+        if ckpt_path:
             print(f"Resuming from {ckpt_path} ...")
             ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
             actor_loaded_cleanly = False
@@ -573,9 +585,16 @@ def train():
             total_steps  = ckpt.get("total_steps", ckpt["update"] * ROLLOUT_STEPS * NUM_ENVS)
             ema_return   = ckpt.get("ema_return", 0.0)
             bc_decay_step = ckpt.get("bc_decay_step", 0)
-            kl_lr_scale  = ckpt.get("kl_lr_scale", 1.0)
-            kl_ema       = ckpt.get("kl_ema", None)
-            ent_coef     = ckpt.get("ent_coef", ENT_COEF_INIT)
+            if os.environ.get("RESET_KL", "1") == "1":
+                kl_lr_scale = 1.0
+                kl_ema = None
+            else:
+                kl_lr_scale  = ckpt.get("kl_lr_scale", 1.0)
+                kl_ema       = ckpt.get("kl_ema", None)
+            if os.environ.get("RESET_ENT", "1") == "1":
+                ent_coef = ENT_COEF_INIT
+            else:
+                ent_coef     = ckpt.get("ent_coef", ENT_COEF_INIT)
             if requested_stage is None and not advance_stage_requested:
                 critic_warmup_remaining = CRITIC_WARMUP_RESUME
             if "rng_state" in ckpt:
@@ -785,7 +804,7 @@ def train():
                 metrics["n_batches"]  += 1
                 epoch_kls.append(mb_approx_kl)
             epoch_mean_kl = float(np.mean(epoch_kls)) if epoch_kls else 0.0
-            if epoch_mean_kl > 1.2 * TARGET_KL:
+            if epoch_mean_kl > 2.0 * TARGET_KL:
                 break
         t_ppo = time.time() - t_ppo_start
         if critic_warmup_remaining > 0:
@@ -799,7 +818,7 @@ def train():
     _stage_start_update = max(0, start_update - getattr(curriculum, '_updates_in_stage', 0))
     if 'exec_since' not in locals():
         exec_since = 0      #updates in this stage during which picks were allowed to execute (drives the anneal)
-    for update in range(start_update, max_updates):
+    for update in range(start_update, max_updates + 1):
         updates_in_stage = update - _stage_start_update
         if curriculum.stage_idx == 0 and is_static_pac:
             win_hist = list(curriculum._kill_history)

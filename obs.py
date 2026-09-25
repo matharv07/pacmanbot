@@ -151,6 +151,15 @@ def build_spatial(ghost, recent_noms: np.ndarray, rows: int, cols: int, obs_reso
     if target is not None:
         tr, tc = target
         _place_blob(out[7], float(tr), float(tc), rows, cols, obs_resolution)
+        pac_v = getattr(ghost, '_prev_pac_dir', None)
+        if pac_v is None and hasattr(ghost, 'belief_map') and hasattr(ghost.belief_map, 'predicted_vel'):
+            pac_v = ghost.belief_map.predicted_vel
+        if pac_v is not None and isinstance(pac_v, (tuple, list)) and len(pac_v) >= 2:
+            v_mag = math.hypot(float(pac_v[0]), float(pac_v[1]))
+            if v_mag > 0.05:
+                lead_r = float(tr + (float(pac_v[0]) / v_mag) * 1.5)
+                lead_c = float(tc + (float(pac_v[1]) / v_mag) * 1.5)
+                _place_blob(out[7], lead_r, lead_c, rows, cols, obs_resolution, scale=0.5)
     for gid in range(MAX_GHOSTS):
         if gid == ghost.gid:
             continue
@@ -422,21 +431,14 @@ def actions_to_tasks(ghost, cand_scores, cand_picks, frame: int, obs_resolution:
             world_x = (float(c) + 0.5) / obs_resolution
             if hasattr(ghost, 'world') and not ghost.world.is_passable(world_x, world_y, radius=0.35):
                 continue
-            if getattr(ghost, 'pacman_powered', False) and target is not None:
-                d_pac = math.hypot(world_y - float(target[0]), world_x - float(target[1]))
-                if d_pac < 10.0:
-                    continue
             conf = min(1.0, max(0.0, float(scores_arr[r, c])))
             score = RL_SCORE_BASE + RL_SCORE_SPAN * conf
             power_pellets = getattr(ghost, 'known_power_pellets', None) or []
             is_power = any(abs(world_y - p[1]) < 0.5 and abs(world_x - p[0]) < 0.5 for p in power_pellets)
-            near_belief = any((abs(world_y - bc[0]) + abs(world_x - bc[1])) <= 3.0 for bc in bm_top)
             if is_power:
                 tt = TaskType.CONVERT
-            elif (target is not None and (abs(world_y - target[0]) + abs(world_x - target[1])) <= 3.0) or near_belief:
-                tt = TaskType.HUNT
             else:
-                tt = TaskType.DYNAMIC
+                tt = TaskType.HUNT
             tasks.append(Task(task_type=tt, target_pos=(world_y, world_x), score=score, created_frame=frame,
                               owner=-1, assigned_to=-1, target_speed=target_speed, origin=ORIGIN_RL_NOVEL))
     elif scores_arr.ndim == 1:

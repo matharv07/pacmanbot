@@ -894,8 +894,7 @@ class Game:
                         g = self.ghosts[gid]
                         indices = [(int(x // C), int(x % C)) for x in idx_np[i]]
                         rl_tasks = actions_to_tasks(g, sc_np[i], indices, self.frame_counter, target_speed=g.current_speed_mult)
-                        own_h = list(h_all_cands.get(gid, []))
-                        all_t = rl_tasks + own_h
+                        all_t = rl_tasks
                         dists = dict(h_dists_all.get(gid, {}))
                         if rl_tasks:
                             rl_targets = [t.target_pos for t in rl_tasks]
