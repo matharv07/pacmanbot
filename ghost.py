@@ -162,23 +162,23 @@ class Ghost:
             self._check_oscillation()
             return newly_discovered, stale_refreshed
         active_task = self.cbba_agent.step(self, self.frame)
-        if self.pacman_powered and not getattr(self, 'rl_mode', False):
+        if self.pacman_powered:
             pac_danger_pos = self.known_pacman or self.last_lost_pacman
             drop_keys = []
             for k in list(self.cbba_agent.bundle):
-                if k[0] == TaskType.HUNT:
-                    drop_keys.append(k)
-                elif pac_danger_pos is not None:
-                    t_obj = self.cbba_agent._task_map.get(k)
-                    if t_obj is not None and math.hypot(t_obj.target_pos[0] - pac_danger_pos[0], t_obj.target_pos[1] - pac_danger_pos[1]) < 8.0:
+                t_obj = self.cbba_agent._task_map.get(k)
+                if t_obj is not None and pac_danger_pos is not None:
+                    if math.hypot(t_obj.target_pos[0] - pac_danger_pos[0], t_obj.target_pos[1] - pac_danger_pos[1]) < 8.0:
                         drop_keys.append(k)
+                elif k[0] == TaskType.HUNT and pac_danger_pos is None:
+                    drop_keys.append(k)
             for dk in drop_keys:
                 if dk in self.cbba_agent.bundle:
                     self.cbba_agent.bundle.remove(dk)
                 if dk in self.cbba_agent.path:
                     self.cbba_agent.path.remove(dk)
             active_task = self.cbba_agent.get_active_task()
-        if not self.pacman_powered and self.known_pacman is not None and not getattr(self, 'rl_mode', False):
+        if not self.pacman_powered and self.known_pacman is not None:
             if active_task is not None and active_task.task_type in (TaskType.EXPLORE, TaskType.DYNAMIC):
                 self.cbba_agent.emergency_preempt_explore()
                 active_task = self.cbba_agent.get_active_task()
@@ -206,8 +206,8 @@ class Ghost:
         moved = False
         dist_pac = 999.0
         self._is_striking = False
-        #Terminal Evasion: actively flee away from powered Pacman when nearby (heuristics only)
-        if not moved and self.pacman_powered and not getattr(self, 'rl_mode', False):
+        #Terminal Evasion: actively flee away from powered Pacman when nearby
+        if not moved and self.pacman_powered:
             pac_target = self.known_pacman or self.last_lost_pacman
             if pac_target is None and hasattr(self, 'belief_map') and self.belief_map is not None:
                 top = self.belief_map.top_cells(n=1)
@@ -308,9 +308,13 @@ class Ghost:
                     self._committed_path = []
                     d_target = math.hypot(self.y - target[0], self.x - target[1])
                     if d_target < 1.0:
-                        if active_task.task_type != TaskType.HUNT:
+                        pac_close = (not self.pacman_powered and self.known_pacman is not None and math.hypot(self.known_pacman[0] - self.y, self.known_pacman[1] - self.x) <= 3.0)
+                        if not pac_close:
                             self.cbba_agent.remove_task(active_task)
                             active_task = None
+                        else:
+                            self._committed_target = self.known_pacman
+                            self._committed_path = []
                     else:
                         self.cbba_agent.mark_unreachable(target, self.frame)
                         self.cbba_agent.remove_task(active_task)
@@ -322,9 +326,13 @@ class Ghost:
                     if self._committed_path:
                         next_cell = self._committed_path[0]
                     else:
-                        if active_task.task_type != TaskType.HUNT:
+                        pac_close = (not self.pacman_powered and self.known_pacman is not None and math.hypot(self.known_pacman[0] - self.y, self.known_pacman[1] - self.x) <= 3.0)
+                        if not pac_close:
                             self.cbba_agent.remove_task(active_task)
                             active_task = None
+                        else:
+                            self._committed_target = self.known_pacman
+                            self._committed_path = []
                 if self._committed_path:
                     target_y, target_x = next_cell[0], next_cell[1]
                     dx, dy = target_x - self.x, target_y - self.y
@@ -445,7 +453,18 @@ class Ghost:
                             fwd_mask = cos_align > 0.0
                             if np.any(fwd_mask):
                                 peer_penalties[fwd_mask] += 1.5 * ((1.8 - d_peer) / 1.8) * cos_align[fwd_mask]
-                scores = interests + hysteresis - ray_penalties - peer_penalties
+                power_bonus = np.zeros(num_rays, dtype=np.float32)
+                if not self.pacman_powered and getattr(self, 'known_power_pellets', None):
+                    for ppx, ppy in self.known_power_pellets:
+                        d_pp = math.hypot(ppy - self.y, ppx - self.x)
+                        if d_pp < 2.5:
+                            ux = (ppx - self.x) / max(d_pp, 1e-4)
+                            uy = (ppy - self.y) / max(d_pp, 1e-4)
+                            cos_align = ray_vx_arr * ux + ray_vy_arr * uy
+                            fwd_mask = cos_align > 0.0
+                            if np.any(fwd_mask):
+                                power_bonus[fwd_mask] += 1.8 * ((2.5 - d_pp) / 2.5) * cos_align[fwd_mask]
+                scores = interests + hysteresis + power_bonus - ray_penalties - peer_penalties
                 best_idx = int(np.argmax(scores))
                 best_vx, best_vy = float(ray_vx_arr[best_idx]), float(ray_vy_arr[best_idx])
                 self._steer_cache = (best_vx, best_vy)

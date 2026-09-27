@@ -96,9 +96,10 @@ class CBBA_Agent:
                     self._last_auction = -1  #trigger auction re-evaluation to adopt orphaned task immediately
         if getattr(ghost, 'pacman_powered', False):
             pac_pos = getattr(ghost, 'known_pacman', None) or getattr(ghost, 'last_lost_pacman', None)
+            is_rl = getattr(ghost, 'rl_mode', False) or getattr(self, 'rl_mode', False)
             drop_keys = []
             for k in list(self.bundle):
-                if k[0] == TaskType.HUNT:
+                if not is_rl and k[0] == TaskType.HUNT:
                     drop_keys.append(k)
                 elif pac_pos is not None and len(k) >= 2 and isinstance(k[1], (tuple, list)):
                     d_pac = math.hypot(float(k[1][0]) - float(pac_pos[0]), float(k[1][1]) - float(pac_pos[1]))

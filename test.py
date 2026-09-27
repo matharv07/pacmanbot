@@ -198,7 +198,7 @@ def main():
         sys.exit(1)
     n_games     = args.n
     chunk_sz    = min(args.chunk, n_games)
-    max_workers = args.workers or os.cpu_count() or 4
+    max_workers = args.workers or max(1, (os.cpu_count() or 4) - 2)
     tasks = []
     for ckpt_path in ckpt_paths:
         n_chunks = max(1, n_games // chunk_sz)

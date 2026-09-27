@@ -19,16 +19,15 @@ SPEED_FLOOR  = float(__import__("os").environ.get("SPEED_FLOOR", "0.0"))
 def speed_to_mult(val) -> float:
     if isinstance(val, torch.Tensor):
         val = val.item()
-    if isinstance(val, (int, np.integer)) and val in (0, 1, 2):
-        return [1.0, 0.88, 0.75][val]
     try:
-        return float(np.clip(float(val), 0.0, 1.0))
+        f = float(val)
+        return float(np.clip(0.85 + f * 0.35, 0.85, 1.20))
     except Exception:
         return 1.0
 
 def mult_to_throttle(mult):
     try:
-        return float(np.clip(float(mult), 0.0, 1.0))
+        return float(np.clip((float(mult) - 0.85) / 0.35, 0.0, 1.0))
     except Exception:
         return 1.0
 

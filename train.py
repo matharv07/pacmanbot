@@ -36,6 +36,11 @@ os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
 os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
 torch.set_num_threads(1)
+try:
+    import cv2
+    cv2.setNumThreads(1)
+except Exception:
+    pass
 SEED = os.environ.get("SEED")
 if SEED is not None:
     random.seed(int(SEED)); np.random.seed(int(SEED)); torch.manual_seed(int(SEED))
@@ -44,7 +49,7 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-NUM_ENVS            = int(os.environ.get("NUM_ENVS", "16"))
+NUM_ENVS            = int(os.environ.get("NUM_ENVS", "14"))
 ROLLOUT_STEPS       = int(os.environ.get("ROLLOUT_STEPS", "256"))
 MINI_BATCH          = int(os.environ.get("MINI_BATCH", "2048"))
 MICRO_BATCH         = int(os.environ.get("MICRO_BATCH", "1024"))
@@ -56,10 +61,10 @@ GAMMA           = 0.985
 GAE_LAMBDA      = 0.96
 CLIP_EPS        = 0.20
 ENT_COEF_INIT   = float(os.environ.get("ENT_COEF_INIT", "0.01"))
-ENT_TARGET      = float(os.environ.get("ENT_TARGET", "0.70"))
-ENT_TARGET_END  = float(os.environ.get("ENT_TARGET_END", "0.25"))
+ENT_TARGET      = float(os.environ.get("ENT_TARGET", "1.20"))
+ENT_TARGET_END  = float(os.environ.get("ENT_TARGET_END", "0.60"))
 ENT_DECAY_UPDATES = int(os.environ.get("ENT_DECAY_UPDATES", "300"))
-ENT_COEF_BOUNDS = (0.001, 0.2)
+ENT_COEF_BOUNDS = (0.005, 0.2)
 ENT_COEF_STEP   = 1.10
 VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
@@ -73,11 +78,11 @@ LOG_DIR         = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file_
 CKPT_DIR        = os.environ.get("CKPT_DIR", os.path.join(os.path.dirname(__file__), "checkpoints"))
 BC_HOLD_UPDATES   = int(os.environ.get("BC_HOLD_UPDATES", "60"))
 BC_ANNEAL_UPDATES = int(os.environ.get("BC_ANNEAL_UPDATES", "150"))
-TARGET_KL       = float(os.environ.get("TARGET_KL", "0.080"))  
+TARGET_KL       = float(os.environ.get("TARGET_KL", "0.140"))  
 KL_EMA_ALPHA    = 0.5
 KL_LR_STEP      = 1.10
 LR_WARMUP_UPDATES = 10
-KL_LR_SCALE_BOUNDS = (0.20, float(os.environ.get("KL_LR_MAX", "1.25")))
+KL_LR_SCALE_BOUNDS = (0.50, float(os.environ.get("KL_LR_MAX", "1.25")))
 METRIC_WINDOW = int(os.environ.get("METRIC_WINDOW", "20"))
 PRINT_INTERVAL = int(os.environ.get("PRINT_INTERVAL", "10"))
 CURRICULUM_START_STAGE = int(os.environ.get("STAGE", os.environ.get("CURRICULUM_START_STAGE", "0")))
@@ -259,6 +264,8 @@ def _worker(env_id, conn, rows, cols, n_ghosts, n_power, static_pacman=False, pa
     os.environ['NUMEXPR_NUM_THREADS'] = '1'
     try:
         torch.set_num_threads(1)
+        import cv2
+        cv2.setNumThreads(1)
     except Exception:
         pass
     try:

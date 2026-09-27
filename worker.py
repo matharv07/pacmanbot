@@ -301,8 +301,7 @@ class Env:
                         l_score = RL_SCORE_BASE + RL_SCORE_SPAN * min(1.0, max(0.0, l_conf))
                         spd = self._cached_rl_speed.get(lgid, 1.0)
                         e_pool.append(Task(task_type=TaskType.HUNT, target_pos=(lead_y, lead_x), score=l_score * 1.05,
-                                           assigned_to=-1, created_frame=self.frame, owner=lgid,
-                                           target_speed=spd, origin=ORIGIN_RL_NOVEL))
+                                           assigned_to=-1, created_frame=self.frame, owner=lgid, target_speed=spd, origin=ORIGIN_RL_NOVEL))
             deduped_e_tasks = _deduplicate_tasks(e_pool, threshold=1.5)
             all_targets = [t.target_pos for t in deduped_e_tasks]
             for lgid in local_gids:
@@ -346,11 +345,12 @@ class Env:
                     g.current_speed_mult = speed_idx_to_mult(speed_val)
                     g.rl_mode = True
                     self.recent_nom[gid] *= NOM_DECAY
+                    pitch = scores_map.shape[-1] if (isinstance(scores_map, np.ndarray) and scores_map.ndim >= 2) else C
                     for item in indices:
                         if isinstance(item, (tuple, list)) and len(item) >= 2:
                             r, c = int(item[0]), int(item[1])
                         else:
-                            r, c = int(item) // C, int(item) % C
+                            r, c = int(item) // pitch, int(item) % pitch
                         if 0 <= r < R and 0 <= c < C:
                             self.recent_nom[gid][r, c] = 1.0
                 elif len(act_data) >= 5:
@@ -417,6 +417,12 @@ class Env:
                                         break
                         if len(aux_targets) >= needed:
                             break
+                    if len(aux_targets) < needed and not self.player.powered and getattr(self.world, 'power_pellets', None):
+                        for ppx, ppy in self.world.power_pellets:
+                            if not any(math.hypot(ppy - et[0], ppx - et[1]) < 2.0 for et in (existing_targets + aux_targets)):
+                                aux_targets.append((ppy, ppx))
+                                if len(aux_targets) >= needed:
+                                    break
                     if len(aux_targets) < needed:
                         for gid in alive:
                             g_aux = self.ghosts[gid]
@@ -441,7 +447,8 @@ class Env:
                     if any_restruct or g.cbba_agent.get_active_task() is None:
                         g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
                         g.cbba_agent._phase1(g, deduped_pool, h_dists)
-                if any_restruct and len(alive) > 1:
+                ran_any_phase1 = any_restruct or any(self.ghosts[gid].cbba_agent.get_active_task() is None for gid in spatial_gids)
+                if ran_any_phase1 and len(alive) > 1:
                     for round_idx in range(2):
                         payloads = {gid: self.ghosts[gid].cbba_agent.get_consensus_payload() for gid in alive}
                         for gid_i in alive:
@@ -524,8 +531,9 @@ class Env:
                     if not self.ghosts[a_gid].dead:
                         g_a = self.ghosts[a_gid]
                         g_a.pacman_powered = True
-                        g_a.pacman_power_timer = 40
-                        purge_keys = [k for k in list(g_a.cbba_agent.bundle) if k[0] == TaskType.HUNT]
+                        pac_y, pac_x = float(self.player.y), float(self.player.x)
+                        purge_keys = [k for k in list(g_a.cbba_agent.bundle)
+                                      if (not getattr(g_a, 'rl_mode', False) and k[0] == TaskType.HUNT) or (len(k) >= 2 and isinstance(k[1], (tuple, list)) and math.hypot(float(k[1][0]) - pac_y, float(k[1][1]) - pac_x) < 10.0)]
                         for pk in purge_keys:
                             if pk in g_a.cbba_agent.bundle:
                                 g_a.cbba_agent.bundle.remove(pk)

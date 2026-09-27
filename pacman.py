@@ -861,13 +861,27 @@ class Game:
                     m = build_valid_mask(g, R, C, obs_resolution=1.0, spatial_walls=s[0])
                     return gid, all_tasks, dists, s, v, m
 
+                def _pad_spatial(arr, target_h, target_w):
+                    h, w = arr.shape[-2], arr.shape[-1]
+                    if h == target_h and w == target_w:
+                        return arr
+                    out = np.zeros(arr.shape[:-2] + (target_h, target_w), dtype=arr.dtype)
+                    out[..., :h, :w] = arr
+                    if arr.ndim == 3:
+                        out[0, h:, :] = 1.0
+                        out[0, :, w:] = 1.0
+                    elif arr.ndim == 2:
+                        out[h:, :] = 1.0
+                        out[:, w:] = 1.0
+                    return out
+
                 results = list(self.executor.map(_build_obs_task, alive))
                 for gid, all_tasks, dists, s, v, m in results:
                     h_all_cands[gid] = all_tasks
                     h_dists_all[gid] = dists
-                    sp.append(s)
+                    sp.append(_pad_spatial(s, MAX_H, MAX_W))
                     ve.append(v)
-                    vm.append(m)
+                    vm.append(_pad_spatial(m, MAX_H, MAX_W))
                 if alive:
                     t_sp = torch.tensor(np.stack(sp), device=RL_DEVICE, dtype=torch.float32)
                     t_ve = torch.tensor(np.stack(ve), device=RL_DEVICE, dtype=torch.float32)
@@ -884,32 +898,77 @@ class Game:
                         g.current_rl_dir = None
                         g.rl_hijack = False
                         g.rl_mode = True
-                        indices = [(int(x // C), int(x % C)) for x in idx_np[i]]
+                        indices = [(int(x // MAX_W), int(x % MAX_W)) for x in idx_np[i] if int(x // MAX_W) < R and int(x % MAX_W) < C]
                         self.recent_nom[gid] *= 0.8
                         for r_m, c_m in indices:
                             if 0 <= r_m < R and 0 <= c_m < C:
                                 self.recent_nom[gid][r_m, c_m] = 1.0
-                    self._pending_auction = {}
+                    pool_tasks = []
                     for i, gid in enumerate(alive):
                         g = self.ghosts[gid]
-                        indices = [(int(x // C), int(x % C)) for x in idx_np[i]]
+                        indices = [(int(x // MAX_W), int(x % MAX_W)) for x in idx_np[i] if int(x // MAX_W) < R and int(x % MAX_W) < C]
                         rl_tasks = actions_to_tasks(g, sc_np[i], indices, self.frame_counter, target_speed=g.current_speed_mult)
-                        all_t = rl_tasks
-                        dists = dict(h_dists_all.get(gid, {}))
                         if rl_tasks:
-                            rl_targets = [t.target_pos for t in rl_tasks]
-                            from pathfinder import dijkstra_multi
-                            d_rl = dijkstra_multi(g.world, (g.y, g.x), rl_targets)
-                            dists.update(d_rl)
-                        self._pending_auction[gid] = (all_t, dists)
-        if getattr(self, '_pending_auction', None):
-            for gid in list(self._pending_auction.keys()):
-                if (self.frame_counter + gid) % 6 == 0:
-                    tasks, dists = self._pending_auction.pop(gid)
-                    if gid in self.ghosts and not self.ghosts[gid].dead:
+                            pool_tasks.extend(rl_tasks)
+                    from cbba import _deduplicate_tasks
+                    deduped_pool = _deduplicate_tasks(pool_tasks, threshold=1.5)
+                    needed = len(alive) - len(deduped_pool)
+                    if needed > 0:
+                        from allocator import Task, TaskType, ORIGIN_RL_NOVEL
+                        existing_targets = [t.target_pos for t in deduped_pool]
+                        aux_targets = []
+                        for gid in alive:
+                            g_aux = self.ghosts[gid]
+                            if hasattr(g_aux, 'belief_map') and hasattr(g_aux.belief_map, 'top_cells'):
+                                top_aux = g_aux.belief_map.top_cells(n=max(4, needed * 2))
+                                for tc in top_aux:
+                                    if not any(math.hypot(tc[0] - et[0], tc[1] - et[1]) < 2.5 for et in (existing_targets + aux_targets)):
+                                        aux_targets.append(tc)
+                                        if len(aux_targets) >= needed:
+                                            break
+                            if len(aux_targets) >= needed:
+                                break
+                        if len(aux_targets) < needed and not self.player.powered and getattr(self.world, 'power_pellets', None):
+                            for ppx, ppy in self.world.power_pellets:
+                                if not any(math.hypot(ppy - et[0], ppx - et[1]) < 2.0 for et in (existing_targets + aux_targets)):
+                                    aux_targets.append((ppy, ppx))
+                                    if len(aux_targets) >= needed:
+                                        break
+                        if len(aux_targets) < needed:
+                            for gid in alive:
+                                g_aux = self.ghosts[gid]
+                                for n in getattr(g_aux, 'prm_last_seen', {}):
+                                    if not any(math.hypot(n[0] - et[0], n[1] - et[1]) < 3.0 for et in (existing_targets + aux_targets)):
+                                        if g_aux.world.is_passable(float(n[1]), float(n[0]), radius=0.35):
+                                            aux_targets.append(n)
+                                            if len(aux_targets) >= needed:
+                                                break
+                                if len(aux_targets) >= needed:
+                                    break
+                        for at in aux_targets:
+                            deduped_pool.append(Task(task_type=TaskType.HUNT, target_pos=(float(at[0]), float(at[1])), score=0.6, origin=ORIGIN_RL_NOVEL))
+                    from pathfinder import dijkstra_multi
+                    all_targets = [t.target_pos for t in deduped_pool]
+                    for gid in alive:
                         g = self.ghosts[gid]
+                        d_rl = dijkstra_multi(g.world, (g.y, g.x), all_targets) if all_targets else {}
                         g.cbba_agent._last_auction = self.frame_counter + 6
-                        g.cbba_agent._phase1(g, tasks, dists)
+                        g.cbba_agent._phase1(g, deduped_pool, d_rl)
+                    if len(alive) > 1:
+                        for round_idx in range(2):
+                            payloads = {gid: self.ghosts[gid].cbba_agent.get_consensus_payload() for gid in alive}
+                            for gid_i in alive:
+                                agent_i = self.ghosts[gid_i].cbba_agent
+                                for gid_j in alive:
+                                    if gid_i != gid_j:
+                                        p_j = payloads[gid_j]
+                                        agent_i.receive_consensus(gid_j, p_j["y"], p_j["z"], p_j["s"], self.frame_counter, p_j.get("meta"))
+                            if round_idx < 1:
+                                for gid in alive:
+                                    g = self.ghosts[gid]
+                                    if len(g.cbba_agent.bundle) == 0:
+                                        d_rl = dijkstra_multi(g.world, (g.y, g.x), all_targets) if all_targets else {}
+                                        g.cbba_agent._phase1(g, deduped_pool, d_rl)
         self.player.update(self.ghosts)
         powered = self.player.powered
         for ghost in self.ghosts.values():
