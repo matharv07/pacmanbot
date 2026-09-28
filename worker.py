@@ -15,8 +15,7 @@ from pacman import generate_map, Player, WALL, PELLET, POWER, EMPTY
 from ghost  import Ghost, GHOST_COLORS
 import pathfinder
 from obs import (authoritative_task, MAX_CANDIDATES, build_spatial, build_global_spatial, build_vector, build_valid_mask, build_candidates, select_candidates, flatten_cand_cells,
-                 actions_to_tasks, MAX_H, MAX_W, MAX_GHOSTS, UNKNOWN, SPATIAL_CH, GLOBAL_SPATIAL_CH, VEC_DIM,
-                 MAX_CANDIDATES, CAND_FEAT_DIM)
+                 actions_to_tasks, MAX_H, MAX_W, MAX_GHOSTS, UNKNOWN, SPATIAL_CH, GLOBAL_SPATIAL_CH, VEC_DIM, MAX_CANDIDATES, CAND_FEAT_DIM)
 from reward import RewardShaper
 from allocator import generate_tasks as heuristic_generate_tasks
 from beliefmap import extract_movement_features

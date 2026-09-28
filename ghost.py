@@ -225,18 +225,54 @@ class Ghost:
                         flee_target = find_topological_flee_target_belief(self.belief_map, (self.y, self.x), (pr, pc))
                         self._flee_cache = (self.frame, (pr, pc), flee_target)
                     if flee_target is not None:
-                        path = self.plan_path(flee_target)
-                        if len(path) >= 2:
-                            next_pt = path[1]
-                            dx = next_pt[1] - self.x
-                            dy = next_pt[0] - self.y
-                            d = math.hypot(dx, dy)
-                            if d > 0.01:
-                                desired_vx = dx / d
-                                desired_vy = dy / d
-                                moved = True
+                        replan_flee = False
+                        cur_flee_path = getattr(self, '_committed_path', [])
+                        cur_flee_target = getattr(self, '_committed_target', None)
+                        if not cur_flee_path:
+                            replan_flee = True
+                        elif cur_flee_target is None:
+                            replan_flee = True
+                        elif math.hypot(cur_flee_target[0] - flee_target[0], cur_flee_target[1] - flee_target[1]) > 2.5:
+                            replan_flee = True
+                        elif self.frame - getattr(self, '_last_flee_replan', -999) >= 12:
+                            replan_flee = True
+                        if replan_flee:
+                            path = self.plan_path(flee_target)
+                            if len(path) >= 2:
                                 self._committed_path = path[1:]
                                 self._committed_target = flee_target
+                                self._last_flee_replan = self.frame
+                            else:
+                                self._committed_path = []
+                        if getattr(self, '_committed_path', None):
+                            while self._committed_path:
+                                next_cell = self._committed_path[0]
+                                d_next = math.hypot(self.y - next_cell[0], self.x - next_cell[1])
+                                reached = (d_next < 0.65)
+                                if not reached and len(self._committed_path) >= 2:
+                                    w2 = self._committed_path[1]
+                                    d_w2 = math.hypot(self.y - w2[0], self.x - w2[1])
+                                    cur_speed = math.hypot(self.vx, self.vy)
+                                    if cur_speed > 0.1:
+                                        dot_ahead = (next_cell[1] - self.x) * self.vx + (next_cell[0] - self.y) * self.vy
+                                        if dot_ahead < 0.0 or d_w2 < d_next:
+                                            reached = True
+                                if not reached and self.world and hasattr(self.world, 'is_passable'):
+                                    if not self.world.is_passable(float(next_cell[1]), float(next_cell[0]), radius=self.radius):
+                                        reached = True
+                                if reached:
+                                    self._committed_path.pop(0)
+                                else:
+                                    break
+                            if self._committed_path:
+                                next_pt = self._committed_path[0]
+                                dx = next_pt[1] - self.x
+                                dy = next_pt[0] - self.y
+                                d = math.hypot(dx, dy)
+                                if d > 0.01:
+                                    desired_vx = dx / d
+                                    desired_vy = dy / d
+                                    moved = True
                     if not moved:
                         best_evade_vx, best_evade_vy = 0.0, 0.0
                         best_evade_score = -math.inf
@@ -281,7 +317,7 @@ class Ghost:
                     if has_los and dist_pac > 0.01:
                         desired_vx = (pac_x - self.x) / dist_pac
                         desired_vy = (pac_y - self.y) / dist_pac
-                        speed_mult = 1.0
+                        speed_mult = max(getattr(self, 'current_speed_mult', 1.0), 1.20)
                         self._is_striking = True
                         moved = True
                         if hasattr(self, '_committed_path'):
@@ -322,26 +358,35 @@ class Ghost:
                         self.cbba_agent.remove_task(active_task)
                         active_task = None
             if hasattr(self, '_committed_path') and self._committed_path:
-                next_cell = self._committed_path[0]
-                if abs(self.y - next_cell[0]) < 0.4 and abs(self.x - next_cell[1]) < 0.4:
-                    self._committed_path.pop(0)
-                    if self._committed_path:
-                        next_cell = self._committed_path[0]
+                while self._committed_path:
+                    next_cell = self._committed_path[0]
+                    d_next = math.hypot(self.y - next_cell[0], self.x - next_cell[1])
+                    reached = (d_next < 0.65)
+                    if not reached and len(self._committed_path) >= 2:
+                        w2 = self._committed_path[1]
+                        d_w2 = math.hypot(self.y - w2[0], self.x - w2[1])
+                        cur_speed = math.hypot(self.vx, self.vy)
+                        if cur_speed > 0.1:
+                            dot_ahead = (next_cell[1] - self.x) * self.vx + (next_cell[0] - self.y) * self.vy
+                            if dot_ahead < 0.0 or d_w2 < d_next:
+                                reached = True
+                    if not reached and self.world and hasattr(self.world, 'is_passable'):
+                        if not self.world.is_passable(float(next_cell[1]), float(next_cell[0]), radius=self.radius):
+                            reached = True
+                    if reached:
+                        self._committed_path.pop(0)
                     else:
-                        pac_close = (not self.pacman_powered and self.known_pacman is not None and math.hypot(self.known_pacman[0] - self.y, self.known_pacman[1] - self.x) <= 3.0)
-                        if not pac_close:
-                            self.cbba_agent.remove_task(active_task)
-                            active_task = None
-                        else:
-                            self._committed_target = self.known_pacman
-                            self._committed_path = []
-                elif not self.world.is_passable(float(next_cell[1]), float(next_cell[0]), radius=self.radius):
-                    self._committed_path.pop(0)
-                    if self._committed_path:
-                        next_cell = self._committed_path[0]
+                        break
+                if not self._committed_path:
+                    pac_close = (not self.pacman_powered and self.known_pacman is not None and math.hypot(self.known_pacman[0] - self.y, self.known_pacman[1] - self.x) <= 3.0)
+                    if not pac_close:
+                        self.cbba_agent.remove_task(active_task)
+                        active_task = None
                     else:
+                        self._committed_target = self.known_pacman
                         self._committed_path = []
-                if self._committed_path:
+                else:
+                    next_cell = self._committed_path[0]
                     target_y, target_x = next_cell[0], next_cell[1]
                     dx, dy = target_x - self.x, target_y - self.y
                     d = math.hypot(dx, dy)
@@ -386,12 +431,27 @@ class Ghost:
                     else:
                         self._committed_path = []
                 if getattr(self, '_committed_path', None):
-                    next_cell = self._committed_path[0]
-                    if abs(self.y - next_cell[0]) < 0.4 and abs(self.x - next_cell[1]) < 0.4:
-                        self._committed_path.pop(0)
-                        if self._committed_path:
-                            next_cell = self._committed_path[0]
+                    while self._committed_path:
+                        next_cell = self._committed_path[0]
+                        d_next = math.hypot(self.y - next_cell[0], self.x - next_cell[1])
+                        reached = (d_next < 0.65)
+                        if not reached and len(self._committed_path) >= 2:
+                            w2 = self._committed_path[1]
+                            d_w2 = math.hypot(self.y - w2[0], self.x - w2[1])
+                            cur_speed = math.hypot(self.vx, self.vy)
+                            if cur_speed > 0.1:
+                                dot_ahead = (next_cell[1] - self.x) * self.vx + (next_cell[0] - self.y) * self.vy
+                                if dot_ahead < 0.0 or d_w2 < d_next:
+                                    reached = True
+                        if not reached and self.world and hasattr(self.world, 'is_passable'):
+                            if not self.world.is_passable(float(next_cell[1]), float(next_cell[0]), radius=self.radius):
+                                reached = True
+                        if reached:
+                            self._committed_path.pop(0)
+                        else:
+                            break
                     if self._committed_path:
+                        next_cell = self._committed_path[0]
                         target_y, target_x = next_cell[0], next_cell[1]
                         dx, dy = target_x - self.x, target_y - self.y
                         d = math.hypot(dx, dy)
@@ -471,7 +531,13 @@ class Ghost:
                             fwd_mask = cos_align > 0.0
                             if np.any(fwd_mask):
                                 power_bonus[fwd_mask] += 1.8 * ((2.5 - d_pp) / 2.5) * cos_align[fwd_mask]
-                scores = interests + hysteresis + power_bonus - ray_penalties - peer_penalties
+                cos_des = ray_vx_arr * desired_vx + ray_vy_arr * desired_vy
+                reverse_penalty = np.zeros(num_rays, dtype=np.float32)
+                fwd_passable = np.any((cos_des > 0.0) & (~has_hit))
+                if fwd_passable:
+                    rev_mask = cos_des < -0.25
+                    reverse_penalty[rev_mask] = 3.0 * (-cos_des[rev_mask])
+                scores = interests + hysteresis + power_bonus - ray_penalties - peer_penalties - reverse_penalty
                 best_idx = int(np.argmax(scores))
                 best_vx, best_vy = float(ray_vx_arr[best_idx]), float(ray_vy_arr[best_idx])
                 self._steer_cache = (best_vx, best_vy)

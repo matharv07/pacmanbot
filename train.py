@@ -712,8 +712,8 @@ def train():
                                 mb_gsp_unique = b_gsp_unique[unique_ids]
                                 mb_c_pool = critic.encode_spatial(mb_gsp_unique)
                                 v_pred = critic.forward_from_pool(mb_c_pool[inv_idx], mb_cve)
-
-                                log_ratio = torch.clamp(new_lp - mb_olp, -10.0, 10.0)
+                                k_norm = max(1.0, float(mb_act.shape[1]))
+                                log_ratio = torch.clamp((new_lp - mb_olp) / k_norm, -10.0, 10.0)
                                 ratio = torch.exp(log_ratio)
                                 with torch.no_grad():
                                     clip_fraction = (torch.abs(ratio - 1.0) > CLIP_EPS).float().mean()
@@ -787,7 +787,8 @@ def train():
                 if torch.isfinite(grad_norm_c) and (critic_warmup_remaining > 0 or torch.isfinite(grad_norm_a)):
                     opt_critic.step()
                     if critic_warmup_remaining <= 0:
-                        if mb_approx_kl <= 4.0 * TARGET_KL:
+                        stage_target_kl = getattr(curriculum.stage, 'target_kl', TARGET_KL)
+                        if mb_approx_kl <= 4.0 * stage_target_kl:
                             opt_actor.step()
                         else:
                             opt_actor.zero_grad()
@@ -810,8 +811,9 @@ def train():
                 metrics["grad_norm_c"] = float(grad_norm_c)
                 metrics["n_batches"]  += 1
                 epoch_kls.append(mb_approx_kl)
+            stage_target_kl = getattr(curriculum.stage, 'target_kl', TARGET_KL)
             epoch_mean_kl = float(np.mean(epoch_kls)) if epoch_kls else 0.0
-            if epoch_mean_kl > 2.0 * TARGET_KL:
+            if epoch_mean_kl > 2.0 * stage_target_kl:
                 break
         t_ppo = time.time() - t_ppo_start
         if critic_warmup_remaining > 0:
@@ -1230,8 +1232,11 @@ def train():
         metrics, t_ppo = run_ppo(update, ds_sp, ds_gsp_unique, ds_gsp_ids, ds_ve, ds_cve, ds_vm, ds_ht, ds_hs,
                                   ds_act, ds_spd, ds_res, ds_olp, ds_adv, ds_ret, lam_bc, ret_rms, ent_coef)
         measured_ent = metrics["entropy"] / max(1, metrics["n_batches"])
+        stage_ent_target = getattr(curriculum.stage, 'ent_target', ENT_TARGET)
+        stage_ent_target_end = getattr(curriculum.stage, 'ent_target_end', ENT_TARGET_END)
+        stage_target_kl = getattr(curriculum.stage, 'target_kl', TARGET_KL)
         if actor_stepped:
-            ent_target = ENT_TARGET - (ENT_TARGET - ENT_TARGET_END) * min(1.0, updates_in_stage / max(1, ENT_DECAY_UPDATES))
+            ent_target = stage_ent_target - (stage_ent_target - stage_ent_target_end) * min(1.0, updates_in_stage / max(1, ENT_DECAY_UPDATES))
             if measured_ent < ent_target:
                 ent_coef = min(ENT_COEF_BOUNDS[1], ent_coef * ENT_COEF_STEP)
             else:
@@ -1239,9 +1244,9 @@ def train():
         measured_kl = metrics["approx_kl"] / max(1, metrics["n_batches"])
         if actor_stepped:
             kl_ema = measured_kl if kl_ema is None else (KL_EMA_ALPHA * measured_kl + (1.0 - KL_EMA_ALPHA) * kl_ema)
-            if kl_ema < TARGET_KL / 1.5:
+            if kl_ema < stage_target_kl / 1.5:
                 kl_lr_scale = min(KL_LR_SCALE_BOUNDS[1], kl_lr_scale * KL_LR_STEP)
-            elif kl_ema > TARGET_KL * 1.5:
+            elif kl_ema > stage_target_kl * 1.5:
                 kl_lr_scale = max(KL_LR_SCALE_BOUNDS[0], kl_lr_scale / KL_LR_STEP)
         ret_rms.update(ds_ret)
         actor_rollout.load_state_dict(actor.state_dict())
@@ -1416,7 +1421,8 @@ def train():
                 print(f"├─ STABILITY & OPTIMIZATION ───────────────────────────────────────────────────────────────")
                 warmup_tag = f"  [Critic Warmup: {critic_warmup_remaining} left]" if critic_warmup_remaining > 0 else ""
                 print(f"│  Actor Loss: {row['actor_loss']:>+.5f}{warmup_tag}   Value Loss: {row['value_loss']:.5f}   Expl. Var (EV): {ev_avg:+.2f}")
-                print(f"│  Approx KL: {row['approx_kl']:.4f}   KL EMA: {(round(kl_ema, 4) if kl_ema is not None else 0.0):.4f} (Target: {TARGET_KL:.3f})   Clip Frac: {row['clip_frac']:.1%}")
+                stage_target_kl = getattr(curriculum.stage, 'target_kl', TARGET_KL)
+                print(f"│  Approx KL: {row['approx_kl']:.4f}   KL EMA: {(round(kl_ema, 4) if kl_ema is not None else 0.0):.4f} (Target: {stage_target_kl:.3f})   Clip Frac: {row['clip_frac']:.1%}")
                 print(f"│  LR Scale: {kl_lr_scale:.2f}x   Actor LR: {cur_lr:.2e}   Grad Norms: [Act: {row['grad_norm_a']:.2f}, Crit: {row['grad_norm_c']:.2f}]")
                 print(f"│  Entropy: {row['entropy']:.4f} (coef {ent_coef:.4f})   BC Loss: {row['bc_loss']:.5f} (coef {lam_bc:.4f})")
                 print(f"├─ HUNTING PERFORMANCE & TEAMWORK ────────────────────────────────────────────────────────")
