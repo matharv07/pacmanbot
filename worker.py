@@ -55,6 +55,7 @@ class Env:
         self.world_width  = world_width
         self.obs_resolution = obs_resolution
         self.n_power    = n_power
+        self.kill_time_scale = float(_env.get("KILL_TIME_SCALE", str(max(220.0, (self.world_height + self.world_width) * 8.0))))
         self.grid       = None
         self.player     = None
         self.ghosts: dict[int, Ghost] = {}
@@ -418,10 +419,12 @@ class Env:
                                         break
                         if len(aux_targets) >= needed:
                             break
+                    pellet_targets = set()
                     if len(aux_targets) < needed and not self.player.powered and getattr(self.world, 'power_pellets', None):
                         for ppx, ppy in self.world.power_pellets:
                             if not any(math.hypot(ppy - et[0], ppx - et[1]) < 2.0 for et in (existing_targets + aux_targets)):
                                 aux_targets.append((ppy, ppx))
+                                pellet_targets.add((ppy, ppx))
                                 if len(aux_targets) >= needed:
                                     break
                     if len(aux_targets) < needed:
@@ -436,7 +439,9 @@ class Env:
                             if len(aux_targets) >= needed:
                                 break
                     for at in aux_targets:
-                        deduped_pool.append(Task(task_type=TaskType.HUNT, target_pos=(float(at[0]), float(at[1])), score=0.6, origin=ORIGIN_RL_NOVEL))
+                        t_type = TaskType.CONVERT if (at[0], at[1]) in pellet_targets else TaskType.HUNT
+                        score_val = 1.8 if t_type == TaskType.CONVERT else 0.6
+                        deduped_pool.append(Task(task_type=t_type, target_pos=(float(at[0]), float(at[1])), score=score_val, origin=ORIGIN_RL_NOVEL))
                 from pathfinder import dijkstra_multi
                 all_targets = [t.target_pos for t in deduped_pool]
                 need_phase1 = [gid for gid in spatial_gids if any_restruct or self.ghosts[gid].cbba_agent.get_active_task() is None]
@@ -744,7 +749,7 @@ class Env:
                             self.player.die()
                             done = True
                             alive_now = [g2 for g2 in self.ghosts.values() if not g2.dead]
-                            speed_bonus = math.exp(-self.frame / max(1.0, KILL_TIME_SCALE))
+                            speed_bonus = math.exp(-self.frame / max(1.0, getattr(self, 'kill_time_scale', KILL_TIME_SCALE)))
                             kill_pay = KILL_BASE * (1.0 + KILL_SPEED_W * speed_bonus)
                             surv_frac = len(alive_now) / max(1, self.num_ghosts)
                             for a_g in alive_now:

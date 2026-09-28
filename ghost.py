@@ -417,10 +417,10 @@ class Ghost:
                 prev_target = getattr(self, '_committed_target', None)
                 if not getattr(self, '_committed_path', []):
                     replan = True
-                elif active_task is not None and (prev_target is None or math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 2.0):
+                elif prev_target is None or math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 2.0:
                     if self.frame - getattr(self, '_last_replan_frame', -999) >= 8:
                         replan = True
-                elif self.frame - getattr(self, '_last_replan_frame', -999) >= 30:
+                elif self.frame - getattr(self, '_last_replan_frame', -999) >= 20:
                     replan = True
                 if replan:
                     full_path = self.plan_path(target)
@@ -524,19 +524,19 @@ class Ghost:
                 if not self.pacman_powered and getattr(self, 'known_power_pellets', None):
                     for ppx, ppy in self.known_power_pellets:
                         d_pp = math.hypot(ppy - self.y, ppx - self.x)
-                        if d_pp < 2.5:
+                        if d_pp < 5.0:
                             ux = (ppx - self.x) / max(d_pp, 1e-4)
                             uy = (ppy - self.y) / max(d_pp, 1e-4)
                             cos_align = ray_vx_arr * ux + ray_vy_arr * uy
                             fwd_mask = cos_align > 0.0
                             if np.any(fwd_mask):
-                                power_bonus[fwd_mask] += 1.8 * ((2.5 - d_pp) / 2.5) * cos_align[fwd_mask]
+                                power_bonus[fwd_mask] += 2.5 * ((5.0 - d_pp) / 5.0) * cos_align[fwd_mask]
                 cos_des = ray_vx_arr * desired_vx + ray_vy_arr * desired_vy
                 reverse_penalty = np.zeros(num_rays, dtype=np.float32)
                 fwd_passable = np.any((cos_des > 0.0) & (~has_hit))
                 if fwd_passable:
-                    rev_mask = cos_des < -0.25
-                    reverse_penalty[rev_mask] = 3.0 * (-cos_des[rev_mask])
+                    rev_mask = cos_des < -0.60
+                    reverse_penalty[rev_mask] = 1.2 * (-cos_des[rev_mask])
                 scores = interests + hysteresis + power_bonus - ray_penalties - peer_penalties - reverse_penalty
                 best_idx = int(np.argmax(scores))
                 best_vx, best_vy = float(ray_vx_arr[best_idx]), float(ray_vy_arr[best_idx])
@@ -551,8 +551,18 @@ class Ghost:
             smooth_vy = target_vy
             smooth_vx = target_vx
         else:
-            smooth_vy = self.vy * 0.25 + target_vy * 0.75
-            smooth_vx = self.vx * 0.25 + target_vx * 0.75
+            cur_spd = math.hypot(self.vx, self.vy)
+            tgt_spd = math.hypot(target_vx, target_vy)
+            if cur_spd > 0.1 and tgt_spd > 0.1:
+                align = (self.vx * target_vx + self.vy * target_vy) / (cur_spd * tgt_spd)
+            else:
+                align = 0.0
+            if align > 0.7:
+                smooth_vy = self.vy * 0.10 + target_vy * 0.90
+                smooth_vx = self.vx * 0.10 + target_vx * 0.90
+            else:
+                smooth_vy = self.vy * 0.25 + target_vy * 0.75
+                smooth_vx = self.vx * 0.25 + target_vx * 0.75
         smooth_safe = True
         if self.world and hasattr(self.world, 'batch_is_passable'):
             smooth_mag = math.hypot(smooth_vx, smooth_vy)

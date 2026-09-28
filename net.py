@@ -277,6 +277,8 @@ class MovementPredictor(nn.Module):
         self.gru = nn.GRUCell(in_dim, hidden_dim)
         self.ln = nn.LayerNorm(hidden_dim)
         self.head = nn.Sequential(nn.Linear(hidden_dim, 32), nn.GELU(), nn.Linear(32, 2))
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
 
     def forward(self, x, hx=None, base_vel=None):
         if hx is None:

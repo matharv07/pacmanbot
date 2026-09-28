@@ -56,10 +56,10 @@ MICRO_BATCH         = int(os.environ.get("MICRO_BATCH", "1024"))
 ROLLOUT_INFER_CHUNK = int(os.environ.get("ROLLOUT_INFER_CHUNK", "1024"))
 _eff_infer_chunk = ROLLOUT_INFER_CHUNK
 _eff_micro_batch = MICRO_BATCH
-PPO_EPOCHS      = int(os.environ.get("PPO_EPOCHS", "2"))
+PPO_EPOCHS      = int(os.environ.get("PPO_EPOCHS", "1"))
 GAMMA           = 0.985
 GAE_LAMBDA      = 0.96
-CLIP_EPS        = 0.20
+CLIP_EPS        = float(os.environ.get("CLIP_EPS", "0.15"))
 ENT_COEF_INIT   = float(os.environ.get("ENT_COEF_INIT", "0.01"))
 ENT_TARGET      = float(os.environ.get("ENT_TARGET", "1.20"))
 ENT_TARGET_END  = float(os.environ.get("ENT_TARGET_END", "0.60"))
@@ -70,6 +70,7 @@ VF_COEF         = 0.5
 MAX_GRAD_NORM   = 0.5
 LR              = 1.2e-4
 LR_CRITIC       = 2.5e-4
+LR_PREDICTOR    = float(os.environ.get("LR_PREDICTOR", "8e-4"))
 STAGE_BC_INIT   = [0.0] * len(STAGES) if os.environ.get("NO_BC", "0") == "1" else [s.bc_init for s in STAGES]
 BC_FLOOR        = 0.0
 SPATIAL_BC_W    = float(os.environ.get("SPATIAL_BC_W", "1.0"))
@@ -82,7 +83,7 @@ TARGET_KL       = float(os.environ.get("TARGET_KL", "0.140"))
 KL_EMA_ALPHA    = 0.5
 KL_LR_STEP      = 1.10
 LR_WARMUP_UPDATES = 10
-KL_LR_SCALE_BOUNDS = (0.50, float(os.environ.get("KL_LR_MAX", "1.25")))
+KL_LR_SCALE_BOUNDS = (float(os.environ.get("KL_LR_MIN", "0.10")), float(os.environ.get("KL_LR_MAX", "1.25")))
 METRIC_WINDOW = int(os.environ.get("METRIC_WINDOW", "20"))
 PRINT_INTERVAL = int(os.environ.get("PRINT_INTERVAL", "10"))
 CURRICULUM_START_STAGE = int(os.environ.get("STAGE", os.environ.get("CURRICULUM_START_STAGE", "0")))
@@ -499,7 +500,7 @@ def train():
     opt_actor  = torch.optim.Adam(actor.parameters(), lr=LR)
     opt_critic = torch.optim.Adam(critic.parameters(), lr=LR_CRITIC)
     predictor  = MovementPredictor(in_dim=PREDICTOR_IN_DIM, hidden_dim=PREDICTOR_HIDDEN_DIM).to(DEVICE)
-    opt_predictor = torch.optim.Adam(predictor.parameters(), lr=LR)
+    opt_predictor = torch.optim.Adam(predictor.parameters(), lr=LR_PREDICTOR)
     start_update = 1
     episodes     = 0
     total_steps  = 0
@@ -561,6 +562,10 @@ def train():
             if "predictor" in ckpt:
                 try:
                     predictor.load_state_dict(ckpt["predictor"])
+                    if hasattr(predictor, 'head') and predictor.head[-1].bias.norm().item() > 0.05:
+                        print("  Re-zeroing MovementPredictor projection head to remove historical phantom velocity bias.")
+                        nn.init.zeros_(predictor.head[-1].weight)
+                        nn.init.zeros_(predictor.head[-1].bias)
                 except Exception as e:
                     print(f"Warning: Could not restore predictor weights: {e}")
             if "opt_predictor" in ckpt:
@@ -568,6 +573,8 @@ def train():
                     opt_predictor.load_state_dict(ckpt["opt_predictor"])
                 except Exception as e:
                     print(f"Warning: Could not restore predictor optimizer: {e}")
+            for pg in opt_predictor.param_groups:
+                pg['lr'] = LR_PREDICTOR
             if "ret_rms" in ckpt:
                 ret_rms.load_state_dict(ckpt["ret_rms"])
             curriculum.load_state_dict(ckpt["curriculum"])
@@ -748,7 +755,7 @@ def train():
                                         bc = torch.tensor(0.0, device=DEVICE)
                                 else:
                                     bc = torch.tensor(0.0, device=DEVICE)
-                                loss_speed_prior = 0.015 * (1.0 - speed_mu).pow(2).mean()
+                                loss_speed_prior = 0.05 * (1.0 - speed_mu).pow(2).mean()
                                 loss_actor = a_loss - ent_coef * ent.mean() + lam_bc * bc + loss_speed_prior
                                 loss_critic = VF_COEF * v_loss
                             (loss_critic * weight).backward()
@@ -788,7 +795,7 @@ def train():
                     opt_critic.step()
                     if critic_warmup_remaining <= 0:
                         stage_target_kl = getattr(curriculum.stage, 'target_kl', TARGET_KL)
-                        if mb_approx_kl <= 4.0 * stage_target_kl:
+                        if mb_approx_kl <= 2.0 * stage_target_kl:
                             opt_actor.step()
                         else:
                             opt_actor.zero_grad()
@@ -811,6 +818,9 @@ def train():
                 metrics["grad_norm_c"] = float(grad_norm_c)
                 metrics["n_batches"]  += 1
                 epoch_kls.append(mb_approx_kl)
+                stage_target_kl = getattr(curriculum.stage, 'target_kl', TARGET_KL)
+                if mb_approx_kl > 2.5 * stage_target_kl:
+                    break
             stage_target_kl = getattr(curriculum.stage, 'target_kl', TARGET_KL)
             epoch_mean_kl = float(np.mean(epoch_kls)) if epoch_kls else 0.0
             if epoch_mean_kl > 2.0 * stage_target_kl:
@@ -1023,9 +1033,9 @@ def train():
                 if "pred_samples" in info_list[e] and info_list[e]["pred_samples"]:
                     env_pred_trajs[e].extend(info_list[e]["pred_samples"])
                 if done_list[e]:
-                    while len(env_pred_trajs[e]) >= 8:
-                        completed_pred_seqs.append(env_pred_trajs[e][:8])
-                        env_pred_trajs[e] = env_pred_trajs[e][8:]
+                    while len(env_pred_trajs[e]) >= 4:
+                        completed_pred_seqs.append(env_pred_trajs[e][:4])
+                        env_pred_trajs[e] = env_pred_trajs[e][4:]
                     env_pred_trajs[e].clear()
                 r = rew_list[e]
                 mean_r = sum(r.values()) / max(1, len(r)) if r else 0.0
@@ -1047,17 +1057,15 @@ def train():
                     current_returns[e] = 0.0
         total_steps += ROLLOUT_STEPS * NUM_ENVS
         for e in range(NUM_ENVS):
-            while len(env_pred_trajs[e]) >= 8:
-                completed_pred_seqs.append(env_pred_trajs[e][:8])
-                env_pred_trajs[e] = env_pred_trajs[e][8:]
+            while len(env_pred_trajs[e]) >= 4:
+                completed_pred_seqs.append(env_pred_trajs[e][:4])
+                env_pred_trajs[e] = env_pred_trajs[e][4:]
+        logged_pred_loss = None
         if completed_pred_seqs:
             try:
                 seq_feats, seq_base_v, seq_gt_v = [], [], []
-                if len(completed_pred_seqs) > 64:
-                    sub_idx = random.sample(range(len(completed_pred_seqs)), 64)
-                    sampled_seqs = [completed_pred_seqs[i] for i in sub_idx]
-                else:
-                    sampled_seqs = completed_pred_seqs
+                max_s = min(len(completed_pred_seqs), 128)
+                sampled_seqs = random.sample(completed_pred_seqs, max_s) if len(completed_pred_seqs) > max_s else completed_pred_seqs
                 for chunk in sampled_seqs:
                     seq_feats.append([s[0] for s in chunk])
                     seq_base_v.append([s[1] for s in chunk])
@@ -1065,14 +1073,16 @@ def train():
                 t_x = torch.from_numpy(np.array(seq_feats, dtype=np.float32)).to(DEVICE)
                 t_bv = torch.from_numpy(np.array(seq_base_v, dtype=np.float32)).to(DEVICE)
                 t_gt = torch.from_numpy(np.array(seq_gt_v, dtype=np.float32)).to(DEVICE)
-                pred_v_seq, _ = predictor.forward_sequence(t_x, base_vel_seq=t_bv)
-                l1_loss = F.smooth_l1_loss(pred_v_seq, t_gt)
-                cos_sim = F.cosine_similarity(pred_v_seq, t_gt, dim=-1)
-                pred_loss = l1_loss + 0.3 * (1.0 - cos_sim.mean())
-                opt_predictor.zero_grad()
-                pred_loss.backward()
-                nn.utils.clip_grad_norm_(predictor.parameters(), MAX_GRAD_NORM)
-                opt_predictor.step()
+                for _ in range(4):
+                    pred_v_seq, _ = predictor.forward_sequence(t_x, base_vel_seq=t_bv)
+                    l1_loss = F.smooth_l1_loss(pred_v_seq, t_gt)
+                    cos_sim = F.cosine_similarity(pred_v_seq, t_gt, dim=-1)
+                    pred_loss = l1_loss + 0.3 * (1.0 - cos_sim.mean())
+                    opt_predictor.zero_grad()
+                    pred_loss.backward()
+                    nn.utils.clip_grad_norm_(predictor.parameters(), MAX_GRAD_NORM)
+                    opt_predictor.step()
+                logged_pred_loss = float(pred_loss.item())
                 vec_env.sync_predictor(predictor.state_dict())
             except Exception as e:
                 print(f"Warning: Predictor update failed: {e}")
@@ -1084,12 +1094,14 @@ def train():
                     t_feats = torch.from_numpy(np.array([s[0] for s in samples], dtype=np.float32)).to(DEVICE)
                     t_base_v = torch.from_numpy(np.array([s[1] for s in samples], dtype=np.float32)).to(DEVICE)
                     t_gt_v = torch.from_numpy(np.array([s[2] for s in samples], dtype=np.float32)).to(DEVICE)
-                    pred_v, _ = predictor(t_feats, base_vel=t_base_v)
-                    pred_loss = F.smooth_l1_loss(pred_v, t_gt_v) + 0.3 * (1.0 - F.cosine_similarity(pred_v, t_gt_v, dim=-1).mean())
-                    opt_predictor.zero_grad()
-                    pred_loss.backward()
-                    nn.utils.clip_grad_norm_(predictor.parameters(), MAX_GRAD_NORM)
-                    opt_predictor.step()
+                    for _ in range(4):
+                        pred_v, _ = predictor(t_feats, base_vel=t_base_v)
+                        pred_loss = F.smooth_l1_loss(pred_v, t_gt_v) + 0.3 * (1.0 - F.cosine_similarity(pred_v, t_gt_v, dim=-1).mean())
+                        opt_predictor.zero_grad()
+                        pred_loss.backward()
+                        nn.utils.clip_grad_norm_(predictor.parameters(), MAX_GRAD_NORM)
+                        opt_predictor.step()
+                    logged_pred_loss = float(pred_loss.item())
                     vec_env.sync_predictor(predictor.state_dict())
                 except Exception as e:
                     print(f"Warning: Predictor single-step update failed: {e}")
@@ -1269,6 +1281,7 @@ def train():
             "ent_coef":   round(ent_coef, 5),
             "approx_kl":  round(metrics["approx_kl"] / nb, 5),
             "clip_frac":  round(metrics["clip_fraction"] / nb, 4),
+            "pred_loss":  (round(logged_pred_loss, 4) if logged_pred_loss is not None else None),
             "bc_coef":    round(lam_bc, 4),
             "kl_ema":     (round(kl_ema, 5) if kl_ema is not None else None),
             "explained_var": ev_avg,
@@ -1419,8 +1432,8 @@ def train():
                 spd_prior_loss = round(metrics.get("loss_speed_prior", 0.0) / nb, 5)
                 print(f"│  Mean Speed: {spd_avg:.2f}x   Fast (≥0.85x): {fast_pct:.1%}   Speed Prior Loss: {spd_prior_loss:.5f}")
                 print(f"├─ STABILITY & OPTIMIZATION ───────────────────────────────────────────────────────────────")
-                warmup_tag = f"  [Critic Warmup: {critic_warmup_remaining} left]" if critic_warmup_remaining > 0 else ""
-                print(f"│  Actor Loss: {row['actor_loss']:>+.5f}{warmup_tag}   Value Loss: {row['value_loss']:.5f}   Expl. Var (EV): {ev_avg:+.2f}")
+                pred_str = f"   Pred Loss: {row['pred_loss']:.4f}" if row.get('pred_loss') is not None else ""
+                print(f"│  Actor Loss: {row['actor_loss']:>+.5f}{warmup_tag}   Value Loss: {row['value_loss']:.5f}   Expl. Var (EV): {ev_avg:+.2f}{pred_str}")
                 stage_target_kl = getattr(curriculum.stage, 'target_kl', TARGET_KL)
                 print(f"│  Approx KL: {row['approx_kl']:.4f}   KL EMA: {(round(kl_ema, 4) if kl_ema is not None else 0.0):.4f} (Target: {stage_target_kl:.3f})   Clip Frac: {row['clip_frac']:.1%}")
                 print(f"│  LR Scale: {kl_lr_scale:.2f}x   Actor LR: {cur_lr:.2e}   Grad Norms: [Act: {row['grad_norm_a']:.2f}, Crit: {row['grad_norm_c']:.2f}]")

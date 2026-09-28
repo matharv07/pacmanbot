@@ -437,7 +437,7 @@ def actions_to_tasks(ghost, cand_scores, cand_picks, frame: int, obs_resolution:
             conf = min(1.0, max(0.0, float(scores_arr[r, c])))
             score = RL_SCORE_BASE + RL_SCORE_SPAN * conf
             power_pellets = getattr(ghost, 'known_power_pellets', None) or []
-            is_power = any(abs(world_y - p[1]) < 0.5 and abs(world_x - p[0]) < 0.5 for p in power_pellets)
+            is_power = any(math.hypot(world_y - p[1], world_x - p[0]) < 1.2 for p in power_pellets)
             if is_power:
                 tt = TaskType.CONVERT
             else:

@@ -41,32 +41,39 @@ def _pad_spatial(arr, target_h, target_w):
 
 def _run_episode(actor, env, stage, critic=None):
     obs = env.reset()
+    if actor is None:
+        for g in env.ghosts.values():
+            g.rl_mode = False
+            g.cbba_agent.rl_mode = False
     while True:
         if obs is None:
             break
-        gids, sp, ve, vm, ht, hs, cf, cc, cm, cbc, global_sp, grid_shape = obs
-        if not gids:
-            break
-        sp_p = _pad_spatial(sp.astype(np.float32), stage.rows, stage.cols)
-        vm_p = _pad_spatial(vm.astype(np.float32), stage.rows, stage.cols).astype(bool)
-        t_sp = torch.from_numpy(sp_p)
-        t_ve = torch.from_numpy(ve.astype(np.float32))
-        t_vm = torch.from_numpy(vm_p)
-        t_cf = torch.from_numpy(cf.astype(np.float32))
-        t_cc = torch.from_numpy(flatten_cand_cells(cc, stage.cols).astype(np.int64))
-        t_cm = torch.from_numpy(cm.astype(bool))
-        with torch.inference_mode():
-            out_act = actor(t_sp, t_ve, t_vm, K=K_CAND, return_restruct=True)
-            idx, lp, scores, _pool, _vec, speed_idx, speed_lp, _, res_act, _, _ = out_act
-        idx_np    = idx.cpu().numpy()
-        scores_np = scores.float().cpu().numpy()
-        spd_np    = speed_idx.cpu().numpy()
-        res_np    = (res_act > 0.5).cpu().numpy()
-        action_dict = {}
-        for i, gid in enumerate(gids):
-            indices = [(int(x // stage.cols), int(x % stage.cols)) for x in idx_np[i]]
-            action_dict[gid] = (indices, scores_np[i], spd_np[i], bool(res_np[i]))
-        obs, _rewards, done, info = env.step(action_dict, want_bc=False)
+        if actor is None:
+            obs, _rewards, done, info = env.step({}, want_bc=False)
+        else:
+            gids, sp, ve, vm, ht, hs, cf, cc, cm, cbc, global_sp, grid_shape = obs
+            if not gids:
+                break
+            sp_p = _pad_spatial(sp.astype(np.float32), stage.rows, stage.cols)
+            vm_p = _pad_spatial(vm.astype(np.float32), stage.rows, stage.cols).astype(bool)
+            t_sp = torch.from_numpy(sp_p)
+            t_ve = torch.from_numpy(ve.astype(np.float32))
+            t_vm = torch.from_numpy(vm_p)
+            t_cf = torch.from_numpy(cf.astype(np.float32))
+            t_cc = torch.from_numpy(flatten_cand_cells(cc, stage.cols).astype(np.int64))
+            t_cm = torch.from_numpy(cm.astype(bool))
+            with torch.inference_mode():
+                out_act = actor(t_sp, t_ve, t_vm, K=K_CAND, return_restruct=True)
+                idx, lp, scores, _pool, _vec, speed_idx, speed_lp, _, res_act, _, _ = out_act
+            idx_np    = idx.cpu().numpy()
+            scores_np = scores.float().cpu().numpy()
+            spd_np    = speed_idx.cpu().numpy()
+            res_np    = (res_act > 0.5).cpu().numpy()
+            action_dict = {}
+            for i, gid in enumerate(gids):
+                indices = [(int(x // stage.cols), int(x % stage.cols)) for x in idx_np[i]]
+                action_dict[gid] = (indices, scores_np[i], spd_np[i], bool(res_np[i]))
+            obs, _rewards, done, info = env.step(action_dict, want_bc=False)
         if done:
             surviving = sum(1 for g in env.ghosts.values() if not g.dead)
             pac_score = float(info.get('pacman_score', 0))
@@ -92,33 +99,40 @@ def _worker_chunk(ckpt_path: str, n_games: int, stage_override=None, seed_offset
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     np.random.seed(seed_offset)
     torch.manual_seed(seed_offset)
-    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    ckpt_stage = ckpt.get('curriculum', {}).get('stage_idx', 0) if isinstance(ckpt.get('curriculum'), dict) else 0
-    raw_idx = stage_override if stage_override is not None else ckpt_stage
-    eff_stage_idx = min(len(STAGES) - 1, max(0, raw_idx))
-    stage = STAGES[eff_stage_idx]
-    actor = GhostActor().cpu()
-    try:
-        actor.load_state_dict(ckpt['actor'])
-    except Exception:
-        actor_sd = ckpt['actor']
-        new_actor_sd = actor.state_dict()
-        for k, v in actor_sd.items():
-            if k in new_actor_sd:
-                if v.shape == new_actor_sd[k].shape:
-                    new_actor_sd[k] = v
-                elif "vec_mlp.0.weight" in k and v.ndim == 2 and new_actor_sd[k].ndim == 2:
-                    min_out = min(v.shape[0], new_actor_sd[k].shape[0])
-                    min_in = min(v.shape[1], new_actor_sd[k].shape[1])
-                    new_actor_sd[k][:min_out, :min_in] = v[:min_out, :min_in]
-        actor.load_state_dict(new_actor_sd)
-    actor.eval()
-    critic = None
-    if 'critic' in ckpt:
+    if ckpt_path == 'heuristic':
+        raw_idx = stage_override if stage_override is not None else 3
+        eff_stage_idx = min(len(STAGES) - 1, max(0, raw_idx))
+        stage = STAGES[eff_stage_idx]
+        actor = None
+        critic = None
+    else:
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        ckpt_stage = ckpt.get('curriculum', {}).get('stage_idx', 0) if isinstance(ckpt.get('curriculum'), dict) else 0
+        raw_idx = stage_override if stage_override is not None else ckpt_stage
+        eff_stage_idx = min(len(STAGES) - 1, max(0, raw_idx))
+        stage = STAGES[eff_stage_idx]
+        actor = GhostActor().cpu()
         try:
-            critic = GhostCritic().cpu(); critic.load_state_dict(ckpt['critic']); critic.eval()
-        except Exception as e:
-            print(f"  (critic not loaded, RL picks disabled: {e})"); critic = None
+            actor.load_state_dict(ckpt['actor'])
+        except Exception:
+            actor_sd = ckpt['actor']
+            new_actor_sd = actor.state_dict()
+            for k, v in actor_sd.items():
+                if k in new_actor_sd:
+                    if v.shape == new_actor_sd[k].shape:
+                        new_actor_sd[k] = v
+                    elif "vec_mlp.0.weight" in k and v.ndim == 2 and new_actor_sd[k].ndim == 2:
+                        min_out = min(v.shape[0], new_actor_sd[k].shape[0])
+                        min_in = min(v.shape[1], new_actor_sd[k].shape[1])
+                        new_actor_sd[k][:min_out, :min_in] = v[:min_out, :min_in]
+            actor.load_state_dict(new_actor_sd)
+        actor.eval()
+        critic = None
+        if 'critic' in ckpt:
+            try:
+                critic = GhostCritic().cpu(); critic.load_state_dict(ckpt['critic']); critic.eval()
+            except Exception as e:
+                print(f"  (critic not loaded, RL picks disabled: {e})"); critic = None
     env = Env(env_id=seed_offset, num_ghosts=stage.n_ghosts, world_height=float(stage.rows), world_width=float(stage.cols), obs_resolution=stage.obs_resolution, n_power=stage.n_power)
     results = []
     for i in range(n_games):
@@ -182,32 +196,37 @@ def main():
     ap.add_argument('--ckpts',    type=int,  nargs='*',    help='Specific update numbers, e.g. 1100 1600')
     ap.add_argument('--stage',    type=int,  default=None, help='Force all checkpoints onto this stage index (default: checkpoint native stage)')
     ap.add_argument('--ckpt_dir', type=str,  default='checkpoints', help='Checkpoint directory')
+    ap.add_argument('--heuristic', action='store_true', help='Include hardcoded/heuristic baseline in comparison')
     args = ap.parse_args()
     ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), args.ckpt_dir)
+    ckpt_paths = []
     if args.ckpts:
         ckpt_paths = [os.path.join(ckpt_dir, f'ckpt_{u}.pt') for u in sorted(args.ckpts)]
         missing = [p for p in ckpt_paths if not os.path.exists(p)]
         if missing:
             print(f'ERROR: checkpoints not found: {missing}')
             sys.exit(1)
-    else:
+    elif not args.heuristic:
         ckpt_paths = sorted(glob.glob(os.path.join(ckpt_dir, 'ckpt_*.pt')),
                             key=lambda p: int(os.path.basename(p).split('_')[1].split('.')[0]))
-    if not ckpt_paths:
-        print(f'No checkpoints found in {ckpt_dir}')
-        sys.exit(1)
+        if not ckpt_paths:
+            print(f'No checkpoints found in {ckpt_dir}')
+            sys.exit(1)
+    eval_targets = list(ckpt_paths)
+    if args.heuristic:
+        eval_targets.append('heuristic')
     n_games     = args.n
     chunk_sz    = min(args.chunk, n_games)
     max_workers = args.workers or max(1, (os.cpu_count() or 4) - 2)
     tasks = []
-    for ckpt_path in ckpt_paths:
+    for target in eval_targets:
         n_chunks = max(1, n_games // chunk_sz)
         rem      = n_games % chunk_sz
         for ci in range(n_chunks):
             games = chunk_sz + (rem if ci == 0 else 0)
-            tasks.append((ckpt_path, games, args.stage, ci * 1000))
+            tasks.append((target, games, args.stage, ci * 1000))
     n_total_workers = min(len(tasks), max_workers)
-    print(f'\n  Evaluating {len(ckpt_paths)} checkpoint(s) × {n_games} games each')
+    print(f'\n  Evaluating {len(eval_targets)} target(s) × {n_games} games each')
     print(f'  {len(tasks)} total chunks  →  {n_total_workers} parallel workers\n')
     raw:  dict[str, list]  = defaultdict(list)
     meta: dict[str, tuple] = {}
@@ -216,13 +235,14 @@ def main():
     with ProcessPoolExecutor(max_workers=n_total_workers) as ex:
         futures = {ex.submit(_worker_chunk, *task): task[0] for task in tasks}
         for fut in as_completed(futures):
-            ckpt_path = futures[fut]
+            target = futures[fut]
             try:
                 path_ret, stage_idx, stage, chunk_results = fut.result()
-                raw[ckpt_path].extend(chunk_results)
-                meta[ckpt_path] = (stage_idx, stage)
+                raw[target].extend(chunk_results)
+                meta[target] = (stage_idx, stage)
             except Exception as e:
-                print(f'  ✗ {os.path.basename(ckpt_path)}: {e}')
+                lbl = 'heuristic' if target == 'heuristic' else os.path.basename(target)
+                print(f'  ✗ {lbl}: {e}')
                 traceback.print_exc()
             completed += 1
             elapsed = time.time() - t0
@@ -230,12 +250,13 @@ def main():
             print(f'  [{pct:5.1f}%]  {completed}/{len(tasks)} chunks done  ({elapsed:.0f}s elapsed)', end='\r')
     print()
     rows = []
-    for ckpt_path in ckpt_paths:
-        if ckpt_path not in raw:
+    for target in eval_targets:
+        if target not in raw:
             continue
-        stage_idx, stage = meta[ckpt_path]
-        agg = _aggregate(raw[ckpt_path])
-        rows.append({'label': os.path.basename(ckpt_path).replace('.pt', ''), 'stage': stage_idx, 'grid' : f'{stage.rows}×{stage.cols}', 'ghosts': stage.n_ghosts, **agg})
+        stage_idx, stage = meta[target]
+        agg = _aggregate(raw[target])
+        label = 'heuristic' if target == 'heuristic' else os.path.basename(target).replace('.pt', '')
+        rows.append({'label': label, 'stage': stage_idx, 'grid' : f'{stage.rows}×{stage.cols}', 'ghosts': stage.n_ghosts, **agg})
     _print_table(rows)
     if len(rows) > 1:
         best_kill  = max(rows, key=lambda r: r['kill_rate'])
