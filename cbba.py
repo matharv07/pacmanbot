@@ -168,7 +168,8 @@ class CBBA_Agent:
             if dk in self.path:
                 self.path.remove(dk)
             self.y[dk] = 0.0
-            self.z[dk] = None
+            if self.z.get(dk) == self.gid:
+                self.z[dk] = None
         if displace:
             self._cascade_release()
 
@@ -343,6 +344,9 @@ class CBBA_Agent:
                 gain, n = self._marginal_gain(key, ghost)
                 cur_y = self.y.get(key, 0.0)
                 cur_z = self.z.get(key)
+                if cur_z == self.gid and key not in self.bundle:
+                    cur_y = 0.0
+                    cur_z = None
                 if gain < cur_y - 1e-6:
                     continue
                 if abs(gain - cur_y) <= 1e-6:

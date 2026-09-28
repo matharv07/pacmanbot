@@ -431,6 +431,9 @@ def actions_to_tasks(ghost, cand_scores, cand_picks, frame: int, obs_resolution:
             world_x = (float(c) + 0.5) / obs_resolution
             if hasattr(ghost, 'world') and not ghost.world.is_passable(world_x, world_y, radius=0.35):
                 continue
+            if hasattr(ghost, 'x') and hasattr(ghost, 'y'):
+                if math.hypot(world_y - ghost.y, world_x - ghost.x) < 1.5:
+                    continue
             conf = min(1.0, max(0.0, float(scores_arr[r, c])))
             score = RL_SCORE_BASE + RL_SCORE_SPAN * conf
             power_pellets = getattr(ghost, 'known_power_pellets', None) or []

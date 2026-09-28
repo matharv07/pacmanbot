@@ -114,6 +114,8 @@ class Env:
             starts.append(tuple(open_cells[best]))
             avail[best] = False
         self.ghosts = { i: Ghost(i, self.grid, pos, GHOST_COLORS[i % len(GHOST_COLORS)], self._player_start, self.world) for i, pos in enumerate(starts) }
+        self._ghost_spawn_pos = {i: (float(pos[0]), float(pos[1])) for i, pos in enumerate(starts)}
+        self._prev_step_vec: dict[int, tuple] = {}
         for g in self.ghosts.values():
             g.rl_mode = True
             g.cbba_agent.rl_mode = True
@@ -438,18 +440,19 @@ class Env:
                         deduped_pool.append(Task(task_type=TaskType.HUNT, target_pos=(float(at[0]), float(at[1])), score=0.6, origin=ORIGIN_RL_NOVEL))
                 from pathfinder import dijkstra_multi
                 all_targets = [t.target_pos for t in deduped_pool]
-                for gid in spatial_gids:
+                need_phase1 = [gid for gid in spatial_gids if any_restruct or self.ghosts[gid].cbba_agent.get_active_task() is None]
+                for gid in need_phase1:
                     g = self.ghosts[gid]
                     h_dists = dict(self._cached_hdists.get(gid, {}))
                     if all_targets:
                         d_rl = dijkstra_multi(g.world, (g.y, g.x), all_targets)
                         h_dists.update(d_rl)
-                    if any_restruct or g.cbba_agent.get_active_task() is None:
-                        g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
-                        g.cbba_agent._phase1(g, deduped_pool, h_dists)
-                ran_any_phase1 = any_restruct or any(self.ghosts[gid].cbba_agent.get_active_task() is None for gid in spatial_gids)
+                    g.cbba_agent._last_auction = self.frame + DECISION_INTERVAL
+                    g.cbba_agent._phase1(g, deduped_pool, h_dists)
+                ran_any_phase1 = len(need_phase1) > 0
                 if ran_any_phase1 and len(alive) > 1:
-                    for round_idx in range(2):
+                    max_rounds = min(len(alive), 4)
+                    for round_idx in range(max_rounds):
                         payloads = {gid: self.ghosts[gid].cbba_agent.get_consensus_payload() for gid in alive}
                         for gid_i in alive:
                             agent_i = self.ghosts[gid_i].cbba_agent
@@ -457,15 +460,23 @@ class Env:
                                 if gid_i != gid_j:
                                     p_j = payloads[gid_j]
                                     agent_i.receive_consensus(gid_j, p_j["y"], p_j["z"], p_j["s"], self.frame, p_j.get("meta"))
-                        if round_idx < 1:
-                            for gid in spatial_gids:
-                                g = self.ghosts[gid]
-                                if len(g.cbba_agent.bundle) == 0:
-                                    h_dists = dict(self._cached_hdists.get(gid, {}))
-                                    if all_targets:
-                                        d_rl = dijkstra_multi(g.world, (g.y, g.x), all_targets)
-                                        h_dists.update(d_rl)
-                                    g.cbba_agent._phase1(g, deduped_pool, h_dists)
+                        empty_gids = [gid for gid in spatial_gids if len(self.ghosts[gid].cbba_agent.bundle) == 0]
+                        if not empty_gids or round_idx == max_rounds - 1:
+                            break
+                        for gid in empty_gids:
+                            g = self.ghosts[gid]
+                            h_dists = dict(self._cached_hdists.get(gid, {}))
+                            if all_targets:
+                                d_rl = dijkstra_multi(g.world, (g.y, g.x), all_targets)
+                                h_dists.update(d_rl)
+                            g.cbba_agent._phase1(g, deduped_pool, h_dists)
+                for gid in spatial_gids:
+                    g = self.ghosts[gid]
+                    if g.cbba_agent.get_active_task() is None:
+                        cands = self._cached_full_htasks.get(gid) or self._cached_htasks.get(gid) or []
+                        if cands:
+                            h_dists = dict(self._cached_hdists.get(gid, {}))
+                            g.cbba_agent._phase1(g, cands, h_dists)
                 from cbba import _task_key
                 for gid in spatial_gids:
                     g = self.ghosts[gid]
@@ -509,6 +520,7 @@ class Env:
                     rewards[gid] -= 0.005  # micro restructure communication cost
         done = False
         pred_samples = []
+        step_start_pos = {gid: (g.y, g.x) for gid, g in self.ghosts.items()}
         for _ in range(DECISION_INTERVAL):
             self.frame += 1
             if self._pending_auction:
@@ -599,7 +611,6 @@ class Env:
                         if d_belief_shift >= 4.5:
                             trigger_emergency = True
                     ghost._prev_belief_peak = cur_b_top
-
                 if trigger_emergency:
                     self._last_emergency_auction_frame[gid] = self.frame
                     self._trigger_emergency_sighting(gid, ghost)
@@ -792,6 +803,35 @@ class Env:
                                     rewards[g_i.gid] -= p_jam
                                 if g_j.gid in rewards:
                                     rewards[g_j.gid] -= p_jam
+        for gid, g in self.ghosts.items():
+            if gid not in rewards or g.dead:
+                continue
+            p0 = step_start_pos.get(gid)
+            if p0 is not None:
+                dy = g.y - p0[0]
+                dx = g.x - p0[1]
+                net_disp = math.hypot(dy, dx)
+                if not getattr(self.player, 'powered', False):
+                    if net_disp < 0.20:
+                        rewards[gid] -= 0.035 * (1.0 - net_disp / 0.20)
+                    elif net_disp >= 0.40:
+                        rewards[gid] += 0.025 * min(1.0, net_disp / 2.0)
+                    prev_v = self._prev_step_vec.get(gid)
+                    if prev_v is not None and net_disp > 0.15:
+                        p_mag = math.hypot(prev_v[0], prev_v[1])
+                        if p_mag > 0.15:
+                            cos_flip = (dy * prev_v[0] + dx * prev_v[1]) / (net_disp * p_mag)
+                            if cos_flip < -0.3:
+                                rewards[gid] -= 0.030 * max(0.0, -cos_flip)
+                    self._prev_step_vec[gid] = (dy, dx)
+                    if self.frame <= 60 and hasattr(self, '_ghost_spawn_pos'):
+                        sp = self._ghost_spawn_pos.get(gid)
+                        if sp is not None:
+                            d_sp = math.hypot(g.y - sp[0], g.x - sp[1])
+                            if self.frame >= 30 and d_sp < 1.2:
+                                rewards[gid] -= 0.025
+                            elif d_sp >= 2.0:
+                                rewards[gid] += 0.015 * min(d_sp / 4.0, 1.0)
         pacman_caught = bool(getattr(self.player, "dead", False))
         for gid, g in self.ghosts.items():
             if gid not in rewards:

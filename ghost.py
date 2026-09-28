@@ -157,9 +157,9 @@ class Ghost:
         self._broadcast(diffs, all_ghosts)
         self._process_messages(all_ghosts)
         self.belief_map.update_safety_map(self.known_agents, self.frame, powered=self.pacman_powered, pacman_pos=self.known_pacman or self.last_lost_pacman)
+        self.pos_history.append((self.y, self.x))
+        self._check_oscillation()
         if skip_movement:
-            self.pos_history.append((self.y, self.x))
-            self._check_oscillation()
             return newly_discovered, stale_refreshed
         active_task = self.cbba_agent.step(self, self.frame)
         if self.pacman_powered:
@@ -170,7 +170,7 @@ class Ghost:
                 if t_obj is not None and pac_danger_pos is not None:
                     if math.hypot(t_obj.target_pos[0] - pac_danger_pos[0], t_obj.target_pos[1] - pac_danger_pos[1]) < 8.0:
                         drop_keys.append(k)
-                elif k[0] == TaskType.HUNT and pac_danger_pos is None:
+                elif not getattr(self, 'rl_mode', False) and k[0] == TaskType.HUNT and pac_danger_pos is None:
                     drop_keys.append(k)
             for dk in drop_keys:
                 if dk in self.cbba_agent.bundle:
@@ -185,7 +185,8 @@ class Ghost:
         #use tolerance-based comparison
         if active_task is not None:
             tpr, tpc = active_task.target_pos
-            if abs(self.y - tpr) < 0.5 and abs(self.x - tpc) < 0.5:
+            task_age = self.frame - getattr(active_task, 'created_frame', 0)
+            if abs(self.y - tpr) < 0.5 and abs(self.x - tpc) < 0.5 and task_age >= 2:
                 is_hunt = (active_task.task_type == TaskType.HUNT)
                 pac_near = False
                 if is_hunt and not self.pacman_powered and self.known_pacman is not None:
@@ -268,8 +269,6 @@ class Ghost:
             pac_strike_target = None
             if self.known_pacman is not None:
                 pac_strike_target = self.known_pacman
-            elif active_task is not None:
-                pac_strike_target = active_task.target_pos
             if pac_strike_target is not None:
                 pac_y, pac_x = float(pac_strike_target[0]), float(pac_strike_target[1])
                 dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
@@ -298,6 +297,8 @@ class Ghost:
                     replan = True
                 elif prev_target and math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 3.0:
                     replan = True
+            elif self.frame - getattr(self, '_last_replan_frame', -999) >= 20:
+                replan = True
             if replan:
                 full_path = self.plan_path(target)
                 if len(full_path) >= 2:
@@ -307,15 +308,16 @@ class Ghost:
                 else:
                     self._committed_path = []
                     d_target = math.hypot(self.y - target[0], self.x - target[1])
+                    task_age = self.frame - getattr(active_task, 'created_frame', 0)
                     if d_target < 1.0:
                         pac_close = (not self.pacman_powered and self.known_pacman is not None and math.hypot(self.known_pacman[0] - self.y, self.known_pacman[1] - self.x) <= 3.0)
-                        if not pac_close:
+                        if not pac_close and task_age >= 2:
                             self.cbba_agent.remove_task(active_task)
                             active_task = None
-                        else:
+                        elif pac_close:
                             self._committed_target = self.known_pacman
                             self._committed_path = []
-                    else:
+                    elif task_age >= 2:
                         self.cbba_agent.mark_unreachable(target, self.frame)
                         self.cbba_agent.remove_task(active_task)
                         active_task = None
@@ -333,6 +335,12 @@ class Ghost:
                         else:
                             self._committed_target = self.known_pacman
                             self._committed_path = []
+                elif not self.world.is_passable(float(next_cell[1]), float(next_cell[0]), radius=self.radius):
+                    self._committed_path.pop(0)
+                    if self._committed_path:
+                        next_cell = self._committed_path[0]
+                    else:
+                        self._committed_path = []
                 if self._committed_path:
                     target_y, target_x = next_cell[0], next_cell[1]
                     dx, dy = target_x - self.x, target_y - self.y
@@ -356,16 +364,15 @@ class Ghost:
                     pr, pc = self.known_pacman
                     target = (float(pr), float(pc))
                 elif self.belief_map._initialised and len(self.belief_map._b_flat) > 0:
-                    best_idx = int(np.argmax(self.belief_map._b_flat))
-                    if self.belief_map._b_flat[best_idx] > 1e-4:
-                        best_r, best_c = self.belief_map._open_cells[best_idx]
-                        target = (float(best_r), float(best_c))
+                    top_cands = self.belief_map.top_cells(n=max(len(all_ghosts) if all_ghosts else 4, 8))
+                    if top_cands:
+                        target = top_cands[self.gid % len(top_cands)]
             if target is not None:
                 replan = False
                 prev_target = getattr(self, '_committed_target', None)
                 if not getattr(self, '_committed_path', []):
                     replan = True
-                elif prev_target is None or math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 2.0:
+                elif active_task is not None and (prev_target is None or math.hypot(target[0] - prev_target[0], target[1] - prev_target[1]) > 2.0):
                     if self.frame - getattr(self, '_last_replan_frame', -999) >= 8:
                         replan = True
                 elif self.frame - getattr(self, '_last_replan_frame', -999) >= 30:
@@ -572,20 +579,18 @@ class Ghost:
     def _check_oscillation(self):
         if len(self.pos_history) < OSCILLATION_WINDOW:
             return
-        cur_y, cur_x = self.y, self.x
-        tol = 0.3               #tolerance for float coordinate comparison
-        matches = sum(1 for py, px in self.pos_history if abs(py - cur_y) < tol and abs(px - cur_x) < tol)
-        if matches >= 2:
+        p_start, p_end = self.pos_history[0], self.pos_history[-1]
+        net_disp = math.hypot(p_end[0] - p_start[0], p_end[1] - p_start[1])
+        cum_dist = sum(math.hypot(self.pos_history[i][0] - self.pos_history[i-1][0],
+                                  self.pos_history[i][1] - self.pos_history[i-1][1])
+                       for i in range(1, len(self.pos_history)))
+        if cum_dist > 1.2 and net_disp < 0.25:
             if self.known_pacman is None and self.last_lost_pacman is not None:
                 self.last_lost_pacman = None
-                self.pos_history.clear()
-        if matches >= 3:        #drop current task to force re-evaluation if found oscillating
-            active_task = self.cbba_agent.get_active_task()
-            if active_task:
-                self.cbba_agent.mark_unreachable(active_task.target_pos, self.frame)
-            self.cbba_agent.bundle.clear()
-            self.cbba_agent.path.clear()
+            self._committed_path = []
             self.pos_history.clear()
+            self.vx = 0.0
+            self.vy = 0.0
 
     def is_agent_dead(self, gid: int) -> bool:
         if gid == self.gid:
@@ -622,6 +627,11 @@ class Ghost:
                     self.belief_map.observe_walls_batch(list(new_walls))
                     wall_diffs = [("wall", w) for w in new_walls]
                     self._broadcast(wall_diffs, all_ghosts)
+                    if getattr(self, '_committed_path', None):
+                        for wy, wx in self._committed_path:
+                            if any(abs(wy - nw[0]) < 0.6 and abs(wx - nw[1]) < 0.6 for nw in new_walls):
+                                self._committed_path = []
+                                break
         visible_prm = []
         visible_belief_idxs = set()
         impassable_belief_nodes = []

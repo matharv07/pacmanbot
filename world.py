@@ -4,7 +4,7 @@ import random
 import numpy as np
 import scipy.ndimage
 import argparse
-from collections import deque
+from collections import deque, defaultdict
 
 class Obstacle:
     def contains(self, x, y):
@@ -488,19 +488,34 @@ class World:
             n_pow = max(0, min(int(n_power), len(self.pellets)))
         else:
             n_pow = min(28, len(self.pellets) // 4)
-        if n_pow > 0:
-            pellets_arr = np.array(self.pellets)
-            #Farthest Point Sampling (FPS) to maximize distance between power pellets
-            power_indices = [random.randint(0, len(self.pellets)-1)]
-            distances = np.sum((pellets_arr - pellets_arr[power_indices[0]])**2, axis=1)
-            for _ in range(1, n_pow):
-                farthest = int(np.argmax(distances))
-                power_indices.append(farthest)
-                new_dists = np.sum((pellets_arr - pellets_arr[farthest])**2, axis=1)
-                distances = np.minimum(distances, new_dists)
-            power_indices.sort(reverse=True)
-            for idx in power_indices:
-                self.power_pellets.append(self.pellets.pop(idx))
+        if n_pow > 0 and len(self.pellets) > 0:
+            mid_x, mid_y = self.width / 2.0, self.height / 2.0
+            max_quad = max(2, int(math.ceil(n_pow * 0.40)))
+            min_quad = max(1, int(math.floor(n_pow * 0.10)))
+            chosen_pellets = None
+            for _ in range(60):
+                cands = random.sample(self.pellets, n_pow)
+                q_counts = [0, 0, 0, 0]
+                for px, py in cands:
+                    q_idx = (1 if px >= mid_x else 0) + (2 if py >= mid_y else 0)
+                    q_counts[q_idx] += 1
+                if max(q_counts) <= max_quad and min(q_counts) >= min_quad:
+                    too_close = False
+                    for i in range(n_pow):
+                        for j in range(i + 1, n_pow):
+                            if (cands[i][0] - cands[j][0])**2 + (cands[i][1] - cands[j][1])**2 < 2.5:
+                                too_close = True
+                                break
+                        if too_close:
+                            break
+                    if not too_close:
+                        chosen_pellets = cands
+                        break
+            if chosen_pellets is None:
+                chosen_pellets = random.sample(self.pellets, n_pow)
+            chosen_set = set(chosen_pellets)
+            self.power_pellets.extend(chosen_pellets)
+            self.pellets = [p for p in self.pellets if p not in chosen_set]
         self.generate_roadmap()
     
     def generate_roadmap(self, n_samples=None):
