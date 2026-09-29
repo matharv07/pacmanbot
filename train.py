@@ -1432,6 +1432,7 @@ def train():
                 spd_prior_loss = round(metrics.get("loss_speed_prior", 0.0) / nb, 5)
                 print(f"│  Mean Speed: {spd_avg:.2f}x   Fast (≥0.85x): {fast_pct:.1%}   Speed Prior Loss: {spd_prior_loss:.5f}")
                 print(f"├─ STABILITY & OPTIMIZATION ───────────────────────────────────────────────────────────────")
+                warmup_tag = f"  [Critic Warmup: {critic_warmup_remaining} left]" if critic_warmup_remaining > 0 else ""
                 pred_str = f"   Pred Loss: {row['pred_loss']:.4f}" if row.get('pred_loss') is not None else ""
                 print(f"│  Actor Loss: {row['actor_loss']:>+.5f}{warmup_tag}   Value Loss: {row['value_loss']:.5f}   Expl. Var (EV): {ev_avg:+.2f}{pred_str}")
                 stage_target_kl = getattr(curriculum.stage, 'target_kl', TARGET_KL)

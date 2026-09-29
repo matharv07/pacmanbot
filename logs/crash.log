@@ -1,0 +1,9 @@
+
+[2026-09-29T05:14:04.611506] CRASH on naaam:
+Traceback (most recent call last):
+  File "/home/arv/pacmanbot/train.py", line 1485, in <module>
+    train()
+  File "/home/arv/pacmanbot/train.py", line 1436, in train
+    print(f"│  Actor Loss: {row['actor_loss']:>+.5f}{warmup_tag}   Value Loss: {row['value_loss']:.5f}   Expl. Var (EV): {ev_avg:+.2f}{pred_str}")
+NameError: name 'warmup_tag' is not defined
+
