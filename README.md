@@ -1,9 +1,7 @@
 # PacmanBot
 
 <p align="center">
-  <video src="media/gameplay.mp4" autoplay loop muted playsinline width="800">
-    <a href="media/gameplay.mp4">Gameplay Demonstration Video</a>
-  </video>
+  <img src="media/gameplay.gif" alt="Gameplay Demonstration" width="800">
 </p>
 
 Visit https://github.com/matharv07/minibot - to see a gazebo simulation of physical bots with routing logic playing pacman with all the same restrictions as laid down below.
@@ -147,7 +145,7 @@ echo "https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN" > discord_webhook.txt
 - `train.py`            - Distributed MAPPO learner across 14 environments with GAE and Discord telemetry.
 - `test.py`             - Evaluation script and Pygame GUI visualizer.
 - `report.pdf`          - Comprehensive 38-page technical engineering report covering continuous physics, CBBA proofs, and FiLM-MAPPO.
-- `media/`              - Gameplay demonstration video (`gameplay.mp4`).
+- `media/`              - Gameplay animation GIF (`gameplay.gif`) and video (`gameplay.mp4`).
 - `tests/`              - Automated unit and regression test suites.
 
 ---
