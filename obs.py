@@ -207,7 +207,9 @@ def build_vector(ghost) -> np.ndarray:
     f.extend([ghost.y / w_height, ghost.x / w_width])
     f.extend([ghost.y % 1.0, ghost.x % 1.0])
     timer = getattr(ghost, 'pacman_power_timer', 0)
-    f.append(timer / 40.0 if getattr(ghost, 'pacman_powered', False) else 0.0)
+    max_t = float(getattr(ghost, 'pacman_power_max_timer', 40.0))
+    norm_timer = min(1.0, max(0.0, timer / max_t)) if max_t > 0 else 0.0
+    f.append(norm_timer if getattr(ghost, 'pacman_powered', False) else 0.0)
     since = ghost.frame - ghost.pacman_last_seen if ghost.pacman_last_seen >= 0 else 200
     f.append(min(since, 200) / 200.0)
     for gid in range(MAX_GHOSTS):
@@ -489,7 +491,8 @@ def build_global_spatial(env, rows: int, cols: int, obs_resolution: float = 1.0)
         _place_blob_global(out[3], env.player.y, env.player.x)
         if getattr(env.player, 'powered', False):
             timer = getattr(env.player, 'power_timer', 0)
-            out[4] = min(timer / 40.0, 1.0)
+            max_t = float(getattr(env, 'power_duration_steps', getattr(env.player, 'power_duration_steps', 40.0)))
+            out[4] = min(timer / max(max_t, 1e-4), 1.0)
     for g in env.ghosts.values():
         if not g.dead and 0 <= g.gid < MAX_GHOSTS:
             _place_blob_global(out[5 + g.gid], g.y, g.x)

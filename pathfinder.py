@@ -328,16 +328,16 @@ def _belief_csr(belief_map):
     base['mask_stamp'] = stamp
     return g
 
-def _node_idx(belief_map, pos):
+def _node_idx(belief_map, pos, walkable_only: bool = False):
     """Nearest belief node for a coordinate, memoised — positions repeat heavily."""
     base = _belief_base(belief_map)
-    key = (round(float(pos[0]), 2), round(float(pos[1]), 2))
+    key = (round(float(pos[0]), 2), round(float(pos[1]), 2), walkable_only)
     cache = base['node_idx'] if base is not None else None
     if cache is not None:
         idx = cache.get(key)
         if idx is not None:
             return idx
-    idx = belief_map._closest_node(pos)
+    idx = belief_map._closest_node(pos, walkable_only=walkable_only)
     if cache is not None and len(cache) < 20000:
         cache[key] = idx
     return idx
@@ -422,7 +422,7 @@ def path_belief(belief_map, start, goal):
     Returns [start, ..., goal] or [] if unreachable. Falls back to astar_belief."""
     if _belief_csr(belief_map) is None:
         return astar_belief(belief_map, start, goal)
-    si, gi = _node_idx(belief_map, start), _node_idx(belief_map, goal)
+    si, gi = _node_idx(belief_map, start, walkable_only=True), _node_idx(belief_map, goal, walkable_only=True)
     if si < 0 or gi < 0:
         return []
     if si == gi:
@@ -484,3 +484,81 @@ def ghost_dists(ghost, start, targets):
     if bm is None:
         return _manhattan_dists(start, list(set(targets)))
     return dijkstra_multi_belief(bm, start, list(targets))
+
+
+def smooth_path_spline(world, path: list, corner_cut: float = 0.45, n_interp: int = 4, radius: float = 0.35) -> list:
+    """Replaces sharp waypoint corners with smooth quadratic Bézier arcs.
+    
+    Verifies passability of generated arc points against the environment clearance (world.is_passable).
+    If an arc would clip a wall, safely retains the original corner waypoint.
+    
+    Args:
+        world: World environment object providing is_passable(x, y, radius)
+        path: List of (y, x) or (r, c) waypoints
+        corner_cut: Maximum distance along incoming and outgoing legs to place Bézier control endpoints
+        n_interp: Number of intermediate curve samples per corner
+        radius: Obstacle clearance radius to enforce (grid units)
+        
+    Returns:
+        Smoothed list of continuous (y, x) waypoints
+    """
+    if not path or len(path) < 3:
+        return list(path)
+        
+    smoothed = [path[0]]
+    i = 1
+    while i < len(path) - 1:
+        p_prev = np.array(path[i - 1], dtype=np.float64)
+        p_curr = np.array(path[i], dtype=np.float64)
+        p_next = np.array(path[i + 1], dtype=np.float64)
+        
+        v_in = p_curr - p_prev
+        v_out = p_next - p_curr
+        d_in = float(np.linalg.norm(v_in))
+        d_out = float(np.linalg.norm(v_out))
+        
+        if d_in < 1e-4 or d_out < 1e-4:
+            smoothed.append(path[i])
+            i += 1
+            continue
+            
+        u_in = v_in / d_in
+        u_out = v_out / d_out
+        dot = float(np.dot(u_in, u_out))
+        
+        # If collinear (straight corridor), keep the existing waypoint
+        if dot > 0.92:
+            smoothed.append(path[i])
+            i += 1
+            continue
+            
+        # Determine corner cut distance (never exceed 45% of incoming/outgoing segment length)
+        cut = min(corner_cut, 0.45 * d_in, 0.45 * d_out)
+        p_entry = p_curr - cut * u_in
+        p_exit = p_curr + cut * u_out
+        
+        # Sample quadratic Bézier fillet arc: B(t) = (1-t)^2 P_entry + 2(1-t)t P_curr + t^2 P_exit
+        ts = np.linspace(0.0, 1.0, n_interp + 2)
+        arc = []
+        arc_passable = True
+        for t in ts:
+            pt = (1.0 - t)**2 * p_entry + 2.0 * (1.0 - t) * t * p_curr + t**2 * p_exit
+            # Check passability in world coordinates (x=col=pt[1], y=row=pt[0])
+            if world is not None and hasattr(world, 'is_passable'):
+                if not world.is_passable(float(pt[1]), float(pt[0]), radius=radius):
+                    arc_passable = False
+                    break
+            arc.append((float(pt[0]), float(pt[1])))
+            
+        if arc_passable and len(arc) >= 2:
+            if smoothed and math.hypot(smoothed[-1][0] - arc[0][0], smoothed[-1][1] - arc[0][1]) < 0.05:
+                smoothed.extend(arc[1:])
+            else:
+                smoothed.extend(arc)
+        else:
+            smoothed.append(path[i])
+        i += 1
+        
+    if smoothed and math.hypot(smoothed[-1][0] - path[-1][0], smoothed[-1][1] - path[-1][1]) > 0.05:
+        smoothed.append(path[-1])
+    return smoothed

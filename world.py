@@ -147,6 +147,7 @@ class World:
             return grid.astype(bool)
             
         self._grid_0_0 = ~rasterize_collided(0.0)
+        self._grid_0_16 = ~rasterize_collided(0.16)
         self._grid_0_3 = ~rasterize_collided(0.3)
         self._grid_0_35 = ~rasterize_collided(0.35)
         self._grid_0_4 = ~rasterize_collided(0.4)
@@ -169,6 +170,8 @@ class World:
                 grid = self._grid_0_3
             elif r_float <= 0.05:
                 grid = self._grid_0_0
+            elif r_float <= 0.24:
+                grid = getattr(self, '_grid_0_16', self._grid_0_0)
             else:
                 grid = self._grid_0_4 if r_float >= 0.38 else (self._grid_0_35 if r_float >= 0.32 else self._grid_0_3)
             if grid is not None:

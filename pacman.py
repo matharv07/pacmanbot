@@ -24,7 +24,7 @@ from world import World
 
 LARGEST_STAGE_IDX = len(STAGES) - 1
 
-parser = argparse.ArgumentParser()
+parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument("--stage", type=int, default=None, help=f"Curriculum stage index to visualize (default: largest stage {LARGEST_STAGE_IDX})")
 parser.add_argument("--checkpoint", type=int, default=-1, help="Checkpoint to load")
 args, _ = parser.parse_known_args()
@@ -262,6 +262,8 @@ class Player:
         self.next_dir = RIGHT
         self.score = 0
         self.powered = False
+        self.power_clearance_dist_cells = float(os.environ.get("POWER_CLEARANCE_DIST_CELLS", "7.5"))
+        self.power_duration_steps = max(1, int(round(self.power_clearance_dist_cells / max(self.max_speed * 1.15, 1e-4))))
         self.power_timer = 0
         self.mouth_open = True
         self.mouth_tick = 0
@@ -382,7 +384,7 @@ class Player:
             if not self.powered:
                 if random.random() < 0.015:
                     self.powered = True
-                    self.power_timer = 35
+                    self.power_timer = self.power_duration_steps
             return
         if AUTO_MODE:
             self.frame_counter += 1
@@ -613,7 +615,7 @@ class Player:
                                 self.world.power_pellets.remove(matched_power)
                                 self.score += 50
                                 self.powered = True
-                                self.power_timer = 40
+                                self.power_timer = getattr(self, 'power_duration_steps', 40)
                             else:
                                 matched_pellet = None
                                 for p in list(self.world.pellets):
@@ -638,7 +640,7 @@ class Player:
                         self.score += 10 if cell == PELLET else 50
                         if cell == POWER:
                             self.powered = True
-                            self.power_timer = 40
+                            self.power_timer = getattr(self, 'power_duration_steps', 40)
                         collected_anything = True
         if collected_anything:
             target_cleared = False
@@ -681,27 +683,146 @@ class Player:
         x = int(self.x * CELL)
         y = int(self.y * CELL)
         r = CELL // 2 - 2
-        angle = 0
-        if self.vx > 0: angle = 0
-        elif self.vx < 0: angle = 180
-        elif self.vy > 0: angle = 270
-        elif self.vy < 0: angle = 90
-        else:
-            angles = {(0, 1): 0, (0, -1): 180, (-1, 0): 90, (1, 0): 270}
-            angle = angles.get(self.dir, 0)
-        pac_color = POWERED_COLOR if self.powered else YELLOW
-        if self.mouth_open and not self.dead:
-            gap = 35
-            start_a = math.radians(angle + gap)
-            points = [(x, y)]
-            steps = 20
-            full = math.radians(360 - gap * 2)
-            for i in range(steps + 1):
-                a = start_a + full * i / steps
-                points.append((x + r * math.cos(a), y - r * math.sin(a)))
-            pygame.draw.polygon(surf, pac_color, points)
-        else:
-            pygame.draw.circle(surf, pac_color, (x, y), r)
+
+        # Determine smooth heading orientation along travel vector
+        v_mag = math.hypot(self.vx, self.vy)
+        if v_mag > 0.04:
+            target_h = math.atan2(self.vy, self.vx)
+            if not hasattr(self, 'heading_rad'):
+                self.heading_rad = target_h
+            else:
+                diff = math.atan2(math.sin(target_h - self.heading_rad), math.cos(target_h - self.heading_rad))
+                self.heading_rad += diff * 0.35
+        elif not hasattr(self, 'heading_rad'):
+            angles = {(0, 1): 0.0, (0, -1): math.pi, (-1, 0): -math.pi / 2, (1, 0): math.pi / 2}
+            self.heading_rad = angles.get(self.dir, 0.0)
+
+        draw_mecanum_car(surf, x, y, self.heading_rad, r=r, powered=self.powered, dead=self.dead)
+
+def draw_mecanum_car(surf, cx, cy, heading, r=9, powered=False, dead=False):
+    """Draws Pac-Man as a high-tech autonomous rover car with 4 mecanum wheels."""
+    cos_h = math.cos(heading)
+    sin_h = math.sin(heading)
+
+    def to_screen(dx, dy):
+        return (cx + dx * cos_h - dy * sin_h, cy + dx * sin_h + dy * cos_h)
+
+    # Colors
+    if dead:
+        c_body = (100, 100, 105)
+        c_body_dark = (60, 60, 65)
+        c_wheel = (35, 35, 40)
+        c_roller = (90, 90, 95)
+        c_cockpit = (40, 40, 45)
+        c_cockpit_glare = (70, 70, 75)
+        c_light_front = (140, 40, 40)
+        c_light_rear = (140, 40, 40)
+        c_lidar = (30, 30, 35)
+        c_lidar_lens = (80, 80, 85)
+    elif powered:
+        c_body = (0, 180, 255)
+        c_body_dark = (0, 110, 200)
+        c_wheel = (30, 35, 45)
+        c_roller = (180, 220, 255)
+        c_cockpit = (15, 25, 45)
+        c_cockpit_glare = (100, 200, 255)
+        c_light_front = (180, 245, 255)
+        c_light_rear = (0, 255, 200)
+        c_lidar = (20, 30, 40)
+        c_lidar_lens = (0, 240, 255)
+    else:
+        c_body = (255, 210, 15)
+        c_body_dark = (210, 160, 10)
+        c_wheel = (35, 35, 40)
+        c_roller = (190, 195, 205)
+        c_cockpit = (20, 28, 45)
+        c_cockpit_glare = (90, 140, 180)
+        c_light_front = (255, 255, 210)
+        c_light_rear = (235, 35, 35)
+        c_lidar = (25, 25, 30)
+        c_lidar_lens = (0, 210, 255)
+
+    # 0. Powered electric aura underglow
+    if powered and not dead:
+        for glow_r, alpha in [(r * 1.8, 35), (r * 1.5, 65), (r * 1.25, 105)]:
+            sz = int(glow_r * 2 + 4)
+            glow_surf = pygame.Surface((sz, sz), pygame.SRCALPHA)
+            pygame.draw.circle(glow_surf, (0, 160, 255, alpha), (sz // 2, sz // 2), int(glow_r))
+            surf.blit(glow_surf, (int(cx - sz // 2), int(cy - sz // 2)))
+
+    # 1. Four Corner Mecanum Wheels with 45-degree rollers
+    hl = r * 1.15
+    hw = r * 0.70
+    wl = r * 0.70
+    ww = r * 0.32
+    wheel_offsets = [
+        (+hl * 0.55, -hw - ww * 0.45, +1), # Front-Left: roller slant +
+        (+hl * 0.55, +hw + ww * 0.45, -1), # Front-Right: roller slant -
+        (-hl * 0.55, -hw - ww * 0.45, -1), # Rear-Left: roller slant -
+        (-hl * 0.55, +hw + ww * 0.45, +1), # Rear-Right: roller slant +
+    ]
+    for w_cx, w_cy, slant in wheel_offsets:
+        w_corners = [
+            to_screen(w_cx + wl * 0.5, w_cy - ww * 0.5),
+            to_screen(w_cx + wl * 0.5, w_cy + ww * 0.5),
+            to_screen(w_cx - wl * 0.5, w_cy + ww * 0.5),
+            to_screen(w_cx - wl * 0.5, w_cy - ww * 0.5),
+        ]
+        pygame.draw.polygon(surf, c_wheel, w_corners)
+        pygame.draw.polygon(surf, (15, 15, 20), w_corners, 1)
+        # Angled mecanum rollers (distinctive 45-degree treads)
+        for t in [-0.25, 0.0, 0.25]:
+            rcx = w_cx + t * wl
+            p1 = to_screen(rcx - 0.18 * wl * slant, w_cy - ww * 0.45)
+            p2 = to_screen(rcx + 0.18 * wl * slant, w_cy + ww * 0.45)
+            pygame.draw.line(surf, c_roller, p1, p2, 1)
+
+    # 2. Main Car Chassis Body (Aerodynamic Rover)
+    chassis_poly = [
+        to_screen(+hl * 1.05, -hw * 0.65), # Front nose left
+        to_screen(+hl * 1.05, +hw * 0.65), # Front nose right
+        to_screen(+hl * 0.85, +hw * 0.95), # Front fender right
+        to_screen(+hl * 0.15, +hw * 0.85), # Mid waist right
+        to_screen(-hl * 0.80, +hw * 0.95), # Rear fender right
+        to_screen(-hl * 1.02, +hw * 0.75), # Rear right corner
+        to_screen(-hl * 1.02, -hw * 0.75), # Rear left corner
+        to_screen(-hl * 0.80, -hw * 0.95), # Rear fender left
+        to_screen(+hl * 0.15, -hw * 0.85), # Mid waist left
+        to_screen(+hl * 0.85, -hw * 0.95), # Front fender left
+    ]
+    pygame.draw.polygon(surf, c_body, chassis_poly)
+    pygame.draw.polygon(surf, c_body_dark, chassis_poly, 1)
+
+    # 3. Cockpit Canopy / Windshield
+    cockpit_poly = [
+        to_screen(+hl * 0.45, -hw * 0.50),
+        to_screen(+hl * 0.45, +hw * 0.50),
+        to_screen(-hl * 0.35, +hw * 0.55),
+        to_screen(-hl * 0.35, -hw * 0.55),
+    ]
+    pygame.draw.polygon(surf, c_cockpit, cockpit_poly)
+    p_glare1 = to_screen(+hl * 0.35, -hw * 0.35)
+    p_glare2 = to_screen(-hl * 0.20, +hw * 0.35)
+    pygame.draw.line(surf, c_cockpit_glare, p_glare1, p_glare2, 1)
+
+    # 4. Front Twin LED Headlights
+    p_hl_l = to_screen(+hl * 0.98, -hw * 0.52)
+    p_hl_r = to_screen(+hl * 0.98, +hw * 0.52)
+    headlight_r = max(2, int(r * 0.18))
+    pygame.draw.circle(surf, c_light_front, (int(p_hl_l[0]), int(p_hl_l[1])), headlight_r)
+    pygame.draw.circle(surf, c_light_front, (int(p_hl_r[0]), int(p_hl_r[1])), headlight_r)
+
+    # 5. Rear Twin LED Taillights
+    p_tl_l = to_screen(-hl * 0.98, -hw * 0.55)
+    p_tl_r = to_screen(-hl * 0.98, +hw * 0.55)
+    taillight_r = max(2, int(r * 0.15))
+    pygame.draw.circle(surf, c_light_rear, (int(p_tl_l[0]), int(p_tl_l[1])), taillight_r)
+    pygame.draw.circle(surf, c_light_rear, (int(p_tl_r[0]), int(p_tl_r[1])), taillight_r)
+
+    # 6. Roof LiDAR Sensor Puck
+    p_lidar = to_screen(-hl * 0.05, 0)
+    pygame.draw.circle(surf, c_lidar, (int(p_lidar[0]), int(p_lidar[1])), max(2, int(r * 0.24)))
+    pygame.draw.circle(surf, c_lidar_lens, (int(p_lidar[0]), int(p_lidar[1])), max(1, int(r * 0.12)))
 
 class Game:
     def __init__(self):
@@ -910,6 +1031,7 @@ class Game:
                         rl_tasks = actions_to_tasks(g, sc_np[i], indices, self.frame_counter, target_speed=g.current_speed_mult)
                         if rl_tasks:
                             pool_tasks.extend(rl_tasks)
+
                     from cbba import _deduplicate_tasks
                     deduped_pool = _deduplicate_tasks(pool_tasks, threshold=1.5)
                     needed = len(alive) - len(deduped_pool)
@@ -928,10 +1050,12 @@ class Game:
                                             break
                             if len(aux_targets) >= needed:
                                 break
+                        pellet_targets = set()
                         if len(aux_targets) < needed and not self.player.powered and getattr(self.world, 'power_pellets', None):
                             for ppx, ppy in self.world.power_pellets:
                                 if not any(math.hypot(ppy - et[0], ppx - et[1]) < 2.0 for et in (existing_targets + aux_targets)):
                                     aux_targets.append((ppy, ppx))
+                                    pellet_targets.add((ppy, ppx))
                                     if len(aux_targets) >= needed:
                                         break
                         if len(aux_targets) < needed:
@@ -946,7 +1070,9 @@ class Game:
                                 if len(aux_targets) >= needed:
                                     break
                         for at in aux_targets:
-                            deduped_pool.append(Task(task_type=TaskType.HUNT, target_pos=(float(at[0]), float(at[1])), score=0.6, origin=ORIGIN_RL_NOVEL))
+                            t_type = TaskType.CONVERT if (at[0], at[1]) in pellet_targets else TaskType.HUNT
+                            score_val = 1.8 if t_type == TaskType.CONVERT else 0.6
+                            deduped_pool.append(Task(task_type=t_type, target_pos=(float(at[0]), float(at[1])), score=score_val, origin=ORIGIN_RL_NOVEL))
                     from pathfinder import dijkstra_multi
                     all_targets = [t.target_pos for t in deduped_pool]
                     for gid in alive:

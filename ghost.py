@@ -1,9 +1,10 @@
+import sys
 import pygame
 import random
 import math
 from collections import deque
 import numpy as np
-from pathfinder import next_step, path_belief, ghost_dists, find_topological_flee_target_belief
+from pathfinder import next_step, path_belief, ghost_dists, find_topological_flee_target_belief, smooth_path_spline
 from cbba import CBBA_Agent
 from beliefmap import BeliefMap
 from allocator import TaskType
@@ -77,7 +78,7 @@ class Ghost:
         self.grid = grid
         self.world = world
         self.color = color
-        self.radius = 0.4
+        self.radius = 0.28
         self.x, self.y = float(pos[1]), float(pos[0])
         self.prev_x, self.prev_y = self.x, self.y
         self.vx, self.vy = 0.0, 0.0
@@ -130,6 +131,8 @@ class Ghost:
         self.current_rl_dir: Optional[float] = None
         self.rl_hijack: bool = False        #policy asked to take over micro-navigation this step
         self.rl_mode: bool = False
+        self._imminent_pellet_danger_pos: Optional[tuple] = None
+        self.power_duration_steps: int = 350
 
     def update(self, player_pos, powered, all_ghosts, skip_movement=False, speed_mult=1.0):
         self.frame += 1
@@ -179,29 +182,67 @@ class Ghost:
                     self.cbba_agent.path.remove(dk)
             active_task = self.cbba_agent.get_active_task()
         if not self.pacman_powered and self.known_pacman is not None:
-            if active_task is not None and active_task.task_type in (TaskType.EXPLORE, TaskType.DYNAMIC):
+            pac_y, pac_x = float(self.known_pacman[0]), float(self.known_pacman[1])
+            should_preempt = False
+            if active_task is not None:
+                if active_task.task_type in (TaskType.EXPLORE, TaskType.DYNAMIC):
+                    should_preempt = True
+                elif active_task.task_type == TaskType.CONVERT:
+                    t_pr, t_pc = float(active_task.target_pos[0]), float(active_task.target_pos[1])
+                    d_pp_pac = math.hypot(t_pr - pac_y, t_pc - pac_x)
+                    d_ghost_pac = math.hypot(self.y - pac_y, self.x - pac_x)
+                    d_ghost_pp = math.hypot(self.y - t_pr, self.x - t_pc)
+                    if d_pp_pac > 4.0 and d_ghost_pac < 8.0 and d_ghost_pp > 2.0:
+                        should_preempt = True
+                elif active_task.task_type == TaskType.HUNT:
+                    t_pr, t_pc = float(active_task.target_pos[0]), float(active_task.target_pos[1])
+                    if math.hypot(t_pr - pac_y, t_pc - pac_x) > 5.0:
+                        # Pac-Man drifted from old task waypoint; update target directly if LOS is maintained
+                        active_task.target_pos = (pac_y, pac_x)
+                        should_preempt = False
+            if should_preempt:
                 self.cbba_agent.emergency_preempt_explore()
+                drop_keys = [k for k in list(self.cbba_agent.bundle)
+                             if len(k) >= 2 and isinstance(k[1], (tuple, list))
+                             and math.hypot(float(k[1][0]) - pac_y, float(k[1][1]) - pac_x) > 5.0]
+                for dk in drop_keys:
+                    if dk in self.cbba_agent.bundle: self.cbba_agent.bundle.remove(dk)
+                    if dk in self.cbba_agent.path: self.cbba_agent.path.remove(dk)
+                    self.cbba_agent.y[dk] = 0.0
+                    if self.cbba_agent.z.get(dk) == self.gid: self.cbba_agent.z[dk] = None
                 active_task = self.cbba_agent.get_active_task()
         #use tolerance-based comparison
         if active_task is not None:
             tpr, tpc = active_task.target_pos
             task_age = self.frame - getattr(active_task, 'created_frame', 0)
-            if abs(self.y - tpr) < 0.5 and abs(self.x - tpc) < 0.5 and task_age >= 2:
-                is_hunt = (active_task.task_type == TaskType.HUNT)
-                pac_near = False
-                if is_hunt and not self.pacman_powered and self.known_pacman is not None:
-                    d_kp = math.hypot(self.known_pacman[0] - self.y, self.known_pacman[1] - self.x)
-                    if d_kp <= 6.0:
-                        pac_near = True
-                        self._reached_hunt_target_near_pacman = True
-                if not pac_near:
-                    #cleanly remove completed task without mutating task_pos in place (preserves CBBA key matching)
+            if active_task.task_type == TaskType.CONVERT:
+                # If power pellet already eaten or defused, finish task
+                pp_gone = True
+                if hasattr(self.world, 'power_pellets'):
+                    if any(abs(p[1] - tpr) < 0.4 and abs(p[0] - tpc) < 0.4 for p in self.world.power_pellets):
+                        pp_gone = False
+                if pp_gone:
                     self.cbba_agent.remove_task(active_task)
                     active_task = self.cbba_agent.get_active_task()
-                else:
-                    #dynamically repath to live Pacman position instead of stalling
-                    self._committed_target = self.known_pacman
-                    self._committed_path = []
+
+            if active_task is not None:
+                tpr, tpc = active_task.target_pos
+                if abs(self.y - tpr) < 0.5 and abs(self.x - tpc) < 0.5 and task_age >= 2:
+                    is_hunt = (active_task.task_type == TaskType.HUNT)
+                    pac_near = False
+                    if is_hunt and not self.pacman_powered and self.known_pacman is not None:
+                        d_kp = math.hypot(self.known_pacman[0] - self.y, self.known_pacman[1] - self.x)
+                        if d_kp <= 6.0:
+                            pac_near = True
+                            self._reached_hunt_target_near_pacman = True
+                    if not pac_near:
+                        #cleanly remove completed task without mutating task_pos in place (preserves CBBA key matching)
+                        self.cbba_agent.remove_task(active_task)
+                        active_task = self.cbba_agent.get_active_task()
+                    else:
+                        #dynamically repath to live Pacman position instead of stalling
+                        self._committed_target = self.known_pacman
+                        self._committed_path = []
         desired_vx = 0.0
         desired_vy = 0.0
         moved = False
@@ -248,26 +289,36 @@ class Ghost:
                             while self._committed_path:
                                 next_cell = self._committed_path[0]
                                 d_next = math.hypot(self.y - next_cell[0], self.x - next_cell[1])
-                                reached = (d_next < 0.65)
-                                if not reached and len(self._committed_path) >= 2:
-                                    w2 = self._committed_path[1]
-                                    d_w2 = math.hypot(self.y - w2[0], self.x - w2[1])
-                                    cur_speed = math.hypot(self.vx, self.vy)
-                                    if cur_speed > 0.1:
-                                        dot_ahead = (next_cell[1] - self.x) * self.vx + (next_cell[0] - self.y) * self.vy
-                                        if dot_ahead < 0.0 or d_w2 < d_next:
-                                            reached = True
-                                if not reached and self.world and hasattr(self.world, 'is_passable'):
-                                    if not self.world.is_passable(float(next_cell[1]), float(next_cell[0]), radius=self.radius):
-                                        reached = True
-                                if reached:
+                                if d_next < 0.45:
                                     self._committed_path.pop(0)
+                                elif len(self._committed_path) >= 2:
+                                    to_self_x = self.x - next_cell[1]
+                                    to_self_y = self.y - next_cell[0]
+                                    dot_overshoot = to_self_x * self.vx + to_self_y * self.vy
+                                    if dot_overshoot > 0.0 and d_next < 0.70:
+                                        self._committed_path.pop(0)
+                                    else:
+                                        w2 = self._committed_path[1]
+                                        d_w2 = math.hypot(self.y - w2[0], self.x - w2[1])
+                                        if d_w2 < d_next and self.world and hasattr(self.world, 'line_of_sight'):
+                                            if self.world.line_of_sight((self.x, self.y), (float(w2[1]), float(w2[0])), radius=0.20, step_size=0.3):
+                                                self._committed_path.pop(0)
+                                            else:
+                                                break
+                                        else:
+                                            break
                                 else:
                                     break
                             if self._committed_path:
-                                next_pt = self._committed_path[0]
-                                dx = next_pt[1] - self.x
-                                dy = next_pt[0] - self.y
+                                d0 = math.hypot(self._committed_path[0][0] - self.y, self._committed_path[0][1] - self.x)
+                                target_pt = self._committed_path[0]
+                                if len(self._committed_path) > 1 and d0 < 0.60:
+                                    w1 = self._committed_path[1]
+                                    if self.world and hasattr(self.world, 'line_of_sight'):
+                                        if self.world.line_of_sight((self.x, self.y), (float(w1[1]), float(w1[0])), radius=0.20, step_size=0.3):
+                                            target_pt = w1
+                                dx = target_pt[1] - self.x
+                                dy = target_pt[0] - self.y
                                 d = math.hypot(dx, dy)
                                 if d > 0.01:
                                     desired_vx = dx / d
@@ -300,29 +351,106 @@ class Ghost:
                             moved = True
                             if hasattr(self, '_committed_path'):
                                 self._committed_path = []
-        #Terminal strike reflex: if unpowered Pacman in line-of-sight within 2.5 cells, steer directly into Pacman at max speed (1.0)
-        if not moved and not self.pacman_powered:
+        # Check for Power Pellet Danger Reflex:
+        # If Pac-Man is closing in on an active power pellet, charging him is suicidal unless we can defuse it first!
+        pellet_threat_pos = None
+        pellet_threat_race_win = False
+        self._imminent_pellet_danger_pos = None
+
+        pac_est = self.known_pacman or (self.last_lost_pacman if (self.frame - getattr(self, 'pacman_last_seen', -999) <= 25) else None)
+        active_pps = getattr(self, 'known_power_pellets', None)
+        if active_pps is None and getattr(self, 'world', None) is not None:
+            active_pps = getattr(self.world, 'power_pellets', None)
+
+        if not self.pacman_powered and pac_est is not None and active_pps:
+            pac_y, pac_x = float(pac_est[0]), float(pac_est[1])
+            for ppx, ppy in list(active_pps):
+                d_pac_pp = math.hypot(ppy - pac_y, ppx - pac_x)
+                if d_pac_pp <= 3.2:  # Pac-Man is within 3.2 cells of eating it!
+                    d_ghost_pp = math.hypot(ppy - self.y, ppx - self.x)
+                    pellet_threat_pos = (float(ppy), float(ppx))
+                    # Can this ghost beat Pac-Man to the pellet to defuse it?
+                    if d_ghost_pp < d_pac_pp * 0.75:
+                        pellet_threat_race_win = True
+                    else:
+                        pellet_threat_race_win = False
+                        self._imminent_pellet_danger_pos = pellet_threat_pos
+                    break
+
+        if not moved and pellet_threat_pos is not None and pellet_threat_race_win:
+            # Race to defuse before Pac-Man arrives (Pellet Denial)
+            d_pp = math.hypot(pellet_threat_pos[0] - self.y, pellet_threat_pos[1] - self.x)
+            if d_pp > 0.05:
+                desired_vx = (pellet_threat_pos[1] - self.x) / d_pp
+                desired_vy = (pellet_threat_pos[0] - self.y) / d_pp
+                speed_mult = max(getattr(self, 'current_speed_mult', 1.0), 1.20)
+                moved = True
+                self._is_striking = False
+                if hasattr(self, '_committed_path'):
+                    self._committed_path = []
+
+        if not moved and pellet_threat_pos is not None and not pellet_threat_race_win:
+            # Pac-Man will reach power pellet first: charging him is suicide.
+            # Abort strike, trigger emergency topological flee away from Pac-Man!
+            self._is_striking = False
+            from allocator import _find_flee_pos
+            flee_target = _find_flee_pos(self, pac_est)
+            if flee_target is not None:
+                dx_fl = float(flee_target[1]) - self.x
+                dy_fl = float(flee_target[0]) - self.y
+                d_fl = math.hypot(dx_fl, dy_fl)
+                if d_fl > 0.05:
+                    desired_vx = dx_fl / d_fl
+                    desired_vy = dy_fl / d_fl
+                    speed_mult = 1.0
+                    moved = True
+                    if hasattr(self, '_committed_path'):
+                        self._committed_path = []
+
+        # Terminal strike reflex:
+        # Crucial kinematic reality: Pac-Man is faster than a ghost in straight-line pursuit!
+        # If Pac-Man is fleeing down a corridor at distance > 2.0-2.5 cells, a straight-line tail-chase
+        # simply causes the ghost to lose ground. Straight-line strike is ONLY effective when:
+        #   1. Extremely close (dist <= 2.2 cells) where the terminal catch box can close immediately, OR
+        #   2. Head-on encounter / cornered target where Pac-Man's velocity vector points toward the ghost.
+        if not moved and not self.pacman_powered and (pellet_threat_pos is None):
             pac_strike_target = None
             if self.known_pacman is not None:
                 pac_strike_target = self.known_pacman
+            elif self.last_lost_pacman is not None and (self.frame - getattr(self, 'pacman_last_seen', -999) <= 25):
+                pac_strike_target = self.last_lost_pacman
             if pac_strike_target is not None:
                 pac_y, pac_x = float(pac_strike_target[0]), float(pac_strike_target[1])
                 dist_pac = math.hypot(pac_y - self.y, pac_x - self.x)
-                if dist_pac <= 2.5:
+                p_dir = getattr(self, '_player_dir', (0.0, 0.0))
+                # Check if Pac-Man is moving towards this ghost:
+                # Vector from ghost to Pac-Man: (pac_x - self.x, pac_y - self.y)
+                # Pac-Man velocity vector: (p_dir[1], p_dir[0])
+                is_head_on = False
+                if dist_pac > 0.01:
+                    dir_to_pac_x = (pac_x - self.x) / dist_pac
+                    dir_to_pac_y = (pac_y - self.y) / dist_pac
+                    # If Pac-Man's direction is opposite to dir_to_pac (i.e. moving towards ghost)
+                    pac_approach = -(p_dir[1] * dir_to_pac_x + p_dir[0] * dir_to_pac_y)
+                    if pac_approach > 0.3:
+                        is_head_on = True
+
+                strike_range_limit = 4.0 if is_head_on else 2.2
+                if dist_pac <= strike_range_limit:
                     has_los = False
                     if self.world and hasattr(self.world, 'line_of_sight'):
-                        has_los = self.world.line_of_sight((self.x, self.y), (pac_x, pac_y), radius=self.radius, step_size=0.3)
+                        has_los = self.world.line_of_sight((self.x, self.y), (pac_x, pac_y), radius=0.15, step_size=0.3)
                     else:
                         has_los = True
                     if has_los and dist_pac > 0.01:
                         desired_vx = (pac_x - self.x) / dist_pac
                         desired_vy = (pac_y - self.y) / dist_pac
-                        speed_mult = max(getattr(self, 'current_speed_mult', 1.0), 1.20)
+                        speed_mult = max(getattr(self, 'current_speed_mult', 1.0), 1.25)
                         self._is_striking = True
                         moved = True
                         if hasattr(self, '_committed_path'):
                             self._committed_path = []
-        if not moved and active_task is not None:
+        if not moved and active_task is not None and not (active_task.task_type == TaskType.HUNT and pellet_threat_pos is not None and not pellet_threat_race_win):
             target = active_task.target_pos
             replan = False
             prev_target = getattr(self, '_committed_target', None)
@@ -361,20 +489,24 @@ class Ghost:
                 while self._committed_path:
                     next_cell = self._committed_path[0]
                     d_next = math.hypot(self.y - next_cell[0], self.x - next_cell[1])
-                    reached = (d_next < 0.65)
-                    if not reached and len(self._committed_path) >= 2:
-                        w2 = self._committed_path[1]
-                        d_w2 = math.hypot(self.y - w2[0], self.x - w2[1])
-                        cur_speed = math.hypot(self.vx, self.vy)
-                        if cur_speed > 0.1:
-                            dot_ahead = (next_cell[1] - self.x) * self.vx + (next_cell[0] - self.y) * self.vy
-                            if dot_ahead < 0.0 or d_w2 < d_next:
-                                reached = True
-                    if not reached and self.world and hasattr(self.world, 'is_passable'):
-                        if not self.world.is_passable(float(next_cell[1]), float(next_cell[0]), radius=self.radius):
-                            reached = True
-                    if reached:
+                    if d_next < 0.45:
                         self._committed_path.pop(0)
+                    elif len(self._committed_path) >= 2:
+                        to_self_x = self.x - next_cell[1]
+                        to_self_y = self.y - next_cell[0]
+                        dot_overshoot = to_self_x * self.vx + to_self_y * self.vy
+                        if dot_overshoot > 0.0 and d_next < 0.70:
+                            self._committed_path.pop(0)
+                        else:
+                            w2 = self._committed_path[1]
+                            d_w2 = math.hypot(self.y - w2[0], self.x - w2[1])
+                            if d_w2 < d_next and self.world and hasattr(self.world, 'line_of_sight'):
+                                if self.world.line_of_sight((self.x, self.y), (float(w2[1]), float(w2[0])), radius=0.20, step_size=0.3):
+                                    self._committed_path.pop(0)
+                                else:
+                                    break
+                            else:
+                                break
                     else:
                         break
                 if not self._committed_path:
@@ -386,8 +518,14 @@ class Ghost:
                         self._committed_target = self.known_pacman
                         self._committed_path = []
                 else:
-                    next_cell = self._committed_path[0]
-                    target_y, target_x = next_cell[0], next_cell[1]
+                    d0 = math.hypot(self._committed_path[0][0] - self.y, self._committed_path[0][1] - self.x)
+                    target_pt = self._committed_path[0]
+                    if len(self._committed_path) > 1 and d0 < 0.60:
+                        w1 = self._committed_path[1]
+                        if self.world and hasattr(self.world, 'line_of_sight'):
+                            if self.world.line_of_sight((self.x, self.y), (float(w1[1]), float(w1[0])), radius=0.20, step_size=0.3):
+                                target_pt = w1
+                    target_y, target_x = target_pt[0], target_pt[1]
                     dx, dy = target_x - self.x, target_y - self.y
                     d = math.hypot(dx, dy)
                     if d > 0:
@@ -434,25 +572,35 @@ class Ghost:
                     while self._committed_path:
                         next_cell = self._committed_path[0]
                         d_next = math.hypot(self.y - next_cell[0], self.x - next_cell[1])
-                        reached = (d_next < 0.65)
-                        if not reached and len(self._committed_path) >= 2:
-                            w2 = self._committed_path[1]
-                            d_w2 = math.hypot(self.y - w2[0], self.x - w2[1])
-                            cur_speed = math.hypot(self.vx, self.vy)
-                            if cur_speed > 0.1:
-                                dot_ahead = (next_cell[1] - self.x) * self.vx + (next_cell[0] - self.y) * self.vy
-                                if dot_ahead < 0.0 or d_w2 < d_next:
-                                    reached = True
-                        if not reached and self.world and hasattr(self.world, 'is_passable'):
-                            if not self.world.is_passable(float(next_cell[1]), float(next_cell[0]), radius=self.radius):
-                                reached = True
-                        if reached:
+                        if d_next < 0.50:
                             self._committed_path.pop(0)
+                        elif len(self._committed_path) >= 2:
+                            to_self_x = self.x - next_cell[1]
+                            to_self_y = self.y - next_cell[0]
+                            dot_overshoot = to_self_x * self.vx + to_self_y * self.vy
+                            if dot_overshoot > 0.0 and d_next < 0.70:
+                                self._committed_path.pop(0)
+                            else:
+                                w2 = self._committed_path[1]
+                                d_w2 = math.hypot(self.y - w2[0], self.x - w2[1])
+                                if d_w2 < d_next and self.world and hasattr(self.world, 'line_of_sight'):
+                                    if self.world.line_of_sight((self.x, self.y), (float(w2[1]), float(w2[0])), radius=0.20, step_size=0.3):
+                                        self._committed_path.pop(0)
+                                    else:
+                                        break
+                                else:
+                                    break
                         else:
                             break
                     if self._committed_path:
-                        next_cell = self._committed_path[0]
-                        target_y, target_x = next_cell[0], next_cell[1]
+                        d0 = math.hypot(self._committed_path[0][0] - self.y, self._committed_path[0][1] - self.x)
+                        target_pt = self._committed_path[0]
+                        if len(self._committed_path) > 1 and d0 < 0.60:
+                            w1 = self._committed_path[1]
+                            if self.world and hasattr(self.world, 'line_of_sight'):
+                                if self.world.line_of_sight((self.x, self.y), (float(w1[1]), float(w1[0])), radius=0.20, step_size=0.3):
+                                    target_pt = w1
+                        target_y, target_x = target_pt[0], target_pt[1]
                         dx, dy = target_x - self.x, target_y - self.y
                         d = math.hypot(dx, dy)
                         if d > 0:
@@ -481,7 +629,10 @@ class Ghost:
         #context steering and momentum, cached every 3 frames to reduce jitter/CPU load
         _STEER_CACHE_TTL = 3
         best_vx, best_vy = desired_vx, desired_vy
-        if desired_vx != 0.0 or desired_vy != 0.0:
+        if getattr(self, '_is_striking', False):
+            best_vx = desired_vx
+            best_vy = desired_vy
+        elif desired_vx != 0.0 or desired_vy != 0.0:
             prev_desired = getattr(self, '_prev_desired', (0.0, 0.0))
             desired_changed = (abs(desired_vx - prev_desired[0]) > 0.05 or abs(desired_vy - prev_desired[1]) > 0.05)
             cache_stale = (self.frame - getattr(self, '_steer_cache_frame', -999)) >= _STEER_CACHE_TTL
@@ -494,7 +645,14 @@ class Ghost:
                 angles = np.linspace(0, 2*math.pi, num_rays, endpoint=False)
                 ray_vx_arr = np.cos(angles)
                 ray_vy_arr = np.sin(angles)
-                check_dist_max = current_speed * 1.5 + self.radius
+                # In doorways and tight corridors, scale ray lookahead to avoid false wall-hits
+                d_wpt = 1.0
+                if getattr(self, '_committed_path', None) and len(self._committed_path) > 0:
+                    d_wpt = math.hypot(self._committed_path[0][0] - self.y, self._committed_path[0][1] - self.x)
+                    check_dist_max = min(1.2, max(0.5, d_wpt + 0.25))
+                else:
+                    check_dist_max = min(1.2, current_speed * 1.5 + self.radius)
+
                 n_steps = max(2, int(math.ceil(check_dist_max / 0.2)))
                 fracs = np.linspace(1/n_steps, 1.0, n_steps)
                 cc_grid = self.x + np.outer(ray_vx_arr, fracs) * check_dist_max
@@ -504,7 +662,17 @@ class Ghost:
                 hit_indices = np.argmax(hit_mask, axis=1)
                 has_hit = np.any(hit_mask, axis=1)
                 hit_fracs = (hit_indices + 1) / n_steps
-                ray_penalties = np.where(has_hit, 1000.0 / hit_fracs, 0.0)
+                hit_dists = (hit_indices + 1) * (check_dist_max / n_steps)
+
+                # Mask penalties for walls BEHIND the target waypoint in corridors
+                if getattr(self, '_committed_path', None) and len(self._committed_path) > 0:
+                    ray_align = ray_vx_arr * desired_vx + ray_vy_arr * desired_vy
+                    behind_target = (ray_align > 0.5) & (hit_dists > d_wpt + 0.15)
+                    effective_hits = has_hit & ~behind_target
+                else:
+                    effective_hits = has_hit
+
+                ray_penalties = np.where(effective_hits, 1000.0 / hit_fracs, 0.0)
                 interests = 1.5 * (ray_vx_arr * desired_vx + ray_vy_arr * desired_vy)
                 hysteresis = 0.8 * (ray_vx_arr * cur_vx_norm + ray_vy_arr * cur_vy_norm)
                 peer_penalties = np.zeros(num_rays, dtype=np.float32)
@@ -521,23 +689,73 @@ class Ghost:
                             if np.any(fwd_mask):
                                 peer_penalties[fwd_mask] += 1.5 * ((1.8 - d_peer) / 1.8) * cos_align[fwd_mask]
                 power_bonus = np.zeros(num_rays, dtype=np.float32)
-                if not self.pacman_powered and getattr(self, 'known_power_pellets', None):
-                    for ppx, ppy in self.known_power_pellets:
-                        d_pp = math.hypot(ppy - self.y, ppx - self.x)
+                _audit_mode = getattr(sys.modules.get('ghost'), '_STEERING_AUDIT_MODE', 'AUDITED_FIX')
+                if _audit_mode == "BASELINE":
+                    if not self.pacman_powered and active_task is not None and active_task.task_type == TaskType.CONVERT:
+                        t_py, t_px = active_task.target_pos
+                        d_pp = math.hypot(t_py - self.y, t_px - self.x)
                         if d_pp < 5.0:
-                            ux = (ppx - self.x) / max(d_pp, 1e-4)
-                            uy = (ppy - self.y) / max(d_pp, 1e-4)
+                            ux = (t_px - self.x) / max(d_pp, 1e-4)
+                            uy = (t_py - self.y) / max(d_pp, 1e-4)
                             cos_align = ray_vx_arr * ux + ray_vy_arr * uy
                             fwd_mask = cos_align > 0.0
                             if np.any(fwd_mask):
-                                power_bonus[fwd_mask] += 2.5 * ((5.0 - d_pp) / 5.0) * cos_align[fwd_mask]
+                                power_bonus[fwd_mask] += 3.0 * ((5.0 - d_pp) / 5.0) * cos_align[fwd_mask]
+                elif _audit_mode == "RAW_PACMANBOT":
+                    if not self.pacman_powered and getattr(self, 'known_power_pellets', None):
+                        for ppx, ppy in self.known_power_pellets:
+                            d_pp = math.hypot(ppy - self.y, ppx - self.x)
+                            if d_pp < 5.0:
+                                ux = (ppx - self.x) / max(d_pp, 1e-4)
+                                uy = (ppy - self.y) / max(d_pp, 1e-4)
+                                cos_align = ray_vx_arr * ux + ray_vy_arr * uy
+                                fwd_mask = cos_align > 0.0
+                                if np.any(fwd_mask):
+                                    power_bonus[fwd_mask] += 2.5 * ((5.0 - d_pp) / 5.0) * cos_align[fwd_mask]
+                else:  # AUDITED_FIX
+                    if not self.pacman_powered and not getattr(self, '_is_striking', False):
+                        # Dedicated CONVERT task steering
+                        if active_task is not None and active_task.task_type == TaskType.CONVERT:
+                            t_py, t_px = active_task.target_pos
+                            d_pp = math.hypot(t_py - self.y, t_px - self.x)
+                            if d_pp < 5.0:
+                                ux = (t_px - self.x) / max(d_pp, 1e-4)
+                                uy = (t_py - self.y) / max(d_pp, 1e-4)
+                                cos_align = ray_vx_arr * ux + ray_vy_arr * uy
+                                fwd_mask = cos_align > 0.0
+                                if np.any(fwd_mask):
+                                    power_bonus[fwd_mask] += 3.0 * ((5.0 - d_pp) / 5.0) * cos_align[fwd_mask]
+                        # Opportunistic en-route conversion for nearby known power pellets
+                        elif getattr(self, 'known_power_pellets', None):
+                            for ppx, ppy in self.known_power_pellets:
+                                d_pp = math.hypot(ppy - self.y, ppx - self.x)
+                                if d_pp < 3.5:
+                                    ux = (ppx - self.x) / max(d_pp, 1e-4)
+                                    uy = (ppy - self.y) / max(d_pp, 1e-4)
+                                    align_plan = desired_vx * ux + desired_vy * uy
+                                    if align_plan > -0.2 or d_pp < 1.5:
+                                        cos_align = ray_vx_arr * ux + ray_vy_arr * uy
+                                        fwd_mask = cos_align > 0.0
+                                        if np.any(fwd_mask):
+                                            power_bonus[fwd_mask] += 2.0 * ((3.5 - d_pp) / 3.5) * cos_align[fwd_mask]
+                power_danger_penalty = np.zeros(num_rays, dtype=np.float32)
+                if getattr(self, '_imminent_pellet_danger_pos', None) is not None:
+                    dy_dan, dx_dan = self._imminent_pellet_danger_pos
+                    d_dan = math.hypot(dy_dan - self.y, dx_dan - self.x)
+                    if d_dan < 6.0:
+                        ux_dan = (dx_dan - self.x) / max(d_dan, 1e-4)
+                        uy_dan = (dy_dan - self.y) / max(d_dan, 1e-4)
+                        cos_dan = ray_vx_arr * ux_dan + ray_vy_arr * uy_dan
+                        fwd_dan = cos_dan > -0.2
+                        if np.any(fwd_dan):
+                            power_danger_penalty[fwd_dan] += 400.0 * (cos_dan[fwd_dan] + 0.2)
                 cos_des = ray_vx_arr * desired_vx + ray_vy_arr * desired_vy
                 reverse_penalty = np.zeros(num_rays, dtype=np.float32)
                 fwd_passable = np.any((cos_des > 0.0) & (~has_hit))
                 if fwd_passable:
                     rev_mask = cos_des < -0.60
                     reverse_penalty[rev_mask] = 1.2 * (-cos_des[rev_mask])
-                scores = interests + hysteresis + power_bonus - ray_penalties - peer_penalties - reverse_penalty
+                scores = interests + hysteresis + power_bonus - ray_penalties - peer_penalties - reverse_penalty - power_danger_penalty
                 best_idx = int(np.argmax(scores))
                 best_vx, best_vy = float(ray_vx_arr[best_idx]), float(ray_vy_arr[best_idx])
                 self._steer_cache = (best_vx, best_vy)
@@ -564,7 +782,7 @@ class Ghost:
                 smooth_vy = self.vy * 0.25 + target_vy * 0.75
                 smooth_vx = self.vx * 0.25 + target_vx * 0.75
         smooth_safe = True
-        if self.world and hasattr(self.world, 'batch_is_passable'):
+        if not getattr(self, '_is_striking', False) and self.world and hasattr(self.world, 'batch_is_passable'):
             smooth_mag = math.hypot(smooth_vx, smooth_vy)
             if smooth_mag > 1e-6:
                 check_dist = smooth_mag * 1.5 + self.radius
@@ -636,7 +854,10 @@ class Ghost:
         return newly_discovered, stale_refreshed
 
     def plan_path(self, target) -> list:
-        return path_belief(self.belief_map, (float(self.y), float(self.x)), (float(target[0]), float(target[1])))
+        raw_path = path_belief(self.belief_map, (float(self.y), float(self.x)), (float(target[0]), float(target[1])))
+        if getattr(self, 'world', None) is not None and hasattr(self.world, 'is_passable') and len(raw_path) >= 3:
+            return smooth_path_spline(self.world, raw_path, corner_cut=0.45, radius=self.radius)
+        return raw_path
 
     def plan_dists(self, targets) -> dict:
         return ghost_dists(self, (float(self.y), float(self.x)), list(targets))
@@ -806,7 +1027,7 @@ class Ghost:
             if np.any(valid_mask):
                 valid_gids = np.array(alive_gids)[valid_mask]
                 valid_targets = targets[valid_mask]
-                is_los = self.world.batch_line_of_sight((self.x, self.y), valid_targets, radius=0.4, step_size=0.5)
+                is_los = self.world.batch_line_of_sight((self.x, self.y), valid_targets, radius=0.0, step_size=0.5)
                 los_gids = valid_gids[is_los]
             else:
                 los_gids = []
@@ -823,7 +1044,7 @@ class Ghost:
                     continue
                 pr, pc = pos
                 dist = math.hypot(pr - self.y, pc - self.x)
-                if dist <= MAX_RAY_DIST and self.world.line_of_sight((self.x, self.y), (pc, pr), radius=0.4, step_size=0.5):
+                if dist <= MAX_RAY_DIST and self.world.line_of_sight((self.x, self.y), (pc, pr), radius=0.0, step_size=0.5):
                     #direct visual confirmation that peer ghost is NOT at last known position
                     self.known_agents[gid] = "UNKNOWN"
                     if self.is_agent_dead(gid):
@@ -833,7 +1054,7 @@ class Ghost:
         pacman_diff = None
         pr, pc = player_pos
         pac_d = math.hypot(pr - self.y, pc - self.x)
-        if pac_d <= MAX_RAY_DIST and self.world.line_of_sight((self.x, self.y), (pc, pr), radius=0.4, step_size=0.5):
+        if pac_d <= MAX_RAY_DIST and self.world.line_of_sight((self.x, self.y), (pc, pr), radius=0.0, step_size=0.5):
             if getattr(self, '_prev_seen_pacman', None) is not None:
                 dy = pr - self._prev_seen_pacman[0]
                 dx = pc - self._prev_seen_pacman[1]
@@ -841,17 +1062,17 @@ class Ghost:
                 if n > 0.01:
                     self._player_dir = (dy / n, dx / n)
             self._prev_seen_pacman = (pr, pc)
-            if self.known_pacman != (pr, pc) or self.pacman_powered != powered:
-                self.known_pacman = (pr, pc)
-                if powered and not self.pacman_powered:
-                    self.pacman_power_timer = 40
-                self.pacman_powered = powered
-                if not powered: self.pacman_power_timer = 0
-                self.pacman_last_seen = self.frame
-                p_dir = getattr(self, '_player_dir', (0.0, 0.0))
-                pacman_diff = ("pacman", pr, pc, powered, self.frame, p_dir[0], p_dir[1])
-            else:
-                self.pacman_last_seen = self.frame
+            self.known_pacman = (pr, pc)
+            if powered and not self.pacman_powered:
+                dur = getattr(self, 'power_duration_steps', 350)
+                self.pacman_power_timer = dur
+                self.pacman_power_max_timer = float(dur)
+            self.pacman_powered = powered
+            if not powered:
+                self.pacman_power_timer = 0
+            self.pacman_last_seen = self.frame
+            p_dir = getattr(self, '_player_dir', (0.0, 0.0))
+            pacman_diff = ("pacman", pr, pc, powered, self.frame, p_dir[0], p_dir[1])
         else:
             self._prev_seen_pacman = None
             if self.known_pacman is not None:
@@ -1102,12 +1323,14 @@ class Ghost:
                     r, c, powered, obs_frame = diff[1], diff[2], diff[3], diff[4]
                     p_vy = diff[5] if len(diff) > 5 else 0.0
                     p_vx = diff[6] if len(diff) > 6 else 0.0
-                    if obs_frame > self.pacman_last_seen:
+                    if obs_frame >= self.pacman_last_seen:
                         self.known_pacman     = (r, c)
                         if (p_vy != 0.0 or p_vx != 0.0):
                             self._player_dir = (p_vy, p_vx)
                         if powered and not self.pacman_powered:
-                            self.pacman_power_timer = 40
+                            dur = getattr(self, 'power_duration_steps', 350)
+                            self.pacman_power_timer = dur
+                            self.pacman_power_max_timer = float(dur)
                         self.pacman_powered   = powered
                         if not powered:
                             self.pacman_power_timer = 0

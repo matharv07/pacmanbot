@@ -244,11 +244,17 @@ class BeliefMap:
         self._compute_topology()
         self._ensure_initialised()
 
-    def _closest_node(self, pos: tuple):
+    def _closest_node(self, pos: tuple, walkable_only: bool = False):
         if not self._open_cells:
             return -1
         if self._tree is None:
             self._tree = cKDTree(self._open_arr)
+        if walkable_only and hasattr(self, '_walkable_mask') and not np.all(self._walkable_mask):
+            k = min(15, len(self._open_arr))
+            _, indices = self._tree.query([pos], k=k)
+            for idx in indices[0]:
+                if self._walkable_mask[idx]:
+                    return int(idx)
         _, idx = self._tree.query([pos])
         return int(idx[0])
 
